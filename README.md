@@ -11,7 +11,7 @@ Milestone progress and verification results are recorded in
 [`docs/progress.md`](docs/progress.md). Each milestone is committed before the
 next milestone begins.
 
-Current milestone: **v0.1 M5 complete**. The CLI collects filesystem inventory,
+Current milestone: **v0.1 M6 complete**. The CLI collects filesystem inventory,
 records Git provenance, correlates pinned marketplace claims, and supports
 explicit trust baselines and review/diff workflows.
 
@@ -35,7 +35,11 @@ cargo run -p omasafe-cli -- scan --format json
 omasafe-cli schedule install
 ```
 
-The CLI is the engine. The future Omarchy bar-widget is a thin QML interface
+The Omarchy plugin is under [`plugin/`](plugin/). Validate it with
+`omarchy plugin validate plugin` and `qmllint plugin/BarWidget.qml
+plugin/Panel.qml` on the supported Omarchy release.
+
+The CLI is the engine. The Omarchy bar-widget is a thin QML interface
 over bounded CLI commands. Runtime state uses XDG paths:
 
 - Configuration: `${XDG_CONFIG_HOME:-~/.config}/omasafe`

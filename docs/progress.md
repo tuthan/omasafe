@@ -199,3 +199,35 @@ Known limitation: the systemd install command is opt-in and requires a working
 user systemd session. Bar UI integration belongs to M6.
 
 Next: **v0.1 M6 — Thin Omarchy UI**.
+
+## v0.1 M6 — Thin Omarchy UI
+
+Status: **complete**
+
+Implemented:
+
+- Valid `bar-widget` manifest with nested `Panel.qml`.
+- Alert count/state badge with quiet, attention, and unavailable states; no
+  security grade or safe badge.
+- Fixed argv-only CLI invocation of `omasafe-cli scan --format json`.
+- Bounded JSON parsing in QML and no raw command output rendering.
+- Manual scan action and a lightweight refresh timer; heavy work remains in the
+  CLI/systemd path.
+- Panel disclosure that OmaSafe reports changes and coverage limits rather than
+  declaring plugins safe.
+- CLI and desktop notification paths remain available when a third-party full
+  bar replaces the bar widget.
+
+Verification:
+
+```text
+omarchy plugin validate plugin
+qmllint plugin/BarWidget.qml plugin/Panel.qml
+cargo test --workspace
+```
+
+Known limitation: interactive click/open/close and shell restart lifecycle
+tests require the provisioned Omarchy VM harness. The repository contains no
+runtime QML dependency or privileged component.
+
+Next: **v0.1 M7 — Packaging, signing, and release**.
