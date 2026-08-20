@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -12,11 +13,29 @@ pub const HISTORY_SCHEMA_VERSION: u64 = 1;
 pub enum Error {
     #[error("trust history I/O error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("trust history is malformed: {0}")]
-    Json(#[from] serde_json::Error),
+    #[error("trust history is malformed at {path}: {source}")]
+    Json {
+        path: String,
+        source: serde_json::Error,
+    },
+    #[error("scan state is malformed at {path}: {source}")]
+    ScanStateJson {
+        path: String,
+        source: serde_json::Error,
+    },
+    #[error("state serialization failed: {0}")]
+    Serialize(#[from] serde_json::Error),
+    #[error("unsupported {kind} schema version {version}; expected {expected}")]
+    Schema {
+        kind: &'static str,
+        version: u64,
+        expected: u64,
+    },
+    #[error("state lock is busy for {path}; retry later")]
+    LockBusy { path: String },
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct TrustHistory {
     pub schema_version: u64,
     pub records: Vec<TrustRecord>,
@@ -41,11 +60,30 @@ pub struct ReviewDecision {
     pub created_at: String,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ScanState {
     pub schema_version: u64,
     #[serde(default)]
     pub alerts: BTreeMap<String, String>,
+}
+
+impl Default for TrustHistory {
+    fn default() -> Self {
+        Self {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            records: Vec::new(),
+            decisions: Vec::new(),
+        }
+    }
+}
+
+impl Default for ScanState {
+    fn default() -> Self {
+        Self {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            alerts: BTreeMap::new(),
+        }
+    }
 }
 
 impl TrustHistory {
@@ -57,7 +95,18 @@ impl TrustHistory {
                 decisions: Vec::new(),
             });
         }
-        let history = serde_json::from_slice(&fs::read(path)?)?;
+        let history: Self =
+            serde_json::from_slice(&fs::read(path)?).map_err(|source| Error::Json {
+                path: path.display().to_string(),
+                source,
+            })?;
+        if history.schema_version != HISTORY_SCHEMA_VERSION {
+            return Err(Error::Schema {
+                kind: "trust history",
+                version: history.schema_version,
+                expected: HISTORY_SCHEMA_VERSION,
+            });
+        }
         Ok(history)
     }
 
@@ -76,14 +125,24 @@ impl TrustHistory {
     pub fn write_atomic(&self, path: &Path) -> Result<(), Error> {
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent)?;
+        let _lock = acquire_lock(path)?;
+        self.write_atomic_locked(path)
+    }
+
+    pub fn write_atomic_locked(&self, path: &Path) -> Result<(), Error> {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
         let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-        fs::write(&temporary, serde_json::to_vec_pretty(self)?)?;
+        let mut file = fs::File::create(&temporary)?;
+        std::io::Write::write_all(&mut file, &serde_json::to_vec_pretty(self)?)?;
+        file.sync_all()?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
         }
         fs::rename(temporary, path)?;
+        sync_parent(parent)?;
         Ok(())
     }
 }
@@ -96,7 +155,19 @@ impl ScanState {
                 alerts: BTreeMap::new(),
             });
         }
-        Ok(serde_json::from_slice(&fs::read(path)?)?)
+        let state: Self =
+            serde_json::from_slice(&fs::read(path)?).map_err(|source| Error::ScanStateJson {
+                path: path.display().to_string(),
+                source,
+            })?;
+        if state.schema_version != HISTORY_SCHEMA_VERSION {
+            return Err(Error::Schema {
+                kind: "scan state",
+                version: state.schema_version,
+                expected: HISTORY_SCHEMA_VERSION,
+            });
+        }
+        Ok(state)
     }
 
     pub fn is_new(&self, key: &str) -> bool {
@@ -111,16 +182,77 @@ impl ScanState {
     pub fn write_atomic(&self, path: &Path) -> Result<(), Error> {
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent)?;
+        let _lock = acquire_lock(path)?;
+        self.write_atomic_locked(path)
+    }
+
+    pub fn write_atomic_locked(&self, path: &Path) -> Result<(), Error> {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
         let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-        fs::write(&temporary, serde_json::to_vec_pretty(self)?)?;
+        let mut file = fs::File::create(&temporary)?;
+        std::io::Write::write_all(&mut file, &serde_json::to_vec_pretty(self)?)?;
+        file.sync_all()?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
         }
         fs::rename(temporary, path)?;
+        sync_parent(parent)?;
         Ok(())
     }
+}
+
+pub struct StateLock {
+    _file: fs::File,
+}
+
+pub fn lock(path: &Path) -> Result<StateLock, Error> {
+    let lock_path = path.with_extension("lock");
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).truncate(false).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&lock_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::io::AsRawFd;
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))?;
+        let mut acquired = false;
+        for _ in 0..20 {
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if result == 0 {
+                acquired = true;
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
+                return Err(error.into());
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        if !acquired {
+            return Err(Error::LockBusy {
+                path: path.display().to_string(),
+            });
+        }
+    }
+    Ok(StateLock { _file: file })
+}
+
+fn acquire_lock(path: &Path) -> Result<StateLock, Error> {
+    lock(path)
+}
+
+fn sync_parent(parent: &Path) -> Result<(), Error> {
+    let directory = fs::File::open(parent)?;
+    directory.sync_all()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -138,6 +270,7 @@ mod tests {
             content_digest: Some("digest".into()),
             file_count: 1,
             limitations: Vec::new(),
+            file_digests: std::collections::BTreeMap::new(),
         };
         let mut history = TrustHistory::default();
         history.accept(TrustRecord {
@@ -147,12 +280,15 @@ mod tests {
             note: "first trust".into(),
         });
         history.write_atomic(&path).unwrap();
+        fs::write(path.with_extension("lock"), b"stale marker").unwrap();
+        history.write_atomic(&path).unwrap();
         let loaded = TrustHistory::load(&path).unwrap();
         assert_eq!(
             loaded.latest("io.example.test").unwrap().accepted_at,
             "first"
         );
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("lock"));
     }
 
     #[test]

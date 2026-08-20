@@ -169,7 +169,7 @@ Next: **v0.1 M5 — Drift scheduling and native-update detection**.
 
 ## v0.1 M5 — Drift Scheduling and Native-Update Detection
 
-Status: **complete**
+Status: **in progress**
 
 Implemented:
 
@@ -202,7 +202,7 @@ Next: **v0.1 M6 — Thin Omarchy UI**.
 
 ## v0.1 M6 — Thin Omarchy UI
 
-Status: **complete**
+Status: **in progress**
 
 Implemented:
 
@@ -231,3 +231,16 @@ tests require the provisioned Omarchy VM harness. The repository contains no
 runtime QML dependency or privileged component.
 
 Next: **v0.1 M7 — Packaging, signing, and release**.
+
+M7 preparation is tracked in [`docs/m7-release-checklist.md`](m7-release-checklist.md).
+The Arch packaging directory is reserved at [`packaging/arch/`](../packaging/arch/);
+no installable package is claimed until clean-build and VM lifecycle gates are ready.
+
+## Post-review hardening
+
+The implementation review follow-up has closed the critical detection,
+provenance, identity, locking, and diff regressions. M5/M6 remain in progress
+until the supported Omarchy runtime validates the panel lifecycle and the
+release workflow verifies the complete desktop experience. Current automated
+verification includes format, clippy, workspace tests, and hermetic CLI
+integration tests on the pinned stable toolchain.
