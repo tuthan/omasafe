@@ -2,6 +2,7 @@
 members = [
     "crates/omasafe-cli",
     "crates/omasafe-core",
+    "crates/omasafe-marketplace",
     "crates/omasafe-plugin-trust",
     "crates/omasafe-report",
 ]
