@@ -129,3 +129,40 @@ Known limitation: baseline comparison and drift notifications are part of M4/M5;
 M3 records trust history but does not yet expose `plugin status` or diff review.
 
 Next: **v0.1 M4 — Diff and review workflow**.
+
+## v0.1 M4 — Diff and Review Workflow
+
+Status: **complete**
+
+Implemented:
+
+- `plugins status ID` compares the installed source identity with the latest
+  trust baseline and reports untrusted, unchanged, or changed state.
+- `plugins diff ID` compares the trusted Git revision with the installed
+  revision, using the live worktree when direct edits make the checkout dirty.
+- Bounded text diffs with binary/mode changes preserved by Git, and explicit
+  unavailable/truncated limitations.
+- Safe argv-only Git invocation with constrained diff references.
+- `plugins review ID` actions for acknowledge, scoped exclusion, rebaseline,
+  and restoring the previous baseline.
+- Rebaseline/restore/exclusion decisions require explicit confirmation and
+  reasons; accepting a revision does not create a future ignore rule.
+- Tests cover Git diff availability, invalid references, changed content,
+  identity comparison, and versioned decision history.
+
+Verification:
+
+```text
+cargo fmt --all -- --check
+cargo test --workspace
+cargo run -p omasafe-cli -- plugins status ID --format json
+cargo run -p omasafe-cli -- plugins diff ID
+cargo run -p omasafe-cli -- plugins review ID \
+  --action acknowledge --reason "reviewed" --scope current-source --yes
+```
+
+Known limitation: scheduling, alert deduplication, and desktop notification
+delivery belong to M5; M4 exposes the review decisions but does not schedule
+them.
+
+Next: **v0.1 M5 — Drift scheduling and native-update detection**.

@@ -48,6 +48,15 @@ pub struct SourceIdentity {
 const MAX_FILES: usize = 10_000;
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_DIFF_BYTES: usize = 128 * 1024;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DiffResult {
+    pub available: bool,
+    pub text: Option<String>,
+    pub truncated: bool,
+    pub limitation: Option<String>,
+}
 
 #[derive(Debug, Default, Serialize)]
 pub struct Coverage {
@@ -380,6 +389,56 @@ pub fn source_identity(
     }
 }
 
+pub fn git_diff(root: &Path, ref_a: &str, ref_b: &str) -> DiffResult {
+    if !valid_ref(ref_a) || !valid_ref(ref_b) {
+        return unavailable_diff("diff reference contains unsupported characters");
+    }
+    let range = format!("{ref_a}..{ref_b}");
+    let mut command = Command::new("git");
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args(["diff", "--no-ext-diff", "--binary", "--unified=3"]);
+    if ref_b == "WORKTREE" {
+        command.args([ref_a, "--"]);
+    } else {
+        command.args([&range, "--"]);
+    }
+    let output = command.current_dir(root).output();
+    let Ok(output) = output else {
+        return unavailable_diff("Git diff could not be started");
+    };
+    if !output.status.success() {
+        return unavailable_diff("Git diff was unavailable for the requested identity");
+    }
+    let mut bytes = output.stdout;
+    let truncated = bytes.len() > MAX_DIFF_BYTES;
+    bytes.truncate(MAX_DIFF_BYTES);
+    DiffResult {
+        available: true,
+        text: Some(String::from_utf8_lossy(&bytes).into_owned()),
+        truncated,
+        limitation: truncated.then(|| format!("diff output was bounded at {MAX_DIFF_BYTES} bytes")),
+    }
+}
+
+fn valid_ref(reference: &str) -> bool {
+    !reference.is_empty()
+        && reference.len() <= 256
+        && reference.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'/' | b'.' | b'-' | b'^' | b'~')
+        })
+}
+
+fn unavailable_diff(limitation: &str) -> DiffResult {
+    DiffResult {
+        available: false,
+        text: None,
+        truncated: false,
+        limitation: Some(limitation.into()),
+    }
+}
+
 struct ContentEntry {
     path: String,
     kind: u8,
@@ -488,7 +547,7 @@ fn file_mode(metadata: &fs::Metadata) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect, source_identity};
+    use super::{collect, git_diff, git_metadata, source_identity};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -586,6 +645,7 @@ mod tests {
                     .success()
             );
         }
+        let baseline_head = git_metadata(&plugin).head.unwrap();
         fs::write(
             plugin.join("main.qml"),
             "Item { property bool changed: true }\n",
@@ -603,6 +663,10 @@ mod tests {
         assert!(record.tree.is_some());
         assert_eq!(record.repository, None);
         assert_eq!(record.dirty, Some(true));
+        let diff = git_diff(&plugin, &baseline_head, "WORKTREE");
+        assert!(diff.available);
+        assert!(diff.text.unwrap().contains("main.qml"));
+        assert!(!git_diff(&plugin, "--bad", "HEAD").available);
         fs::remove_dir_all(root).unwrap();
     }
 
