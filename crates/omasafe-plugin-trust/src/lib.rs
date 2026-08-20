@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::process::Command;
 
@@ -12,6 +13,8 @@ pub mod baseline;
 pub struct Inventory {
     pub plugins: Vec<PluginRecord>,
     pub active_full_bar: Option<String>,
+    pub active_full_bars: Vec<String>,
+    pub bar_conflict: bool,
     pub non_builtin_bar_replaces_bar: bool,
     pub coverage: Coverage,
 }
@@ -31,10 +34,12 @@ pub struct PluginRecord {
     pub dirty: Option<bool>,
     pub content_digest: Option<String>,
     pub content_file_count: Option<usize>,
-    pub reason: Option<String>,
+    pub classification_reason: Option<String>,
+    pub limitations: Vec<String>,
+    pub file_digests: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SourceIdentity {
     pub plugin_id: String,
     pub repository: Option<String>,
@@ -43,12 +48,39 @@ pub struct SourceIdentity {
     pub content_digest: Option<String>,
     pub file_count: usize,
     pub limitations: Vec<String>,
+    #[serde(default)]
+    pub file_digests: BTreeMap<String, String>,
+}
+
+impl PartialEq for SourceIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity_material() == other.identity_material()
+    }
+}
+
+impl Eq for SourceIdentity {}
+
+impl SourceIdentity {
+    pub fn identity_material(&self) -> Vec<u8> {
+        serde_json::to_vec(&(
+            &self.plugin_id,
+            &self.repository,
+            &self.head,
+            &self.tree,
+            &self.content_digest,
+            self.file_count,
+            &self.limitations,
+        ))
+        .expect("source identity serialization cannot fail")
+    }
 }
 
 const MAX_FILES: usize = 10_000;
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_DIFF_BYTES: usize = 128 * 1024;
+const MAX_METADATA_BYTES: usize = 1024 * 1024;
+const SAMPLE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DiffResult {
@@ -72,6 +104,8 @@ struct ShellPlugin {
     active: Option<bool>,
     #[serde(rename = "firstParty", default)]
     first_party: Option<bool>,
+    #[serde(rename = "clonedFrom", default)]
+    cloned_from: Option<String>,
     #[serde(default)]
     kinds: Vec<String>,
 }
@@ -86,6 +120,18 @@ struct Manifest {
 }
 
 pub fn collect(plugin_root: &Path, shell_json: Option<&str>) -> Inventory {
+    collect_internal(plugin_root, shell_json, None)
+}
+
+pub fn collect_one(plugin_root: &Path, plugin_id: &str, shell_json: Option<&str>) -> Inventory {
+    collect_internal(plugin_root, shell_json, Some(plugin_id))
+}
+
+fn collect_internal(
+    plugin_root: &Path,
+    shell_json: Option<&str>,
+    target_id: Option<&str>,
+) -> Inventory {
     let shell = parse_shell_inventory(shell_json);
     let mut inventory = Inventory::default();
     inventory.coverage.limitations.extend(shell.limitations);
@@ -106,12 +152,10 @@ pub fn collect(plugin_root: &Path, shell_json: Option<&str>) -> Inventory {
         .into_iter()
         .map(|plugin| (plugin.id.clone(), plugin))
         .collect();
-    if let Some(plugin) = shell_by_id
-        .values()
-        .find(|plugin| plugin.active == Some(true) && plugin.kinds.iter().any(|kind| kind == "bar"))
-    {
-        inventory.active_full_bar = Some(plugin.id.clone());
-        inventory.non_builtin_bar_replaces_bar = plugin.first_party != Some(true);
+    for plugin in shell_by_id.values().filter(|plugin| {
+        plugin.active == Some(true) && plugin.kinds.iter().any(|kind| kind == "bar")
+    }) {
+        register_active_bar(&mut inventory, &plugin.id, plugin.first_party != Some(true));
     }
 
     for entry in entries {
@@ -127,25 +171,63 @@ pub fn collect(plugin_root: &Path, shell_json: Option<&str>) -> Inventory {
         };
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
-        let shell_plugin = shell_by_id.remove(&name);
-        let record = inspect_plugin(&path, &name, shell_plugin.as_ref());
+        let manifest_id = manifest_id(&path);
+        let shell_key = manifest_id
+            .as_deref()
+            .filter(|id| shell_by_id.contains_key(*id))
+            .map(str::to_owned)
+            .or_else(|| Some(name.clone()));
+        let shell_plugin = shell_key.and_then(|key| shell_by_id.remove(&key));
+        if let Some(target_id) = target_id
+            && manifest_id.as_deref() != Some(target_id)
+            && name != target_id
+            && shell_plugin
+                .as_ref()
+                .is_none_or(|plugin| plugin.id != target_id)
+        {
+            continue;
+        }
+        let mut record = inspect_plugin(&path, &name, shell_plugin.as_ref());
+        if record.id != name && record.classification != "unscannable" {
+            record.limitations.push("directory_id_mismatch".into());
+            record.limitations.sort();
+            record.limitations.dedup();
+        }
         if record.active == Some(true) && record.kinds.iter().any(|kind| kind == "bar") {
-            inventory.active_full_bar = Some(record.id.clone());
-            inventory.non_builtin_bar_replaces_bar = record.first_party != Some(true);
+            register_active_bar(&mut inventory, &record.id, record.first_party != Some(true));
         }
         inventory.plugins.push(record);
     }
 
     for plugin in shell_by_id.values() {
+        if plugin.cloned_from.as_deref() == Some("") || plugin.first_party == Some(true) {
+            continue;
+        }
         inventory.coverage.limitations.push(format!(
             "shell reports plugin {} but its directory was not found",
             plugin.id
         ));
     }
+    inventory.bar_conflict = inventory.active_full_bars.len() > 1;
     inventory
         .plugins
         .sort_by(|left, right| left.id.cmp(&right.id));
     inventory
+}
+
+fn register_active_bar(inventory: &mut Inventory, id: &str, non_builtin: bool) {
+    if !inventory.active_full_bars.iter().any(|active| active == id) {
+        inventory.active_full_bars.push(id.to_owned());
+    }
+    if inventory.active_full_bar.is_none() {
+        inventory.active_full_bar = Some(id.to_owned());
+    }
+    inventory.non_builtin_bar_replaces_bar |= non_builtin;
+}
+
+fn manifest_id(path: &Path) -> Option<String> {
+    let contents = fs::read(path.join("manifest.json")).ok()?;
+    serde_json::from_slice::<Manifest>(&contents).ok()?.id
 }
 
 pub fn query_shell() -> (Option<String>, Option<String>) {
@@ -205,13 +287,18 @@ fn inspect_plugin(path: &Path, name: &str, shell: Option<&ShellPlugin>) -> Plugi
         active: shell.and_then(|plugin| plugin.active),
         first_party: shell.and_then(|plugin| plugin.first_party),
         kinds: shell.map_or_else(Vec::new, |plugin| plugin.kinds.clone()),
-        repository: None,
+        repository: shell
+            .and_then(|plugin| plugin.cloned_from.as_deref())
+            .filter(|repository| !repository.is_empty())
+            .map(str::to_owned),
         head: None,
         tree: None,
         dirty: None,
         content_digest: None,
         content_file_count: None,
-        reason: None,
+        classification_reason: None,
+        limitations: Vec::new(),
+        file_digests: BTreeMap::new(),
     };
     if fs::symlink_metadata(path)
         .map(|metadata| metadata.file_type().is_symlink())
@@ -248,9 +335,9 @@ fn inspect_plugin(path: &Path, name: &str, shell: Option<&ShellPlugin>) -> Plugi
         } else {
             manifest.kinds
         },
-        classification: if shell.map_or(false, |plugin| plugin.first_party == Some(true))
-            || name.starts_with("omarchy.")
-        {
+        classification: if shell.is_some_and(|plugin| {
+            plugin.first_party == Some(true) || plugin.cloned_from.as_deref() == Some("")
+        }) {
             "built-in".into()
         } else {
             "cloned/local".into()
@@ -264,9 +351,7 @@ fn inspect_plugin(path: &Path, name: &str, shell: Option<&ShellPlugin>) -> Plugi
         record.head = git.head;
         record.tree = git.tree;
         record.dirty = git.dirty;
-        if git.reason.is_some() {
-            record.reason = git.reason;
-        }
+        record.classification_reason = git.reason;
     }
     let source = source_identity(
         &record.id,
@@ -277,14 +362,16 @@ fn inspect_plugin(path: &Path, name: &str, shell: Option<&ShellPlugin>) -> Plugi
     );
     record.content_digest = source.content_digest;
     record.content_file_count = Some(source.file_count);
+    record.limitations = source.limitations.clone();
+    record.file_digests = source.file_digests.clone();
     if !source.limitations.is_empty() {
-        record.reason = Some(source.limitations.join("; "));
+        record.classification_reason = Some(source.limitations.join(", "));
     }
     record
 }
 
 fn with_reason(mut record: PluginRecord, reason: &str) -> PluginRecord {
-    record.reason = Some(reason.into());
+    record.classification_reason = Some(reason.into());
     record
 }
 
@@ -329,9 +416,7 @@ fn git_metadata(path: &Path) -> GitMetadata {
 }
 
 fn git(path: &Path, args: &[&str]) -> Option<String> {
-    Command::new("git")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_OPTIONAL_LOCKS", "0")
+    git_command()
         .args(args)
         .current_dir(path)
         .output()
@@ -342,15 +427,17 @@ fn git(path: &Path, args: &[&str]) -> Option<String> {
 }
 
 fn git_status(path: &Path) -> Option<String> {
-    Command::new("git")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_OPTIONAL_LOCKS", "0")
+    git_command()
         .args(["status", "--porcelain", "--untracked-files=all"])
         .current_dir(path)
         .output()
         .ok()
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn git_command() -> Command {
+    omasafe_core::git::command()
 }
 
 pub fn source_identity(
@@ -365,7 +452,10 @@ pub fn source_identity(
     let mut total_bytes = 0;
     collect_entries(root, root, &mut entries, &mut total_bytes, &mut limitations);
     entries.sort_by(|left, right| left.path.cmp(&right.path));
+    limitations.sort();
+    limitations.dedup();
     let mut hasher = Sha256::new();
+    let mut file_digests = BTreeMap::new();
     for entry in &entries {
         hasher.update((entry.path.len() as u64).to_be_bytes());
         hasher.update(entry.path.as_bytes());
@@ -373,19 +463,21 @@ pub fn source_identity(
         hasher.update(entry.mode.to_be_bytes());
         hasher.update((entry.data.len() as u64).to_be_bytes());
         hasher.update(&entry.data);
+        let mut file_hasher = Sha256::new();
+        file_hasher.update([entry.kind]);
+        file_hasher.update(entry.mode.to_be_bytes());
+        file_hasher.update(&entry.data);
+        file_digests.insert(entry.path.clone(), format!("{:x}", file_hasher.finalize()));
     }
     SourceIdentity {
         plugin_id: plugin_id.into(),
         repository,
         head,
         tree,
-        content_digest: if limitations.is_empty() {
-            Some(format!("{:x}", hasher.finalize()))
-        } else {
-            None
-        },
+        content_digest: Some(format!("{:x}", hasher.finalize())),
         file_count: entries.len(),
         limitations,
+        file_digests,
     }
 }
 
@@ -394,15 +486,18 @@ pub fn git_diff(root: &Path, ref_a: &str, ref_b: &str) -> DiffResult {
         return unavailable_diff("diff reference contains unsupported characters");
     }
     let range = format!("{ref_a}..{ref_b}");
-    let mut command = Command::new("git");
-    command
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .args(["diff", "--no-ext-diff", "--binary", "--unified=3"]);
+    let mut command = git_command();
+    command.args([
+        "diff",
+        "--no-ext-diff",
+        "--binary",
+        "--unified=3",
+        "--no-renames",
+    ]);
     if ref_b == "WORKTREE" {
-        command.args([ref_a, "--"]);
+        command.args(["--end-of-options", ref_a, "--"]);
     } else {
-        command.args([&range, "--"]);
+        command.args(["--end-of-options", &range, "--"]);
     }
     let output = command.current_dir(root).output();
     let Ok(output) = output else {
@@ -424,6 +519,7 @@ pub fn git_diff(root: &Path, ref_a: &str, ref_b: &str) -> DiffResult {
 
 fn valid_ref(reference: &str) -> bool {
     !reference.is_empty()
+        && !reference.starts_with('-')
         && reference.len() <= 256
         && reference.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'/' | b'.' | b'-' | b'^' | b'~')
@@ -459,25 +555,45 @@ fn collect_entries(
     let read_dir = match fs::read_dir(directory) {
         Ok(read_dir) => read_dir,
         Err(error) => {
-            limitations.push(format!("unreadable path {}: {error}", directory.display()));
+            let _ = error;
+            limitations.push("unreadable_directory".into());
             return;
         }
     };
-    for entry in read_dir {
+    let mut children = Vec::new();
+    for item in read_dir {
+        match item {
+            Ok(entry) => children.push(entry),
+            Err(_) => limitations.push("directory_entry_unreadable".into()),
+        }
+    }
+    children.sort_by_key(|entry| entry.file_name());
+    for entry in children {
         if entries.len() >= MAX_FILES {
-            limitations.push(format!("file limit of {MAX_FILES} exceeded"));
+            limitations.push("file_limit".into());
             return;
         }
-        let Ok(entry) = entry else {
-            limitations.push("directory entry could not be read".into());
-            continue;
-        };
         let path = entry.path();
         if path.file_name().is_some_and(|name| name == ".git") {
+            if path.is_dir() {
+                collect_git_metadata(root, &path, entries, limitations);
+            } else if let Ok(metadata) = fs::symlink_metadata(&path) {
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                entries.push(ContentEntry {
+                    path: relative,
+                    kind: b'g',
+                    mode: file_mode(&metadata),
+                    data: bounded_file_bytes(&path),
+                });
+            }
             continue;
         }
         let Ok(metadata) = fs::symlink_metadata(&path) else {
-            limitations.push(format!("metadata unavailable: {}", path.display()));
+            limitations.push("metadata_unavailable".into());
             continue;
         };
         let relative = path
@@ -506,15 +622,47 @@ fn collect_entries(
             });
             collect_entries(root, &path, entries, total_bytes, limitations);
         } else if file_type.is_file() {
+            if *total_bytes >= MAX_TOTAL_BYTES {
+                limitations.push("aggregate_byte_limit".into());
+                entries.push(ContentEntry {
+                    path: relative,
+                    kind: b'x',
+                    mode,
+                    data: metadata.len().to_be_bytes().to_vec(),
+                });
+                continue;
+            }
             if metadata.len() > MAX_FILE_BYTES {
-                limitations.push(format!("file exceeds {MAX_FILE_BYTES} bytes: {relative}"));
+                limitations.push("oversize_file".into());
+                let (data, sampled) = skipped_file_digest(
+                    &path,
+                    metadata.len(),
+                    MAX_TOTAL_BYTES.saturating_sub(*total_bytes),
+                );
+                *total_bytes = total_bytes.saturating_add(sampled);
+                entries.push(ContentEntry {
+                    path: relative,
+                    kind: b'x',
+                    mode,
+                    data,
+                });
                 continue;
             }
             if total_bytes.saturating_add(metadata.len()) > MAX_TOTAL_BYTES {
-                limitations.push(format!(
-                    "aggregate file limit of {MAX_TOTAL_BYTES} bytes exceeded"
-                ));
-                return;
+                limitations.push("aggregate_byte_limit".into());
+                let (data, sampled) = skipped_file_digest(
+                    &path,
+                    metadata.len(),
+                    MAX_TOTAL_BYTES.saturating_sub(*total_bytes),
+                );
+                *total_bytes = total_bytes.saturating_add(sampled);
+                entries.push(ContentEntry {
+                    path: relative,
+                    kind: b'x',
+                    mode,
+                    data,
+                });
+                continue;
             }
             match fs::read(&path) {
                 Ok(data) => {
@@ -526,12 +674,114 @@ fn collect_entries(
                         data,
                     });
                 }
-                Err(error) => limitations.push(format!("file unreadable {relative}: {error}")),
+                Err(_) => {
+                    limitations.push("unreadable_file".into());
+                    entries.push(ContentEntry {
+                        path: relative,
+                        kind: b'x',
+                        mode,
+                        data: Vec::new(),
+                    });
+                }
             }
         } else {
-            limitations.push(format!("special file skipped: {relative}"));
+            limitations.push("special_file".into());
+            entries.push(ContentEntry {
+                path: relative,
+                kind: b'x',
+                mode,
+                data: Vec::new(),
+            });
         }
     }
+}
+
+fn collect_git_metadata(
+    root: &Path,
+    git: &Path,
+    entries: &mut Vec<ContentEntry>,
+    limitations: &mut Vec<String>,
+) {
+    for name in ["config", "HEAD", "packed-refs"] {
+        let path = git.join(name);
+        if let Ok(metadata) = fs::symlink_metadata(&path)
+            && metadata.is_file()
+        {
+            let relative = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let data = bounded_file_bytes(&path);
+            entries.push(ContentEntry {
+                path: relative,
+                kind: b'g',
+                mode: file_mode(&metadata),
+                data,
+            });
+        }
+    }
+    let hooks = git.join("hooks");
+    if let Ok(items) = fs::read_dir(&hooks) {
+        for item in items.flatten() {
+            let item_path = item.path();
+            if let Ok(metadata) = fs::symlink_metadata(&item_path) {
+                let relative = item_path
+                    .strip_prefix(root)
+                    .unwrap_or(&item_path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                entries.push(ContentEntry {
+                    path: relative,
+                    kind: b'h',
+                    mode: file_mode(&metadata),
+                    data: bounded_file_bytes(&item_path),
+                });
+            }
+        }
+    } else if hooks.exists() {
+        limitations.push("git_hooks_unreadable".into());
+    }
+}
+
+fn skipped_file_digest(path: &Path, size: u64, budget: u64) -> (Vec<u8>, u64) {
+    let mut hasher = Sha256::new();
+    hasher.update(size.to_be_bytes());
+    let mut sampled = 0;
+    if budget > 0
+        && let Ok(mut file) = fs::File::open(path)
+    {
+        let sample_limit = SAMPLE_BYTES.min(budget);
+        let mut buffer = Vec::new();
+        let first = file
+            .by_ref()
+            .take(sample_limit)
+            .read_to_end(&mut buffer)
+            .unwrap_or(0);
+        hasher.update(&buffer);
+        sampled += first as u64;
+        if size > sample_limit && sample_limit > 1 {
+            let tail = sample_limit / 2;
+            let _ = file.seek(SeekFrom::End(-(tail as i64)));
+            buffer.clear();
+            let last = file.take(tail).read_to_end(&mut buffer).unwrap_or(0);
+            hasher.update(&buffer);
+            sampled += last as u64;
+        }
+    }
+    (hasher.finalize().to_vec(), sampled)
+}
+
+fn bounded_file_bytes(path: &Path) -> Vec<u8> {
+    let Ok(mut file) = fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut bytes = Vec::new();
+    let _ = file
+        .by_ref()
+        .take((MAX_METADATA_BYTES + 1) as u64)
+        .read_to_end(&mut bytes);
+    bytes
 }
 
 #[cfg(unix)]
@@ -599,6 +849,36 @@ mod tests {
             .unwrap();
         assert_eq!(broken.classification, "unscannable");
         assert_eq!(valid.classification, "cloned/local");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reconciles_shell_metadata_by_manifest_id_when_directory_name_differs() {
+        let root = fixture_root();
+        manifest(
+            &root.join("local-name"),
+            "io.example.manifest",
+            &["bar-widget"],
+        );
+        let inventory = collect(
+            &root,
+            Some(
+                r#"[{"id":"io.example.manifest","enabled":true,"active":true,"firstParty":false,"clonedFrom":"https://example.test/repo","kinds":["bar"]}]"#,
+            ),
+        );
+        let record = &inventory.plugins[0];
+        assert_eq!(record.id, "io.example.manifest");
+        assert_eq!(record.enabled, Some(true));
+        assert_eq!(
+            record.repository.as_deref(),
+            Some("https://example.test/repo")
+        );
+        assert!(
+            record
+                .limitations
+                .iter()
+                .any(|limitation| limitation == "directory_id_mismatch")
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -686,6 +966,82 @@ mod tests {
         .unwrap();
         let changed = source_identity("io.example.digest", &plugin, None, None, None);
         assert_ne!(first.content_digest, changed.content_digest);
+        assert!(changed.file_digests.contains_key("main.qml"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn derived_file_maps_do_not_change_source_identity_equality() {
+        let root = fixture_root();
+        let mut left = source_identity("io.example.compat", &root, None, None, None);
+        let mut right = left.clone();
+        left.file_digests.clear();
+        right
+            .file_digests
+            .insert("main.qml".into(), "digest".into());
+        assert_eq!(left, right);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mode_changes_are_reviewable_file_changes() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = fixture_root();
+        let plugin = root.join("io.example.mode");
+        manifest(&plugin, "io.example.mode", &["bar-widget"]);
+        let file = plugin.join("payload.sh");
+        fs::write(&file, "payload\n").unwrap();
+        let first = source_identity("io.example.mode", &plugin, None, None, None);
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).unwrap();
+        let second = source_identity("io.example.mode", &plugin, None, None, None);
+        assert_ne!(
+            first.file_digests.get("payload.sh"),
+            second.file_digests.get("payload.sh")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn limited_files_still_have_a_digest_and_content_changes_are_visible() {
+        let root = fixture_root();
+        let plugin = root.join("io.example.limited");
+        manifest(&plugin, "io.example.limited", &["bar-widget"]);
+        let large = plugin.join("asset.bin");
+        let data = vec![b'a'; 16 * 1024 * 1024 + 1];
+        fs::write(&large, &data).unwrap();
+        for name in [
+            "code_a.qml",
+            "code_b.qml",
+            "code_c.qml",
+            "code_d.qml",
+            "code_e.qml",
+            "code_f.qml",
+            "code_g.qml",
+        ] {
+            fs::write(plugin.join(name), "Item {}\n").unwrap();
+        }
+        let first = source_identity("io.example.limited", &plugin, None, None, None);
+        fs::write(&large, vec![b'b'; 16 * 1024 * 1024 + 1]).unwrap();
+        let second = source_identity("io.example.limited", &plugin, None, None, None);
+        assert!(first.content_digest.is_some());
+        assert!(!first.limitations.is_empty());
+        assert_ne!(first.content_digest, second.content_digest);
+        assert!(first.file_digests.contains_key("code_g.qml"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn git_trust_files_are_part_of_identity() {
+        let root = fixture_root();
+        let plugin = root.join("io.example.git-config");
+        manifest(&plugin, "io.example.git-config", &["bar-widget"]);
+        fs::create_dir_all(plugin.join(".git")).unwrap();
+        fs::write(plugin.join(".git/config"), "[core]\n").unwrap();
+        let first = source_identity("io.example.git-config", &plugin, None, None, None);
+        fs::write(plugin.join(".git/config"), "[core]\n\tfsmonitor = true\n").unwrap();
+        let second = source_identity("io.example.git-config", &plugin, None, None, None);
+        assert_ne!(first.content_digest, second.content_digest);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -706,7 +1062,12 @@ mod tests {
             .find(|plugin| plugin.id == "io.example.link")
             .unwrap();
         assert_eq!(link.classification, "unscannable");
-        assert!(link.reason.as_deref().unwrap().contains("symlink"));
+        assert!(
+            link.classification_reason
+                .as_deref()
+                .unwrap()
+                .contains("symlink")
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

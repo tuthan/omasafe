@@ -1,12 +1,16 @@
 import QtQuick
 import qs.Commons
 import qs.Ui
+import Quickshell.Io
 
 BarWidget {
   id: root
   moduleName: "io.github.tuthan.omasafe"
 
   property int alertCount: 0
+  property int outstandingCount: 0
+  property int newCount: 0
+  property var alerts: []
   property string scanState: "unknown"
   property string limitation: ""
 
@@ -19,6 +23,9 @@ BarWidget {
       var report = JSON.parse(output)
       var result = report.result || {}
       root.alertCount = (result.alerts || []).length
+      root.outstandingCount = result.outstanding || root.alertCount
+      root.newCount = result.new || 0
+      root.alerts = result.alerts || []
       root.scanState = result.quiet === true ? "quiet" : "attention"
       root.limitation = ""
     } catch (error) {
@@ -39,7 +46,7 @@ BarWidget {
       onStreamFinished: root.applyScan(text())
     }
     onExited: function(exitCode) {
-      if (exitCode !== 0) root.scanState = "unavailable"
+      if (exitCode !== 0 && exitCode !== 3) root.scanState = "unavailable"
     }
   }
 
@@ -49,6 +56,8 @@ BarWidget {
     repeat: true
     onTriggered: root.runScan()
   }
+
+  Component.onCompleted: root.runScan()
 
   Loader {
     id: panelLoader
@@ -65,10 +74,11 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.alertCount > 0 ? "!" : "✓"
+    text: root.scanState === "unavailable" || root.scanState === "unknown"
+      ? "?" : (root.outstandingCount > 0 ? "!" : "✓")
     slotSize: Style.bar.statusSlot
-    tooltipText: root.alertCount > 0
-      ? "OmaSafe: " + root.alertCount + " item(s) need review"
+    tooltipText: root.outstandingCount > 0
+      ? "OmaSafe: " + root.outstandingCount + " item(s) need review"
       : "OmaSafe: " + root.scanState
     onPressed: function(mouseButton) {
       if (mouseButton === Qt.LeftButton) root.runScan()

@@ -5,7 +5,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const MAX_CATALOG_BYTES: usize = 32 * 1024 * 1024;
+pub const OFFICIAL_REPOSITORY: &str = "https://github.com/HANCORE-linux/omarchy-plugin-marketplace";
 pub const DISCLAIMER: &str = "Marketplace fields are claims made by the named registry snapshot, not local security guarantees.";
+
+pub fn valid_commit(value: &str) -> bool {
+    (value.len() == 40 || value.len() == 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -21,6 +26,8 @@ pub enum Error {
     InvalidCommit,
     #[error("catalog revision is older or unrelated to the last accepted snapshot")]
     Rollback,
+    #[error("catalog JSON has no recognized entry list")]
+    InvalidShape,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -30,6 +37,8 @@ pub struct CatalogSnapshot {
     pub file_digest: String,
     pub retrieved_at: String,
     pub generation_time: Option<String>,
+    #[serde(skip)]
+    pub verified: bool,
     pub entries: Vec<CatalogEntry>,
 }
 
@@ -107,7 +116,10 @@ pub fn parse_catalog(
             generation_time,
             generated_at,
         } => (
-            entries.or(plugins).unwrap_or_default(),
+            match entries.or(plugins) {
+                Some(entries) => entries,
+                None => return Err(Error::InvalidShape),
+            },
             generation_time.or(generated_at),
         ),
     };
@@ -117,6 +129,7 @@ pub fn parse_catalog(
         file_digest: hex_digest(bytes),
         retrieved_at,
         generation_time,
+        verified: false,
         entries,
     })
 }
@@ -127,6 +140,10 @@ pub fn load_catalog(
     repository_commit: String,
     retrieved_at: String,
 ) -> Result<CatalogSnapshot, Error> {
+    let size = fs::metadata(path)?.len();
+    if size > MAX_CATALOG_BYTES as u64 {
+        return Err(Error::Oversized);
+    }
     let bytes = fs::read(path)?;
     parse_catalog(
         bytes.as_slice(),
@@ -159,13 +176,11 @@ pub fn fetch_pinned_catalog(
     repository_commit: &str,
     retrieved_at: String,
 ) -> Result<CatalogSnapshot, Error> {
-    if repository_commit.is_empty()
-        || repository_commit.len() > 64
-        || !repository_commit
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
-    {
+    if !valid_commit(repository_commit) {
         return Err(Error::InvalidCommit);
+    }
+    if !repository_url.starts_with("https://") || repository_url.starts_with("-") {
+        return Err(Error::Git("catalog repository must be an HTTPS URL".into()));
     }
     fs::create_dir_all(cache_dir)?;
     let repository_dir = cache_dir.join("catalog.git");
@@ -175,7 +190,9 @@ pub fn fetch_pinned_catalog(
             &[
                 "init",
                 "--bare",
-                repository_dir.to_str().unwrap_or_default(),
+                repository_dir
+                    .to_str()
+                    .ok_or_else(|| Error::Git("catalog cache path is not UTF-8".into()))?,
             ],
         )?;
     }
@@ -190,32 +207,36 @@ pub fn fetch_pinned_catalog(
         &["fetch", "--no-tags", "origin", repository_commit],
     )?;
     let metadata_path = cache_dir.join("catalog.meta.json");
-    if let Ok(metadata) = fs::read(&metadata_path) {
-        if let Ok(previous) = serde_json::from_slice::<CacheMetadata>(&metadata) {
-            if previous.repository_commit != repository_commit
-                && !is_ancestor(
-                    &repository_dir,
-                    &previous.repository_commit,
-                    repository_commit,
-                )?
-            {
-                return Err(Error::Rollback);
-            }
-        }
+    if let Ok(metadata) = fs::read(&metadata_path)
+        && let Ok(previous) = serde_json::from_slice::<CacheMetadata>(&metadata)
+        && previous.repository_commit != repository_commit
+        && !is_ancestor(
+            &repository_dir,
+            &previous.repository_commit,
+            repository_commit,
+        )?
+    {
+        return Err(Error::Rollback);
     }
     let output = run_git_output(
         &repository_dir,
         &["show", &format!("{repository_commit}:site/catalog.json")],
     )?;
+    let retrieved_at_for_cache = retrieved_at.clone();
     let snapshot = parse_catalog(
         &output,
         repository_url.to_owned(),
         repository_commit.to_owned(),
         retrieved_at,
     )?;
+    let mut snapshot = snapshot;
+    snapshot.verified = true;
     write_atomic(&cache_dir.join("catalog.json"), &output)?;
     let metadata = serde_json::to_vec(&CacheMetadata {
         repository_commit: repository_commit.into(),
+        repository_url: Some(repository_url.into()),
+        retrieved_at: Some(retrieved_at_for_cache),
+        file_digest: Some(snapshot.file_digest.clone()),
     })?;
     write_atomic(&metadata_path, &metadata)?;
     Ok(snapshot)
@@ -345,9 +366,7 @@ fn run_git(directory: &Path, args: &[&str]) -> Result<(), Error> {
 }
 
 fn run_git_output(directory: &Path, args: &[&str]) -> Result<Vec<u8>, Error> {
-    let output = std::process::Command::new("git")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
+    let output = git_command()
         .args(args)
         .current_dir(directory)
         .output()
@@ -364,12 +383,58 @@ fn run_git_output(directory: &Path, args: &[&str]) -> Result<Vec<u8>, Error> {
 #[derive(Debug, Deserialize, Serialize)]
 struct CacheMetadata {
     repository_commit: String,
+    #[serde(default)]
+    repository_url: Option<String>,
+    #[serde(default)]
+    retrieved_at: Option<String>,
+    #[serde(default)]
+    file_digest: Option<String>,
+}
+
+pub fn load_cached_catalog(cache_dir: &Path) -> Result<Option<CatalogSnapshot>, Error> {
+    let metadata_path = cache_dir.join("catalog.meta.json");
+    let catalog_path = cache_dir.join("catalog.json");
+    if !metadata_path.exists() || !catalog_path.exists() {
+        return Ok(None);
+    }
+    let metadata: CacheMetadata = serde_json::from_slice(&fs::read(&metadata_path)?)?;
+    let size = fs::metadata(&catalog_path)?.len();
+    if size > MAX_CATALOG_BYTES as u64 {
+        return Err(Error::Oversized);
+    }
+    let bytes = fs::read(&catalog_path)?;
+    let repository = metadata
+        .repository_url
+        .clone()
+        .unwrap_or_else(|| OFFICIAL_REPOSITORY.into());
+    let mut snapshot = parse_catalog(
+        &bytes,
+        repository,
+        metadata.repository_commit,
+        metadata.retrieved_at.unwrap_or_else(|| "unknown".into()),
+    )?;
+    let file_matches = metadata
+        .file_digest
+        .as_deref()
+        .is_some_and(|digest| digest == snapshot.file_digest);
+    let repo_matches = metadata.repository_url.as_deref() == Some(OFFICIAL_REPOSITORY)
+        && cache_dir.join("catalog.git").is_dir();
+    let commit_matches = valid_commit(&snapshot.repository_commit)
+        && repo_matches
+        && run_git_output(
+            &cache_dir.join("catalog.git"),
+            &[
+                "show",
+                &format!("{}:site/catalog.json", snapshot.repository_commit),
+            ],
+        )
+        .is_ok_and(|cached| cached == bytes);
+    snapshot.verified = file_matches && commit_matches;
+    Ok(Some(snapshot))
 }
 
 fn is_ancestor(directory: &Path, previous: &str, current: &str) -> Result<bool, Error> {
-    let output = std::process::Command::new("git")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
+    let output = git_command()
         .args(["merge-base", "--is-ancestor", previous, current])
         .current_dir(directory)
         .output()
@@ -383,6 +448,10 @@ fn is_ancestor(directory: &Path, previous: &str, current: &str) -> Result<bool, 
             String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         ))
     }
+}
+
+fn git_command() -> std::process::Command {
+    omasafe_core::git::command()
 }
 
 #[cfg(test)]
@@ -452,6 +521,19 @@ mod tests {
         assert!(matches!(
             parse_catalog(&bytes, "repo".into(), "commit".into(), "now".into()),
             Err(Error::Oversized)
+        ));
+    }
+
+    #[test]
+    fn rejects_wrapped_catalog_without_entries() {
+        assert!(matches!(
+            parse_catalog(
+                br#"{"pluginList":[]}"#,
+                "repo".into(),
+                "commit".into(),
+                "now".into()
+            ),
+            Err(Error::InvalidShape)
         ));
     }
 
