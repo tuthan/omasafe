@@ -35,9 +35,11 @@ cargo run -p omasafe-cli -- scan --format json
 omasafe-cli schedule install
 ```
 
-The Omarchy plugin is under [`plugin/`](plugin/). Validate it with
-`omarchy plugin validate plugin` and `qmllint plugin/BarWidget.qml
-plugin/Panel.qml` on the supported Omarchy release.
+The Omarchy UI plugin is maintained as the sibling project
+[`../omasafe-plugin/`](../omasafe-plugin/) so it has a repository-root
+`manifest.json` for direct Omarchy publishing. Validate it from the sibling
+directory with `omarchy plugin validate .` and `qmllint BarWidget.qml
+Panel.qml` on the supported Omarchy release.
 
 The CLI is the engine. The Omarchy bar-widget is a thin QML interface
 over bounded CLI commands. Runtime state uses XDG paths:

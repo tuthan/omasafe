@@ -47,14 +47,14 @@ The workflow is an asset-publishing mechanism, not a replacement for package sig
 ## Omarchy plugin publishing boundary
 
 The official Omarchy publishing contract requires a public repository with a valid
-`manifest.json` at its repository root. The current UI is under `plugin/`, so that
-subdirectory cannot be submitted as the plugin repository by itself. Choose one of
-these M7 layouts before publishing:
+`manifest.json` at its repository root. The UI has now been moved to the sibling
+project `../omasafe-plugin/`, whose root contains the manifest and QML entry points.
+Before publishing, initialize that directory as its own GitHub repository and choose
+one of these M7 distribution layouts:
 
-- split the UI into a dedicated plugin repository and keep this repository as the CLI
-  engine; or
-- make this repository's root the plugin repository by moving/rewriting the manifest
-  and entry-point paths, while keeping the Rust workspace as source content.
+- keep `omasafe-plugin` as the dedicated plugin repository and keep this repository as
+  the CLI engine; or
+- combine the two repositories later if a single source repository is preferred.
 
 Neither layout causes `omarchy plugin add` to install `omasafe-cli`. The CLI must be
 installed separately through the Arch package/release workflow, and the plugin should

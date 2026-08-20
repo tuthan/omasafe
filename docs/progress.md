@@ -206,7 +206,7 @@ Status: **in progress**
 
 Implemented:
 
-- Valid `bar-widget` manifest with nested `Panel.qml`.
+- Valid standalone `bar-widget` manifest with nested `Panel.qml`.
 - Alert count/state badge with quiet, attention, and unavailable states; no
   security grade or safe badge.
 - Fixed argv-only CLI invocation of `omasafe-cli scan --format json`.
@@ -221,8 +221,10 @@ Implemented:
 Verification:
 
 ```text
-omarchy plugin validate plugin
-qmllint plugin/BarWidget.qml plugin/Panel.qml
+cd ../omasafe-plugin
+omarchy plugin validate .
+qmllint BarWidget.qml Panel.qml
+cd ../omasafe
 cargo test --workspace
 ```
 
@@ -233,8 +235,9 @@ runtime QML dependency or privileged component.
 Next: **v0.1 M7 — Packaging, signing, and release**.
 
 M7 preparation is tracked in [`docs/m7-release-checklist.md`](m7-release-checklist.md).
-The Arch packaging directory is reserved at [`packaging/arch/`](../packaging/arch/);
-no installable package is claimed until clean-build and VM lifecycle gates are ready.
+The standalone plugin checkout is prepared at `../omasafe-plugin/`; the Arch
+packaging directory is reserved at [`packaging/arch/`](../packaging/arch/). No
+installable package is claimed until clean-build and VM lifecycle gates are ready.
 
 ## Post-review hardening
 

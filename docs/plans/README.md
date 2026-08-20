@@ -134,10 +134,6 @@ omasafe/
 │   ├── omasafe-plugin-trust/
 │   ├── omasafe-marketplace/
 │   └── omasafe-report/
-├── plugin/
-│   ├── manifest.json
-│   ├── BarWidget.qml
-│   └── Panel.qml
 ├── fixtures/
 │   ├── plugins/
 │   └── marketplace/
@@ -145,6 +141,10 @@ omasafe/
 │   └── arch/
 └── docs/
 ```
+
+The Omarchy UI is maintained in the sibling `omasafe-plugin/` project so its
+repository root can carry the plugin `manifest.json` required for publishing.
+The main repository remains the CLI engine and release/package source.
 
 Add crates only when a release needs them; do not pre-build v0.3–v0.5 subsystems.
 
