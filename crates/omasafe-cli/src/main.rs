@@ -5,7 +5,7 @@ use omasafe_core::{TOOL_VERSION, paths::XdgPaths};
 use omasafe_marketplace::{Correlation, correlate, load_catalog};
 use omasafe_plugin_trust::{
     DiffResult, SourceIdentity,
-    baseline::{ReviewDecision, TrustHistory, TrustRecord},
+    baseline::{ReviewDecision, ScanState, TrustHistory, TrustRecord},
     collect, git_diff, query_shell,
 };
 use omasafe_report::Report;
@@ -41,9 +41,14 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         [command, subcommand, id, rest @ ..] if command == "plugins" && subcommand == "review" => {
             review(id, rest)?
         }
+        [command] if command == "scan" => scan(&[])?,
+        [command, rest @ ..] if command == "scan" => scan(rest)?,
+        [command, subcommand, rest @ ..] if command == "schedule" && subcommand == "install" => {
+            schedule_install(rest)?
+        }
         _ => {
             eprintln!(
-                "usage: omasafe-cli plugins inventory ... | plugins trust ID ... | plugins status ID [--format text|json] | plugins diff ID [REF_A..REF_B] | plugins review ID --action ACTION --reason REASON [--scope SCOPE] --yes | paths"
+                "usage: omasafe-cli plugins ... | scan [--format text|json] [--notify] | schedule install | paths"
             );
             std::process::exit(2);
         }
@@ -152,6 +157,224 @@ fn expected_component(current: Option<&str>, expected: Option<&str>) -> bool {
         (None, None) => true,
         _ => false,
     }
+}
+
+#[derive(serde::Serialize)]
+struct ScanAlert {
+    plugin_id: String,
+    kind: String,
+    message: String,
+    post_change: bool,
+}
+
+#[derive(serde::Serialize)]
+struct ScanResult {
+    alerts: Vec<ScanAlert>,
+    quiet: bool,
+    post_change_detection: bool,
+}
+
+fn scan(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut format = "text";
+    let mut notify = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--notify" => {
+                notify = true;
+                index += 1;
+            }
+            "--format" => {
+                format = args
+                    .get(index + 1)
+                    .map(String::as_str)
+                    .ok_or("missing format")?;
+                index += 2;
+            }
+            value => return Err(format!("unknown scan argument: {value}").into()),
+        }
+    }
+    if !matches!(format, "text" | "json") {
+        return Err(format!("unsupported format: {format}").into());
+    }
+    let paths = XdgPaths::discover()?;
+    paths.ensure()?;
+    let plugin_root = home()?.join(".config/omarchy/plugins");
+    let (shell_json, shell_error) = query_shell();
+    let mut inventory = collect(&plugin_root, shell_json.as_deref());
+    if let Some(error) = shell_error {
+        inventory.coverage.limitations.push(error);
+    }
+    let history = TrustHistory::load(&paths.state.join("trust-history.json"))?;
+    let mut state = ScanState::load(&paths.state.join("scan-state.json"))?;
+    let mut alerts = Vec::new();
+    for plugin in &inventory.plugins {
+        let Some(trusted) = history.latest(&plugin.id).map(|record| &record.accepted) else {
+            continue;
+        };
+        let current = SourceIdentity {
+            plugin_id: plugin.id.clone(),
+            repository: plugin.repository.clone(),
+            head: plugin.head.clone(),
+            tree: plugin.tree.clone(),
+            content_digest: plugin.content_digest.clone(),
+            file_count: plugin.content_file_count.unwrap_or_default(),
+            limitations: plugin.reason.clone().into_iter().collect(),
+        };
+        if current != *trusted {
+            let key = format!("drift:{}:{}", plugin.id, serde_json::to_string(&current)?);
+            let alert = ScanAlert {
+                plugin_id: plugin.id.clone(),
+                kind: "source-drift".into(),
+                message: "installed source differs from the trusted baseline; review is required"
+                    .into(),
+                post_change: true,
+            };
+            if state.is_new(&key) {
+                if notify {
+                    notify_user(&alert);
+                }
+                state.record(key, now());
+                alerts.push(alert);
+            }
+        }
+        if plugin.classification == "unscannable" {
+            let key = format!(
+                "coverage:{}:{}",
+                plugin.id,
+                plugin.reason.as_deref().unwrap_or("unknown")
+            );
+            let alert = ScanAlert {
+                plugin_id: plugin.id.clone(),
+                kind: "lost-coverage".into(),
+                message: "plugin can no longer be scanned".into(),
+                post_change: false,
+            };
+            if state.is_new(&key) {
+                if notify {
+                    notify_user(&alert);
+                }
+                state.record(key, now());
+                alerts.push(alert);
+            }
+        }
+    }
+    for trusted in history
+        .records
+        .iter()
+        .filter(|record| record.plugin_id != "")
+    {
+        if !inventory
+            .plugins
+            .iter()
+            .any(|plugin| plugin.id == trusted.plugin_id)
+        {
+            let key = format!("missing:{}", trusted.plugin_id);
+            let alert = ScanAlert {
+                plugin_id: trusted.plugin_id.clone(),
+                kind: "missing-plugin".into(),
+                message: "trusted plugin is missing or unavailable".into(),
+                post_change: true,
+            };
+            if state.is_new(&key) {
+                if notify {
+                    notify_user(&alert);
+                }
+                state.record(key, now());
+                alerts.push(alert);
+            }
+        }
+    }
+    if inventory
+        .coverage
+        .limitations
+        .iter()
+        .any(|limitation| !limitation.starts_with("shell reports plugin "))
+    {
+        let key = format!(
+            "coverage:inventory:{}",
+            inventory.coverage.limitations.len()
+        );
+        if state.is_new(&key) {
+            let alert = ScanAlert {
+                plugin_id: "inventory".into(),
+                kind: "lost-coverage".into(),
+                message: "inventory coverage is limited; review the scan report".into(),
+                post_change: false,
+            };
+            if notify {
+                notify_user(&alert);
+            }
+            state.record(key, now());
+            alerts.push(alert);
+        }
+    }
+    state.write_atomic(&paths.state.join("scan-state.json"))?;
+    let result = ScanResult {
+        quiet: alerts.is_empty(),
+        post_change_detection: true,
+        alerts,
+    };
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&Report::new(TOOL_VERSION, now(), result))?
+        );
+    } else if result.quiet {
+        println!("No new actionable changes detected.");
+    } else {
+        for alert in result.alerts {
+            println!("{}: {}", alert.kind, alert.message);
+        }
+    }
+    Ok(())
+}
+
+fn notify_user(alert: &ScanAlert) {
+    let body = format!("{}: {}", alert.plugin_id, alert.message);
+    let result = std::process::Command::new("notify-send")
+        .args(["--urgency=critical", "OmaSafe", &body])
+        .status();
+    if result.is_err() {
+        eprintln!("OmaSafe notification unavailable: {body}");
+    }
+}
+
+fn schedule_install(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if !args.is_empty() {
+        return Err("schedule install takes no arguments".into());
+    }
+    let home = home()?;
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    let unit_dir = config_home.join("systemd/user");
+    std::fs::create_dir_all(&unit_dir)?;
+    let executable = std::env::current_exe()?;
+    std::fs::write(
+        unit_dir.join("omasafe-scan.service"),
+        format!(
+            "[Unit]\nDescription=OmaSafe plugin drift scan\n\n[Service]\nType=oneshot\nExecStart={} scan --notify\n",
+            executable.display()
+        ),
+    )?;
+    std::fs::write(
+        unit_dir.join("omasafe-scan.timer"),
+        "[Unit]\nDescription=Daily OmaSafe plugin drift scan\n\n[Timer]\nOnCalendar=daily\nPersistent=true\nUnit=omasafe-scan.service\n\n[Install]\nWantedBy=timers.target\n",
+    )?;
+    for args in [
+        vec!["--user", "daemon-reload"],
+        vec!["--user", "enable", "--now", "omasafe-scan.timer"],
+    ] {
+        let status = std::process::Command::new("systemctl")
+            .args(args)
+            .status()?;
+        if !status.success() {
+            return Err("systemd user timer installation failed".into());
+        }
+    }
+    println!("Installed and enabled daily OmaSafe scan timer.");
+    Ok(())
 }
 
 #[derive(serde::Serialize)]

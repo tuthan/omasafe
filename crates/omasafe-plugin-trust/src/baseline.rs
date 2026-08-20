@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -40,6 +41,13 @@ pub struct ReviewDecision {
     pub created_at: String,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct ScanState {
+    pub schema_version: u64,
+    #[serde(default)]
+    pub alerts: BTreeMap<String, String>,
+}
+
 impl TrustHistory {
     pub fn load(path: &Path) -> Result<Self, Error> {
         if !path.exists() {
@@ -63,6 +71,41 @@ impl TrustHistory {
             .iter()
             .rev()
             .find(|record| record.plugin_id == plugin_id)
+    }
+
+    pub fn write_atomic(&self, path: &Path) -> Result<(), Error> {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+        fs::write(&temporary, serde_json::to_vec_pretty(self)?)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
+        }
+        fs::rename(temporary, path)?;
+        Ok(())
+    }
+}
+
+impl ScanState {
+    pub fn load(path: &Path) -> Result<Self, Error> {
+        if !path.exists() {
+            return Ok(Self {
+                schema_version: HISTORY_SCHEMA_VERSION,
+                alerts: BTreeMap::new(),
+            });
+        }
+        Ok(serde_json::from_slice(&fs::read(path)?)?)
+    }
+
+    pub fn is_new(&self, key: &str) -> bool {
+        !self.alerts.contains_key(key)
+    }
+
+    pub fn record(&mut self, key: String, emitted_at: String) {
+        self.schema_version = HISTORY_SCHEMA_VERSION;
+        self.alerts.insert(key, emitted_at);
     }
 
     pub fn write_atomic(&self, path: &Path) -> Result<(), Error> {
@@ -110,5 +153,13 @@ mod tests {
             "first"
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn scan_state_deduplicates_the_same_alert_key() {
+        let mut state = ScanState::default();
+        assert!(state.is_new("drift:plugin:identity"));
+        state.record("drift:plugin:identity".into(), "now".into());
+        assert!(!state.is_new("drift:plugin:identity"));
     }
 }

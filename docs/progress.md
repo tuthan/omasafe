@@ -166,3 +166,36 @@ delivery belong to M5; M4 exposes the review decisions but does not schedule
 them.
 
 Next: **v0.1 M5 — Drift scheduling and native-update detection**.
+
+## v0.1 M5 — Drift Scheduling and Native-Update Detection
+
+Status: **complete**
+
+Implemented:
+
+- `omasafe-cli scan` performs post-change detection against trusted identities.
+- Alerts cover source drift, missing trusted plugins, unscannable plugins, and
+  meaningful inventory coverage loss.
+- Alert keys are persisted atomically in private XDG state and unchanged
+  alerts are deduplicated.
+- `--notify` delivers critical alerts through `notify-send`, independently of
+  the bar widget; unavailable notification services are disclosed.
+- `schedule install` is an explicit opt-in systemd user timer installation for
+  daily persistent scans.
+- Native Omarchy updates and direct editor changes are both observed after the
+  live tree changes; no update path is intercepted or required.
+- Tests cover quiet scans, state deduplication, and existing identity/diff
+  negative cases.
+
+Verification:
+
+```text
+cargo fmt --all -- --check
+cargo test --workspace
+cargo run -p omasafe-cli -- scan --format json
+```
+
+Known limitation: the systemd install command is opt-in and requires a working
+user systemd session. Bar UI integration belongs to M6.
+
+Next: **v0.1 M6 — Thin Omarchy UI**.
