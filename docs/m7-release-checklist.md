@@ -12,6 +12,11 @@ not add new detection behavior.
   toolchain, dependency lockfile identity, supported Omarchy/Quickshell versions,
   and coverage limitations.
 - Signed source tag and signed release archive/package, with detached verification
+
+The repository now has a tag-triggered release workflow at
+`.github/workflows/release.yml`. It builds the locked `omasafe-cli` workspace binary
+for `x86_64-unknown-linux-gnu`, publishes a tarball, and publishes its SHA-256 file.
+The workflow is an asset-publishing mechanism, not a replacement for package signing.
   instructions.
 
 ## Release gates
@@ -38,6 +43,23 @@ not add new detection behavior.
 4. Supported Arch/Omarchy/Quickshell versions and the VM image source.
 5. Whether package upgrades preserve user state by default and how removal is
    confirmed.
+
+## Omarchy plugin publishing boundary
+
+The official Omarchy publishing contract requires a public repository with a valid
+`manifest.json` at its repository root. The current UI is under `plugin/`, so that
+subdirectory cannot be submitted as the plugin repository by itself. Choose one of
+these M7 layouts before publishing:
+
+- split the UI into a dedicated plugin repository and keep this repository as the CLI
+  engine; or
+- make this repository's root the plugin repository by moving/rewriting the manifest
+  and entry-point paths, while keeping the Rust workspace as source content.
+
+Neither layout causes `omarchy plugin add` to install `omasafe-cli`. The CLI must be
+installed separately through the Arch package/release workflow, and the plugin should
+document the missing-CLI state as unavailable rather than downloading or executing a
+release asset at runtime.
 
 The milestone should remain open until the signed-artifact and clean-VM gates are
 reproduced from a fresh checkout.
