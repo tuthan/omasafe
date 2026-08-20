@@ -11,8 +11,8 @@ Milestone progress and verification results are recorded in
 [`docs/progress.md`](docs/progress.md). Each milestone is committed before the
 next milestone begins.
 
-Current milestone: **v0.1 M0 complete**. The Rust workspace and CLI foundation
-are available; plugin filesystem and Git inventory is the next step.
+Current milestone: **v0.1 M1 complete**. The CLI collects filesystem inventory,
+reconciles optional shell state, and records Git provenance.
 
 ## Development
 

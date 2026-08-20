@@ -29,4 +29,34 @@ Known limitation: inventory currently returns an explicit coverage limitation;
 filesystem reconciliation, shell output parsing, and Git metadata collection
 belong to M1.
 
-Next: **v0.1 M1 — Installed inventory**.
+## v0.1 M1 — Installed Inventory
+
+Status: **complete**
+
+Implemented:
+
+- Filesystem-first collection from `~/.config/omarchy/plugins`.
+- Optional `omarchy plugin list --json` parsing with visible failure/absence
+  coverage limitations.
+- Reconciliation of shell IDs with plugin directories without following
+  symlinks.
+- Manifest schema validation and built-in, Git-managed, cloned/local, backup,
+  malformed, and unscannable classifications.
+- Git repository URL, `HEAD`, tree OID, and dirty working-tree state.
+- Active full-bar detection and disclosure when a non-built-in bar replaces it.
+- Tests for malformed manifests, symlinks, shell reconciliation, non-Git
+  plugins, dirty Git checkouts, and missing remotes.
+
+Verification:
+
+```text
+cargo fmt --all
+cargo test --workspace
+cargo run -p omasafe-cli -- plugins inventory --format json
+```
+
+Known limitations: built-in plugin directories may be outside the user plugin
+directory and are therefore represented from shell metadata only. Source
+content digests, marketplace correlation, and trust baselines belong to M2/M3.
+
+Next: **v0.1 M2 — Marketplace catalog correlation**.
