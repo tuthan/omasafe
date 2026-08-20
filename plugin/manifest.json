@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.tuthan.omasafe",
+  "name": "OmaSafe",
+  "version": "0.1.0",
+  "author": "Hung Vo",
+  "license": "MIT",
+  "description": "A small trust and drift indicator for Omarchy plugins",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "OmaSafe",
+    "description": "Show new plugin drift and coverage alerts",
+    "category": "Security",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
