@@ -1,0 +1,15 @@
+[package]
+name = "omasafe-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "omasafe-cli"
+path = "src/main.rs"
+
+[dependencies]
+omasafe-core = { path = "../omasafe-core" }
+omasafe-plugin-trust = { path = "../omasafe-plugin-trust" }
+omasafe-report = { path = "../omasafe-report" }
+serde_json.workspace = true
