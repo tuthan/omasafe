@@ -19,6 +19,8 @@ pub enum Error {
 pub struct TrustHistory {
     pub schema_version: u64,
     pub records: Vec<TrustRecord>,
+    #[serde(default)]
+    pub decisions: Vec<ReviewDecision>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -29,12 +31,22 @@ pub struct TrustRecord {
     pub note: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReviewDecision {
+    pub plugin_id: String,
+    pub action: String,
+    pub scope: String,
+    pub reason: String,
+    pub created_at: String,
+}
+
 impl TrustHistory {
     pub fn load(path: &Path) -> Result<Self, Error> {
         if !path.exists() {
             return Ok(Self {
                 schema_version: HISTORY_SCHEMA_VERSION,
                 records: Vec::new(),
+                decisions: Vec::new(),
             });
         }
         let history = serde_json::from_slice(&fs::read(path)?)?;

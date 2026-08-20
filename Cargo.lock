@@ -82,6 +82,7 @@ dependencies = [
  "omasafe-marketplace",
  "omasafe-plugin-trust",
  "omasafe-report",
+ "serde",
  "serde_json",
 ]
 

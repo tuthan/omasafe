@@ -13,4 +13,5 @@ omasafe-core = { path = "../omasafe-core" }
 omasafe-marketplace = { path = "../omasafe-marketplace" }
 omasafe-plugin-trust = { path = "../omasafe-plugin-trust" }
 omasafe-report = { path = "../omasafe-report" }
+serde.workspace = true
 serde_json.workspace = true

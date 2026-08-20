@@ -4,9 +4,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use omasafe_core::{TOOL_VERSION, paths::XdgPaths};
 use omasafe_marketplace::{Correlation, correlate, load_catalog};
 use omasafe_plugin_trust::{
-    SourceIdentity,
-    baseline::{TrustHistory, TrustRecord},
-    collect, query_shell,
+    DiffResult, SourceIdentity,
+    baseline::{ReviewDecision, TrustHistory, TrustRecord},
+    collect, git_diff, query_shell,
 };
 use omasafe_report::Report;
 
@@ -32,9 +32,18 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         [command, subcommand, id, rest @ ..] if command == "plugins" && subcommand == "trust" => {
             trust(id, rest)?
         }
+        [command, subcommand, id, rest @ ..] if command == "plugins" && subcommand == "status" => {
+            status(id, rest)?
+        }
+        [command, subcommand, id, rest @ ..] if command == "plugins" && subcommand == "diff" => {
+            diff(id, rest)?
+        }
+        [command, subcommand, id, rest @ ..] if command == "plugins" && subcommand == "review" => {
+            review(id, rest)?
+        }
         _ => {
             eprintln!(
-                "usage: omasafe-cli plugins inventory [--format text|json] [--catalog PATH --catalog-commit COMMIT] | plugins trust ID [--yes --expected-head SHA --expected-tree SHA --expected-digest SHA256] | paths"
+                "usage: omasafe-cli plugins inventory ... | plugins trust ID ... | plugins status ID [--format text|json] | plugins diff ID [REF_A..REF_B] | plugins review ID --action ACTION --reason REASON [--scope SCOPE] --yes | paths"
             );
             std::process::exit(2);
         }
@@ -143,6 +152,253 @@ fn expected_component(current: Option<&str>, expected: Option<&str>) -> bool {
         (None, None) => true,
         _ => false,
     }
+}
+
+#[derive(serde::Serialize)]
+struct StatusResult {
+    plugin_id: String,
+    state: String,
+    current: SourceIdentity,
+    trusted: Option<SourceIdentity>,
+    reason: Option<String>,
+}
+
+fn review(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut action = None;
+    let mut reason = None;
+    let mut scope = None;
+    let mut yes = false;
+    let mut expected_head = None;
+    let mut expected_tree = None;
+    let mut expected_digest = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--action" => {
+                action = Some(args.get(index + 1).ok_or("missing review action")?.clone());
+                index += 2;
+            }
+            "--reason" => {
+                reason = Some(args.get(index + 1).ok_or("missing review reason")?.clone());
+                index += 2;
+            }
+            "--scope" => {
+                scope = Some(args.get(index + 1).ok_or("missing review scope")?.clone());
+                index += 2;
+            }
+            "--yes" => {
+                yes = true;
+                index += 1;
+            }
+            "--expected-head" => {
+                expected_head = Some(args.get(index + 1).ok_or("missing expected HEAD")?.clone());
+                index += 2;
+            }
+            "--expected-tree" => {
+                expected_tree = Some(args.get(index + 1).ok_or("missing expected tree")?.clone());
+                index += 2;
+            }
+            "--expected-digest" => {
+                expected_digest = Some(
+                    args.get(index + 1)
+                        .ok_or("missing expected digest")?
+                        .clone(),
+                );
+                index += 2;
+            }
+            value => return Err(format!("unknown review argument: {value}").into()),
+        }
+    }
+    if !yes {
+        return Err("review actions require --yes after explicit preview".into());
+    }
+    let action = action.ok_or("--action is required")?;
+    let reason = reason.ok_or("--reason is required")?;
+    let scope = scope.unwrap_or_else(|| "plugin".into());
+    if action == "exclude" && scope == "plugin" {
+        return Err("exclude requires a narrow --scope".into());
+    }
+    let paths = XdgPaths::discover()?;
+    paths.ensure()?;
+    let path = paths.state.join("trust-history.json");
+    let mut history = TrustHistory::load(&path)?;
+    if action == "rebaseline" || action == "restore" {
+        let accepted = if action == "restore" {
+            history
+                .records
+                .iter()
+                .rev()
+                .filter(|record| record.plugin_id == id)
+                .nth(1)
+                .ok_or("no previous baseline exists to restore")?
+                .accepted
+                .clone()
+        } else {
+            let (_, current) = current_identity(id)?;
+            if !expected_component(current.head.as_deref(), expected_head.as_deref())
+                || !expected_component(current.tree.as_deref(), expected_tree.as_deref())
+                || !expected_component(
+                    current.content_digest.as_deref(),
+                    expected_digest.as_deref(),
+                )
+            {
+                return Err("current identity does not exactly match the expected identity".into());
+            }
+            current
+        };
+        history.accept(TrustRecord {
+            plugin_id: id.into(),
+            accepted,
+            accepted_at: now(),
+            note: reason,
+        });
+    } else if matches!(action.as_str(), "acknowledge" | "exclude") {
+        history.decisions.push(ReviewDecision {
+            plugin_id: id.into(),
+            action,
+            scope,
+            reason,
+            created_at: now(),
+        });
+    } else {
+        return Err("action must be acknowledge, rebaseline, restore, or exclude".into());
+    }
+    history.write_atomic(&path)?;
+    println!("Review decision recorded in {}", path.display());
+    Ok(())
+}
+
+fn status(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let format = format_arg(args)?;
+    let (_record, current) = current_identity(id)?;
+    let history = TrustHistory::load(&XdgPaths::discover()?.state.join("trust-history.json"))?;
+    let trusted = history.latest(id).map(|record| record.accepted.clone());
+    let state = match trusted.as_ref() {
+        None => "untrusted",
+        Some(identity) if identity == &current => "unchanged",
+        Some(_) => "changed",
+    };
+    let result = StatusResult {
+        plugin_id: id.into(),
+        state: state.into(),
+        current,
+        trusted,
+        reason: (state == "untrusted").then(|| "no trust baseline exists".into()),
+    };
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&Report::new(TOOL_VERSION, now(), result))?
+        );
+    } else {
+        println!("{}: {}", result.plugin_id, result.state);
+        if let Some(reason) = result.reason {
+            println!("Reason: {reason}");
+        }
+    }
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct DiffReport {
+    plugin_id: String,
+    from: Option<String>,
+    to: Option<String>,
+    source_changed: bool,
+    diff: DiffResult,
+    limitation: Option<String>,
+}
+
+fn diff(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (record, current) = current_identity(id)?;
+    let history = TrustHistory::load(&XdgPaths::discover()?.state.join("trust-history.json"))?;
+    let trusted = history.latest(id).map(|record| record.accepted.clone());
+    let Some(trusted) = trusted else {
+        return Err(format!("no trust baseline exists for {id}").into());
+    };
+    let range_arg = args
+        .iter()
+        .find(|arg| !arg.starts_with("--") && arg.as_str() != "json");
+    let (ref_a, ref_b) = if let Some(range) = range_arg {
+        range
+            .split_once("..")
+            .ok_or("diff range must be REF_A..REF_B")?
+    } else {
+        (
+            trusted
+                .head
+                .as_deref()
+                .ok_or("trusted baseline has no Git HEAD")?,
+            if record.dirty == Some(true) {
+                "WORKTREE"
+            } else {
+                current
+                    .head
+                    .as_deref()
+                    .ok_or("installed plugin has no Git HEAD")?
+            },
+        )
+    };
+    let git = git_diff(PathBuf::from(&record.path).as_path(), ref_a, ref_b);
+    let report = DiffReport {
+        plugin_id: id.into(),
+        from: Some(ref_a.into()),
+        to: Some(ref_b.into()),
+        source_changed: current != trusted,
+        limitation: git.limitation.clone(),
+        diff: git,
+    };
+    if args.iter().any(|arg| arg == "--format=json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&Report::new(TOOL_VERSION, now(), report))?
+        );
+    } else {
+        println!(
+            "{}: source_changed={}",
+            report.plugin_id, report.source_changed
+        );
+        if let Some(text) = report.diff.text {
+            print!("{text}");
+        }
+        if let Some(limitation) = report.limitation {
+            println!("\nLimitation: {limitation}");
+        }
+    }
+    Ok(())
+}
+
+fn format_arg(args: &[String]) -> Result<&str, Box<dyn std::error::Error>> {
+    match args {
+        [] => Ok("text"),
+        [flag, format] if flag == "--format" && matches!(format.as_str(), "text" | "json") => {
+            Ok(format)
+        }
+        _ => Err("expected optional --format text|json".into()),
+    }
+}
+
+fn current_identity(
+    id: &str,
+) -> Result<(omasafe_plugin_trust::PluginRecord, SourceIdentity), Box<dyn std::error::Error>> {
+    let plugin_root = home()?.join(".config/omarchy/plugins");
+    let (shell_json, _shell_error) = query_shell();
+    let inventory = collect(&plugin_root, shell_json.as_deref());
+    let record = inventory
+        .plugins
+        .into_iter()
+        .find(|plugin| plugin.id == id)
+        .ok_or_else(|| format!("plugin not found: {id}"))?;
+    let identity = SourceIdentity {
+        plugin_id: record.id.clone(),
+        repository: record.repository.clone(),
+        head: record.head.clone(),
+        tree: record.tree.clone(),
+        content_digest: record.content_digest.clone(),
+        file_count: record.content_file_count.unwrap_or_default(),
+        limitations: record.reason.clone().into_iter().collect(),
+    };
+    Ok((record, identity))
 }
 
 fn inventory(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
