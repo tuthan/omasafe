@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use omasafe_core::{TOOL_VERSION, paths::XdgPaths};
-use omasafe_plugin_trust::{Coverage, Inventory};
+use omasafe_plugin_trust::{collect, query_shell};
 use omasafe_report::Report;
 
 fn main() {
@@ -43,20 +43,10 @@ fn inventory(format: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let plugin_root = home()?.join(".config/omarchy/plugins");
-    let mut result = Inventory {
-        coverage: Coverage {
-            limitations: vec![
-                "M1 filesystem reconciliation is not yet implemented".into(),
-                "The Omarchy shell inventory is not queried in this foundation release".into(),
-            ],
-        },
-        ..Inventory::default()
-    };
-    if !plugin_root.is_dir() {
-        result.coverage.limitations.push(format!(
-            "plugin directory is unavailable: {}",
-            plugin_root.display()
-        ));
+    let (shell_json, shell_error) = query_shell();
+    let mut result = collect(&plugin_root, shell_json.as_deref());
+    if let Some(error) = shell_error {
+        result.coverage.limitations.push(error);
     }
 
     if format == "json" {
