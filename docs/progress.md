@@ -60,3 +60,37 @@ directory and are therefore represented from shell metadata only. Source
 content digests, marketplace correlation, and trust baselines belong to M2/M3.
 
 Next: **v0.1 M2 — Marketplace catalog correlation**.
+
+## v0.1 M2 — Marketplace Catalog Correlation
+
+Status: **complete**
+
+Implemented:
+
+- Bounded catalog parsing with SHA-256 file identity and registry provenance.
+- Explicit `root-plugin`, `monorepo`, and `suite` layout handling; unknown
+  layouts are reported as incomplete.
+- Repository normalization and correlation by both plugin ID and repository.
+- Listed, unlisted, conflict, incomplete, and installed-differs states.
+- Verification, validated-commit, upstream-moved, retrieval-time, generation,
+  and registry-commit claims remain attributed to the snapshot.
+- Immutable-commit Git fetch support with no tags, atomic private cache writes,
+  and rollback detection against the last accepted snapshot.
+- CLI catalog correlation using `--catalog PATH --catalog-commit COMMIT`.
+- Fixtures and tests for malformed/oversized/conflicting data, normalization,
+  cache replacement, unknown layouts, and provenance.
+
+Verification:
+
+```text
+cargo fmt --all -- --check
+cargo test --workspace
+cargo run -p omasafe-cli -- plugins inventory --format text \
+  --catalog fixtures/marketplace/catalog.json --catalog-commit fixture-commit
+```
+
+Known limitation: the checked-in fixture is intentionally small. The frozen
+2026-08-20 689-entry catalog remains a release-corpus verification input and
+must be run through the same bounded parser before v0.1 release.
+
+Next: **v0.1 M3 — Source identity and trust baseline**.

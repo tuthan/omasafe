@@ -1,0 +1,19 @@
+[
+  {
+    "id": "io.example.widget",
+    "repo": "https://github.com/example/widget.git",
+    "verificationStatus": "verified",
+    "listingValidatedCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "upstreamObservedCommit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "repositoryLayout": "root-plugin",
+    "kind": "bar-widget"
+  },
+  {
+    "id": "io.example.monorepo",
+    "repo": "git@github.com:example/suite.git",
+    "verificationStatus": "unverified",
+    "listingValidatedCommit": "cccccccccccccccccccccccccccccccccccccccc",
+    "repositoryLayout": "monorepo",
+    "kind": "panel"
+  }
+]
