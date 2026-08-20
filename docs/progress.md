@@ -94,3 +94,38 @@ Known limitation: the checked-in fixture is intentionally small. The frozen
 must be run through the same bounded parser before v0.1 release.
 
 Next: **v0.1 M3 — Source identity and trust baseline**.
+
+## v0.1 M3 — Source Identity and Trust Baseline
+
+Status: **complete**
+
+Implemented:
+
+- Immutable Git commit/tree identity plus normalized content identity for
+  dirty and non-Git plugins.
+- Deterministic path, mode, type, and byte ordering with bounded file and byte
+  limits; symlinks are recorded as metadata and never followed.
+- Digest-only `SourceIdentity` and generic trust-history record types.
+- Private, atomic, versioned trust history under the XDG state directory.
+- Interactive `plugins trust ID` review and unattended trust requiring `--yes`
+  plus an exact expected identity.
+- Tests proving deterministic identity, relevant-content changes, history
+  round trips, and the existing malformed/symlink/dirty cases.
+
+Verification:
+
+```text
+cargo fmt --all -- --check
+cargo test --workspace
+cargo run -p omasafe-cli -- plugins inventory --format json
+cargo run -p omasafe-cli -- plugins trust ID --yes \
+  --expected-head HEAD --expected-tree TREE --expected-digest SHA256
+```
+
+The smoke trust command wrote only to the local XDG state directory; no trust
+contents are stored in the repository.
+
+Known limitation: baseline comparison and drift notifications are part of M4/M5;
+M3 records trust history but does not yet expose `plugin status` or diff review.
+
+Next: **v0.1 M4 — Diff and review workflow**.

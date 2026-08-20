@@ -11,9 +11,9 @@ Milestone progress and verification results are recorded in
 [`docs/progress.md`](docs/progress.md). Each milestone is committed before the
 next milestone begins.
 
-Current milestone: **v0.1 M2 complete**. The CLI collects filesystem inventory,
-records Git provenance, and correlates plugins with a pinned marketplace
-catalog.
+Current milestone: **v0.1 M3 complete**. The CLI collects filesystem inventory,
+records Git provenance, correlates pinned marketplace claims, and supports
+explicit trust baselines.
 
 ## Development
 
@@ -26,6 +26,8 @@ cargo run -p omasafe-cli -- --version
 cargo run -p omasafe-cli -- plugins inventory --format json
 cargo run -p omasafe-cli -- plugins inventory --format json \
   --catalog fixtures/marketplace/catalog.json --catalog-commit FIXTURE_COMMIT
+cargo run -p omasafe-cli -- plugins trust PLUGIN_ID \
+  --yes --expected-head HEAD --expected-tree TREE --expected-digest SHA256
 ```
 
 The CLI is the engine. The future Omarchy bar-widget is a thin QML interface

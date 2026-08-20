@@ -4,6 +4,9 @@ use std::path::Path;
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+pub mod baseline;
 
 #[derive(Debug, Default, Serialize)]
 pub struct Inventory {
@@ -26,8 +29,25 @@ pub struct PluginRecord {
     pub head: Option<String>,
     pub tree: Option<String>,
     pub dirty: Option<bool>,
+    pub content_digest: Option<String>,
+    pub content_file_count: Option<usize>,
     pub reason: Option<String>,
 }
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SourceIdentity {
+    pub plugin_id: String,
+    pub repository: Option<String>,
+    pub head: Option<String>,
+    pub tree: Option<String>,
+    pub content_digest: Option<String>,
+    pub file_count: usize,
+    pub limitations: Vec<String>,
+}
+
+const MAX_FILES: usize = 10_000;
+const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Default, Serialize)]
 pub struct Coverage {
@@ -180,6 +200,8 @@ fn inspect_plugin(path: &Path, name: &str, shell: Option<&ShellPlugin>) -> Plugi
         head: None,
         tree: None,
         dirty: None,
+        content_digest: None,
+        content_file_count: None,
         reason: None,
     };
     if fs::symlink_metadata(path)
@@ -236,6 +258,18 @@ fn inspect_plugin(path: &Path, name: &str, shell: Option<&ShellPlugin>) -> Plugi
         if git.reason.is_some() {
             record.reason = git.reason;
         }
+    }
+    let source = source_identity(
+        &record.id,
+        path,
+        record.repository.clone(),
+        record.head.clone(),
+        record.tree.clone(),
+    );
+    record.content_digest = source.content_digest;
+    record.content_file_count = Some(source.file_count);
+    if !source.limitations.is_empty() {
+        record.reason = Some(source.limitations.join("; "));
     }
     record
 }
@@ -310,9 +344,151 @@ fn git_status(path: &Path) -> Option<String> {
         .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+pub fn source_identity(
+    plugin_id: &str,
+    root: &Path,
+    repository: Option<String>,
+    head: Option<String>,
+    tree: Option<String>,
+) -> SourceIdentity {
+    let mut entries = Vec::new();
+    let mut limitations = Vec::new();
+    let mut total_bytes = 0;
+    collect_entries(root, root, &mut entries, &mut total_bytes, &mut limitations);
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut hasher = Sha256::new();
+    for entry in &entries {
+        hasher.update((entry.path.len() as u64).to_be_bytes());
+        hasher.update(entry.path.as_bytes());
+        hasher.update([entry.kind]);
+        hasher.update(entry.mode.to_be_bytes());
+        hasher.update((entry.data.len() as u64).to_be_bytes());
+        hasher.update(&entry.data);
+    }
+    SourceIdentity {
+        plugin_id: plugin_id.into(),
+        repository,
+        head,
+        tree,
+        content_digest: if limitations.is_empty() {
+            Some(format!("{:x}", hasher.finalize()))
+        } else {
+            None
+        },
+        file_count: entries.len(),
+        limitations,
+    }
+}
+
+struct ContentEntry {
+    path: String,
+    kind: u8,
+    mode: u32,
+    data: Vec<u8>,
+}
+
+fn collect_entries(
+    root: &Path,
+    directory: &Path,
+    entries: &mut Vec<ContentEntry>,
+    total_bytes: &mut u64,
+    limitations: &mut Vec<String>,
+) {
+    if directory.file_name().is_some_and(|name| name == ".git") {
+        return;
+    }
+    let read_dir = match fs::read_dir(directory) {
+        Ok(read_dir) => read_dir,
+        Err(error) => {
+            limitations.push(format!("unreadable path {}: {error}", directory.display()));
+            return;
+        }
+    };
+    for entry in read_dir {
+        if entries.len() >= MAX_FILES {
+            limitations.push(format!("file limit of {MAX_FILES} exceeded"));
+            return;
+        }
+        let Ok(entry) = entry else {
+            limitations.push("directory entry could not be read".into());
+            continue;
+        };
+        let path = entry.path();
+        if path.file_name().is_some_and(|name| name == ".git") {
+            continue;
+        }
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            limitations.push(format!("metadata unavailable: {}", path.display()));
+            continue;
+        };
+        let relative = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let mode = file_mode(&metadata);
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            let data = fs::read_link(&path)
+                .map(|target| target.to_string_lossy().into_owned().into_bytes())
+                .unwrap_or_default();
+            entries.push(ContentEntry {
+                path: relative,
+                kind: b'l',
+                mode,
+                data,
+            });
+        } else if file_type.is_dir() {
+            entries.push(ContentEntry {
+                path: relative,
+                kind: b'd',
+                mode,
+                data: Vec::new(),
+            });
+            collect_entries(root, &path, entries, total_bytes, limitations);
+        } else if file_type.is_file() {
+            if metadata.len() > MAX_FILE_BYTES {
+                limitations.push(format!("file exceeds {MAX_FILE_BYTES} bytes: {relative}"));
+                continue;
+            }
+            if total_bytes.saturating_add(metadata.len()) > MAX_TOTAL_BYTES {
+                limitations.push(format!(
+                    "aggregate file limit of {MAX_TOTAL_BYTES} bytes exceeded"
+                ));
+                return;
+            }
+            match fs::read(&path) {
+                Ok(data) => {
+                    *total_bytes += data.len() as u64;
+                    entries.push(ContentEntry {
+                        path: relative,
+                        kind: b'f',
+                        mode,
+                        data,
+                    });
+                }
+                Err(error) => limitations.push(format!("file unreadable {relative}: {error}")),
+            }
+        } else {
+            limitations.push(format!("special file skipped: {relative}"));
+        }
+    }
+}
+
+#[cfg(unix)]
+fn file_mode(metadata: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode()
+}
+
+#[cfg(not(unix))]
+fn file_mode(metadata: &fs::Metadata) -> u32 {
+    u32::from(metadata.permissions().readonly())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::collect;
+    use super::{collect, source_identity};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -427,6 +603,25 @@ mod tests {
         assert!(record.tree.is_some());
         assert_eq!(record.repository, None);
         assert_eq!(record.dirty, Some(true));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn content_digest_changes_for_relevant_content_and_is_deterministic() {
+        let root = fixture_root();
+        let plugin = root.join("io.example.digest");
+        manifest(&plugin, "io.example.digest", &["bar-widget"]);
+        fs::write(plugin.join("main.qml"), "Item {}\n").unwrap();
+        let first = source_identity("io.example.digest", &plugin, None, None, None);
+        let second = source_identity("io.example.digest", &plugin, None, None, None);
+        assert_eq!(first, second);
+        fs::write(
+            plugin.join("main.qml"),
+            "Item { property bool changed: true }\n",
+        )
+        .unwrap();
+        let changed = source_identity("io.example.digest", &plugin, None, None, None);
+        assert_ne!(first.content_digest, changed.content_digest);
         fs::remove_dir_all(root).unwrap();
     }
 
