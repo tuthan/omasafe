@@ -106,8 +106,15 @@ and removal lifecycles.
 
 - **CLI** — install `omasafe-cli` from the
   [GitHub releases](https://github.com/tuthan/omasafe/releases) (or the future Arch
-  package), place it on the `omarchy-shell` session `PATH`. Release signatures and
-  detached verification instructions are in
+  package), place it on the `omarchy-shell` session `PATH`. For x86_64 Linux, the
+  repository includes a helper that verifies the Sigstore bundle and SHA-256 digest
+  before installing to `~/.local/bin`:
+
+  ```sh
+  ./scripts/install-cli.sh --version v0.1.0
+  ```
+
+  Release signatures and detached verification instructions are in
   [`docs/release-signing.md`](docs/release-signing.md).
 - **UI plugin** — the standalone bar-widget lives in the sibling project
   [`../omasafe-plugin/`](../omasafe-plugin/), which carries a repository-root

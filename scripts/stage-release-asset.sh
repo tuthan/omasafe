@@ -27,7 +27,10 @@ cli_bin="$root_dir/release/$asset/omasafe-cli"
 "$cli_bin" provenance --format json > "$root_dir/release/$asset/omasafe-provenance.json"
 
 tar -C "$root_dir/release" -czf "$root_dir/release/$asset.tar.gz" "$asset"
-sha256sum "$root_dir/release/$asset.tar.gz" > "$root_dir/release/$asset.tar.gz.sha256"
+(
+  cd "$root_dir/release"
+  sha256sum "$asset.tar.gz" > "$asset.tar.gz.sha256"
+)
 cosign sign-blob --yes \
   --bundle "$root_dir/release/$asset.tar.gz.sigstore.json" \
   "$root_dir/release/$asset.tar.gz"
