@@ -270,6 +270,9 @@ fn expected_component(current: Option<&str>, expected: Option<&str>) -> bool {
 struct ScanAlert {
     plugin_id: String,
     kind: String,
+    /// The confidence/impact level of the signal, not a claim that a plugin is safe.
+    /// v0.1 emits review-needed warnings; later analysis can emit critical findings.
+    severity: String,
     message: String,
     post_change: bool,
 }
@@ -280,6 +283,7 @@ struct ScanResult {
     quiet: bool,
     outstanding: usize,
     new: usize,
+    highest_severity: String,
     post_change_detection: bool,
 }
 
@@ -346,15 +350,18 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
     let mut alerts = Vec::new();
     let mut new_alerts = Vec::new();
     let mut live_keys = BTreeSet::new();
+    let mut highest_severity = "none";
     if history_recovered {
         let key = "coverage:trust-history".to_owned();
         live_keys.insert(key.clone());
         let alert = ScanAlert {
             plugin_id: "trust-history".into(),
             kind: "lost-coverage".into(),
+            severity: "warning".into(),
             message: "trust history was corrupt and quarantined; baselines require recovery".into(),
             post_change: false,
         };
+        track_highest_severity(&mut highest_severity, &alert);
         let is_new = state.is_new(&key);
         if is_new {
             new_alerts.push(alert.clone());
@@ -368,6 +375,12 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
         }
     }
     for plugin in &inventory.plugins {
+        // Backups are retained in inventory for audit visibility but are not
+        // installed targets. Scanning them would duplicate live-plugin IDs
+        // when their copied manifests match an active shell plugin.
+        if plugin.classification == "backup" {
+            continue;
+        }
         if plugin.classification == "unscannable"
             && !is_excluded(&history, &plugin.id, "lost-coverage")
         {
@@ -376,9 +389,11 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
             let alert = ScanAlert {
                 plugin_id: plugin.id.clone(),
                 kind: "lost-coverage".into(),
+                severity: "warning".into(),
                 message: "plugin can no longer be scanned".into(),
                 post_change: false,
             };
+            track_highest_severity(&mut highest_severity, &alert);
             let is_new = state.is_new(&key);
             if is_new {
                 new_alerts.push(alert.clone());
@@ -400,12 +415,14 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
             let alert = ScanAlert {
                 plugin_id: plugin.id.clone(),
                 kind: "lost-coverage".into(),
+                severity: "warning".into(),
                 message: format!(
                     "plugin coverage is partial: {}",
                     plugin.limitations.join(", ")
                 ),
                 post_change: false,
             };
+            track_highest_severity(&mut highest_severity, &alert);
             let is_new = state.is_new(&key);
             if is_new {
                 new_alerts.push(alert.clone());
@@ -438,6 +455,7 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
             let alert = ScanAlert {
                 plugin_id: plugin.id.clone(),
                 kind: "source-drift".into(),
+                severity: "warning".into(),
                 message: if is_acknowledged(&history, &plugin.id, "source-drift") {
                     "installed source differs from the trusted baseline; previously acknowledged, review remains available"
                 } else {
@@ -445,6 +463,7 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
                 }.into(),
                 post_change: true,
             };
+            track_highest_severity(&mut highest_severity, &alert);
             let is_new = state.is_new(&key);
             if is_new {
                 new_alerts.push(alert.clone());
@@ -461,7 +480,7 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
     for trusted in history
         .records
         .iter()
-        .filter(|record| !record.plugin_id.is_empty())
+        .filter(|record| !record.plugin_id.is_empty() && !history.is_revoked(&record.plugin_id))
     {
         if !inventory
             .plugins
@@ -470,13 +489,17 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
             && !is_excluded(&history, &trusted.plugin_id, "missing-plugin")
         {
             let key = format!("missing:{}", trusted.plugin_id);
-            live_keys.insert(key.clone());
+            if !live_keys.insert(key.clone()) {
+                continue;
+            }
             let alert = ScanAlert {
                 plugin_id: trusted.plugin_id.clone(),
                 kind: "missing-plugin".into(),
+                severity: "warning".into(),
                 message: "trusted plugin is missing or unavailable".into(),
                 post_change: true,
             };
+            track_highest_severity(&mut highest_severity, &alert);
             let is_new = state.is_new(&key);
             if is_new {
                 new_alerts.push(alert.clone());
@@ -502,9 +525,11 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
         let alert = ScanAlert {
             plugin_id: "inventory".into(),
             kind: "lost-coverage".into(),
+            severity: "warning".into(),
             message: "inventory coverage is limited; review the scan report".into(),
             post_change: false,
         };
+        track_highest_severity(&mut highest_severity, &alert);
         if is_new {
             new_alerts.push(alert.clone());
         }
@@ -528,9 +553,11 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
             let alert = ScanAlert {
                 plugin_id: plugin_id.to_owned(),
                 kind: kind.to_owned(),
+                severity: "warning".into(),
                 message: message.to_owned(),
                 post_change: false,
             };
+            track_highest_severity(&mut highest_severity, &alert);
             let is_new = state.is_new(&key);
             if is_new {
                 new_alerts.push(alert.clone());
@@ -554,12 +581,14 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
                 .cloned()
                 .unwrap_or_else(|| "bar".into()),
             kind: "provenance-conflict".into(),
+            severity: "warning".into(),
             message: format!(
                 "multiple active full-bar plugins are present: {}",
                 inventory.active_full_bars.join(", ")
             ),
             post_change: false,
         };
+        track_highest_severity(&mut highest_severity, &alert);
         let is_new = state.is_new(&key);
         if is_new {
             new_alerts.push(alert.clone());
@@ -581,6 +610,7 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
             let alert = ScanAlert {
                 plugin_id: "marketplace".into(),
                 kind: "lost-coverage".into(),
+                severity: "warning".into(),
                 message: if !snapshot.verified {
                     "cached marketplace snapshot could not be re-verified".into()
                 } else {
@@ -588,6 +618,7 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
                 },
                 post_change: false,
             };
+            track_highest_severity(&mut highest_severity, &alert);
             let is_new = state.is_new(&key);
             if is_new {
                 new_alerts.push(alert.clone());
@@ -613,9 +644,11 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
                 let alert = ScanAlert {
                     plugin_id: plugin.id.clone(),
                     kind: "provenance-conflict".into(),
+                    severity: "warning".into(),
                     message: "installed repository conflicts with the marketplace claim".into(),
                     post_change: false,
                 };
+                track_highest_severity(&mut highest_severity, &alert);
                 let is_new = state.is_new(&key);
                 if is_new {
                     new_alerts.push(alert.clone());
@@ -638,6 +671,7 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
         quiet: live_keys.is_empty(),
         outstanding: live_keys.len(),
         new: new_alerts.len(),
+        highest_severity: highest_severity.into(),
         post_change_detection: true,
         alerts,
     };
@@ -659,6 +693,14 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
         }
     }
     Ok(has_findings)
+}
+
+fn track_highest_severity(current: &mut &'static str, alert: &ScanAlert) {
+    if alert.severity == "critical" {
+        *current = "critical";
+    } else if *current == "none" && !alert.severity.is_empty() {
+        *current = "warning";
+    }
 }
 
 fn notify_user(alert: &ScanAlert) {
@@ -813,11 +855,16 @@ fn review(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if !yes {
         return Err("review actions require --yes after explicit preview".into());
     }
-    let action = action.ok_or("--action is required")?;
+    let action = match action.ok_or("--action is required")?.as_str() {
+        "revoke" => "untrust".to_owned(),
+        value => value.to_owned(),
+    };
     let reason = reason.ok_or("--reason is required")?;
     let scope = scope.unwrap_or_else(|| {
         if action == "acknowledge" {
             "source-drift".into()
+        } else if action == "untrust" {
+            "trust-baseline".into()
         } else {
             "plugin".into()
         }
@@ -830,6 +877,9 @@ fn review(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     {
         return Err("review scope must be source-drift, missing-plugin, or lost-coverage".into());
     }
+    if action == "untrust" && scope != "trust-baseline" {
+        return Err("untrust scope must be trust-baseline".into());
+    }
     let paths = XdgPaths::discover()?;
     paths.ensure()?;
     let path = paths.state.join("trust-history.json");
@@ -838,7 +888,16 @@ fn review(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if action == "restore" && restore_to.is_none() {
         return Err("restore requires --to INDEX or --to DIGEST".into());
     }
-    if action == "rebaseline" || action == "restore" {
+    if action == "untrust" {
+        history.revoke(id);
+        history.decisions.push(ReviewDecision {
+            plugin_id: id.into(),
+            action,
+            scope,
+            reason,
+            created_at: now(),
+        });
+    } else if action == "rebaseline" || action == "restore" {
         let accepted = if action == "restore" {
             let target = restore_to.as_deref().unwrap();
             let records: Vec<&TrustRecord> = history
@@ -885,7 +944,7 @@ fn review(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             created_at: now(),
         });
     } else {
-        return Err("action must be acknowledge, rebaseline, restore, or exclude".into());
+        return Err("action must be acknowledge, rebaseline, restore, untrust, or exclude".into());
     }
     history.write_atomic_locked(&path)?;
     println!("Review decision recorded in {}", path.display());
@@ -909,7 +968,11 @@ fn status(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         current,
         trusted,
         reason: if state == "untrusted" {
-            Some("no trust baseline exists".into())
+            Some(if history.is_revoked(id) {
+                "trust baseline was revoked; restore or re-trust to recover it".into()
+            } else {
+                "no trust baseline exists".into()
+            })
         } else if state == "partial" {
             Some("source identity has disclosed coverage limitations".into())
         } else {
@@ -1252,7 +1315,18 @@ fn inventory(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let report = Report::new(TOOL_VERSION, now(), output);
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        println!("{} plugin record(s) collected.", result.plugins.len());
+        let backup_count = result
+            .plugins
+            .iter()
+            .filter(|plugin| plugin.classification == "backup")
+            .count();
+        println!(
+            "{} installed plugin(s) collected.",
+            result.plugins.len().saturating_sub(backup_count)
+        );
+        if backup_count > 0 {
+            println!("{backup_count} backup folder(s) retained separately for audit visibility.");
+        }
         if let Some(source) = marketplace_source {
             println!("Marketplace source: {source}");
         }
