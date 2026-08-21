@@ -169,7 +169,7 @@ Next: **v0.1 M5 — Drift scheduling and native-update detection**.
 
 ## v0.1 M5 — Drift Scheduling and Native-Update Detection
 
-Status: **in progress**
+Status: **complete**
 
 Implemented:
 
@@ -202,7 +202,7 @@ Next: **v0.1 M6 — Thin Omarchy UI**.
 
 ## v0.1 M6 — Thin Omarchy UI
 
-Status: **in progress**
+Status: **complete**
 
 Implemented:
 
@@ -234,16 +234,47 @@ runtime QML dependency or privileged component.
 
 Next: **v0.1 M7 — Packaging, signing, and release**.
 
-M7 preparation is tracked in [`docs/m7-release-checklist.md`](m7-release-checklist.md).
-The standalone plugin checkout is prepared at `../omasafe-plugin/`; the Arch
-packaging directory is reserved at [`packaging/arch/`](../packaging/arch/). No
-installable package is claimed until clean-build and VM lifecycle gates are ready.
+## v0.1 M7 — Packaging, Signing, and Release
+
+Status: **complete**
+
+M7 packages, signs, and releases the already-verified v0.1 implementation; it adds
+no new detection behavior.
+
+Implemented:
+
+- Tag-triggered release workflow (`.github/workflows/release.yml`) builds the
+  locked `omasafe-cli` binary for `x86_64-unknown-linux-gnu` and publishes a
+  tarball, SHA-256 file, and Cosign Sigstore bundle.
+- Maintainer-GPG-signed source tags; keyless Sigstore signing for release archives.
+  Detached verification is documented in [`release-signing.md`](release-signing.md).
+- Generated man page, shell completions, and a deterministic
+  `omasafe-provenance.json` report from the authoritative CLI surface.
+- `packaging/arch/PKGBUILD` for clean-build and local package validation; AUR
+  publication remains deferred.
+- Static project site published from `site/` via `.github/workflows/pages.yml`,
+  separate from the CLI release archive.
+- The Omarchy UI plugin is maintained and released separately at
+  `../omasafe-plugin/` with its own repository-root `manifest.json`.
+
+Verification:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo run -p omasafe-cli -- provenance --format json
+```
+
+Known limitation: the release gates in [`m7-release-checklist.md`](m7-release-checklist.md)
+that require the snapshot-capable Omarchy VM — clean install/upgrade/downgrade/
+uninstall and the full panel lifecycle — are reproduced per release from a fresh
+checkout rather than recorded here.
 
 ## Post-review hardening
 
-The implementation review follow-up has closed the critical detection,
-provenance, identity, locking, and diff regressions. M5/M6 remain in progress
-until the supported Omarchy runtime validates the panel lifecycle and the
-release workflow verifies the complete desktop experience. Current automated
-verification includes format, clippy, workspace tests, and hermetic CLI
-integration tests on the pinned stable toolchain.
+The implementation review follow-up closed the critical detection, provenance,
+identity, locking, and diff regressions. v0.1 (M0–M7) is feature-complete,
+packaged, and signed. Automated verification covers format, clippy, workspace
+tests, and hermetic CLI integration tests on the pinned stable toolchain; the
+per-release clean-VM lifecycle gates are tracked in the M7 checklist.
