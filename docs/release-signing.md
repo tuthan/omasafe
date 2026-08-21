@@ -59,11 +59,24 @@ downloads the archive, bundle, and digest, verifies the Sigstore identity before
 unpacking, then installs the binary under `~/.local/bin`:
 
 ```sh
-./scripts/install-cli.sh --version v0.1.0
+# Install the latest signed release
+curl --fail --proto '=https' --tlsv1.2 --location \
+  https://raw.githubusercontent.com/tuthan/omasafe/d4fb76d/scripts/install-cli.sh \
+  | bash -s -- --version latest
+
+# Or install an exact release
+curl --fail --proto '=https' --tlsv1.2 --location \
+  https://raw.githubusercontent.com/tuthan/omasafe/d4fb76d/scripts/install-cli.sh \
+  | bash -s -- --version v0.1.0
 ```
 
-Use `--prefix DIR` to choose another installation root. The installer accepts
-the current `latest` release by default and does not require root privileges.
+The raw-script URL is pinned to the commit that introduced the installer;
+`--version latest` selects the current signed release, while `v0.1.0` selects an
+exact signed archive. From a repository checkout, run
+`./scripts/install-cli.sh --version latest` or
+`./scripts/install-cli.sh --version v0.1.0` instead. Use `--prefix DIR` to
+choose another installation root. The installer does not require root
+privileges.
 
 The identity and issuer restrictions are intentional: they require the
 signature to originate from the OmaSafe release workflow in GitHub Actions.

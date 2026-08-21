@@ -580,19 +580,23 @@
       <div class="sec-head">
         <p class="eyebrow">Getting started</p>
         <h2>Download the engine, then pin what you trust</h2>
-        <p>GitHub releases are the first distribution path. The optional Omarchy bar widget is maintained and installed separately.</p>
+        <p>GitHub releases are the first distribution path. The optional Omarchy bar widget is maintained and installed separately in the <a href="https://github.com/tuthan/omasafe-plugin">OmaSafe plugin repository</a>.</p>
       </div>
       <div class="cta-row" style="margin-bottom: 28px;">
         <a class="btn btn-primary" href="https://github.com/tuthan/omasafe/releases/latest">Download the CLI release</a>
-        <a class="btn btn-ghost" href="https://github.com/tuthan/omasafe#installation-boundary">Installation instructions</a>
+        <a class="btn btn-ghost" href="https://github.com/tuthan/omasafe#installation">Installation instructions</a>
       </div>
       <div class="install reveal">
         <div class="term">
-          <div class="term-head">developer build</div>
-<pre>cargo build --release --locked
+          <div class="term-head">verified install</div>
+<pre>curl --fail --proto <span class="p">'=https'</span> --tlsv1.2 --location \
+  https://raw.githubusercontent.com/tuthan/omasafe/d4fb76d/scripts/install-cli.sh \
+  | bash -s -- <span class="p">--version</span> latest
 
-omasafe-cli plugins inventory <span class="p">--format json</span>
-omasafe-cli plugins status PLUGIN_ID</pre>
+<span class="c"># exact release</span>
+curl --fail --proto <span class="p">'=https'</span> --tlsv1.2 --location \
+  https://raw.githubusercontent.com/tuthan/omasafe/d4fb76d/scripts/install-cli.sh \
+  | bash -s -- <span class="p">--version</span> v0.1.0</pre>
         </div>
         <div class="term">
           <div class="term-head">pin &amp; watch</div>

@@ -107,18 +107,31 @@ and removal lifecycles.
 - **CLI** — install `omasafe-cli` from the
   [GitHub releases](https://github.com/tuthan/omasafe/releases) (or the future Arch
   package), place it on the `omarchy-shell` session `PATH`. For x86_64 Linux, the
-  repository includes a helper that verifies the Sigstore bundle and SHA-256 digest
-  before installing to `~/.local/bin`:
+  version-pinned helper verifies the Sigstore bundle and SHA-256 digest before
+  installing to `~/.local/bin`:
 
   ```sh
-  ./scripts/install-cli.sh --version v0.1.0
+  # Install the latest signed release
+  curl --fail --proto '=https' --tlsv1.2 --location \
+    https://raw.githubusercontent.com/tuthan/omasafe/d4fb76d/scripts/install-cli.sh \
+    | bash -s -- --version latest
+
+  # Or install an exact release
+  curl --fail --proto '=https' --tlsv1.2 --location \
+    https://raw.githubusercontent.com/tuthan/omasafe/d4fb76d/scripts/install-cli.sh \
+    | bash -s -- --version v0.1.0
   ```
+
+  The pinned commit contains the installer; `latest` selects the current
+  signed release, while `v0.1.0` selects an exact signed archive. From a
+  repository checkout, run `./scripts/install-cli.sh --version latest` or
+  `./scripts/install-cli.sh --version v0.1.0`.
 
   Release signatures and detached verification instructions are in
   [`docs/release-signing.md`](docs/release-signing.md).
-- **UI plugin** — the standalone bar-widget lives in the sibling project
-  [`../omasafe-plugin/`](../omasafe-plugin/), which carries a repository-root
-  `manifest.json` for direct Omarchy publishing.
+- **UI plugin** — the standalone bar-widget lives in the
+  [`omasafe-plugin`](https://github.com/tuthan/omasafe-plugin) repository, which
+  carries a repository-root `manifest.json` for direct Omarchy publishing.
 
 Installing an Omarchy plugin only clones and validates the plugin checkout; it does
 **not** install native binaries or run dependency installers. If the plugin is
