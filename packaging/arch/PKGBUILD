@@ -1,3 +1,5 @@
+# shellcheck shell=bash
+# shellcheck disable=SC2034,SC2154
 pkgname=omasafe-cli
 pkgver=0.1.0
 pkgrel=1
@@ -11,12 +13,12 @@ source=("$pkgname-$pkgver.tar.gz::https://github.com/tuthan/omasafe/archive/refs
 sha256sums=('SKIP')
 
 build() {
-  cd "omasafe-$pkgver"
+  cd "omasafe-$pkgver" || return 1
   OMASAFE_SOURCE_REVISION="v$pkgver" cargo build --locked --release -p omasafe-cli
 }
 
 package() {
-  cd "omasafe-$pkgver"
+  cd "omasafe-$pkgver" || return 1
 
   ./scripts/generate-cli-assets.sh
 
