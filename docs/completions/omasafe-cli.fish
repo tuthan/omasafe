@@ -7,6 +7,6 @@ complete -c omasafe-cli -l yes
 complete -c omasafe-cli -l expected-head -r
 complete -c omasafe-cli -l expected-tree -r
 complete -c omasafe-cli -l expected-digest -r
-complete -c omasafe-cli -l action -r -a "acknowledge revoke"
+complete -c omasafe-cli -l action -r -a "acknowledge exclude rebaseline restore untrust revoke"
 complete -c omasafe-cli -l reason -r
 complete -c omasafe-cli -l commit -r

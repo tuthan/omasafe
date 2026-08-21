@@ -77,7 +77,8 @@ Report whether a plugin matches its trusted baseline.
 Show the file-level differences from the trusted baseline.
 .TP
 .B plugins review PLUGIN_ID
-Acknowledge or revoke a reviewed finding.
+Acknowledge findings, change review decisions, rebaseline, restore, or untrust a
+plugin. Untrust revokes the active baseline while preserving its history.
 .TP
 .B marketplace refresh --commit COMMIT
 Fetch and verify a pinned marketplace snapshot.
@@ -148,7 +149,7 @@ complete -c omasafe-cli -l yes
 complete -c omasafe-cli -l expected-head -r
 complete -c omasafe-cli -l expected-tree -r
 complete -c omasafe-cli -l expected-digest -r
-complete -c omasafe-cli -l action -r -a "acknowledge revoke"
+complete -c omasafe-cli -l action -r -a "acknowledge exclude rebaseline restore untrust revoke"
 complete -c omasafe-cli -l reason -r
 complete -c omasafe-cli -l commit -r
 EOF
