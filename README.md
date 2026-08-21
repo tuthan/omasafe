@@ -111,20 +111,25 @@ and removal lifecycles.
   installing to `~/.local/bin`:
 
   ```sh
-  # Install the latest signed release
+  # Download the pinned installer, review it, then run it locally
   curl --fail --proto '=https' --tlsv1.2 --location \
     https://raw.githubusercontent.com/tuthan/omasafe/d4fb76d/scripts/install-cli.sh \
-    | bash -s -- --version latest
+    --output install-cli.sh
+  less install-cli.sh
+  bash install-cli.sh --version latest
 
-  # Or install an exact release
+  # Or review and run it for an exact release
   curl --fail --proto '=https' --tlsv1.2 --location \
     https://raw.githubusercontent.com/tuthan/omasafe/d4fb76d/scripts/install-cli.sh \
-    | bash -s -- --version v0.1.0
+    --output install-cli.sh
+  less install-cli.sh
+  bash install-cli.sh --version v0.1.0
   ```
 
-  The pinned commit contains the installer; `latest` selects the current
-  signed release, while `v0.1.0` selects an exact signed archive. From a
-  repository checkout, run `./scripts/install-cli.sh --version latest` or
+  The pinned commit contains the installer; reviewing it locally avoids piping
+  a network response directly to the shell. `latest` selects the current signed
+  release, while `v0.1.0` selects an exact signed archive. From a repository
+  checkout, run `./scripts/install-cli.sh --version latest` or
   `./scripts/install-cli.sh --version v0.1.0`.
 
   Release signatures and detached verification instructions are in
