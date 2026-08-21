@@ -1,0 +1,12 @@
+# Canonical OmaSafe CLI surface used by scripts/generate-cli-assets.sh.
+# Columns: top-level command, subcommand or argument summary.
+paths	print XDG configuration, state, and cache paths
+provenance	[--format text|json]
+scan	[--format text|json] [--notify] [--only-new]
+plugins inventory	[--format text|json]
+plugins trust PLUGIN_ID	[--yes] [--expected-head VALUE] [--expected-tree VALUE] [--expected-digest VALUE]
+plugins status PLUGIN_ID	[--format text|json]
+plugins diff PLUGIN_ID	[--format text|json]
+plugins review PLUGIN_ID	--action acknowledge|revoke [--reason TEXT] [--yes]
+marketplace refresh	--commit COMMIT
+schedule install

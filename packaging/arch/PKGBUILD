@@ -1,0 +1,37 @@
+pkgname=omasafe-cli
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Local trust and drift-review CLI for Omarchy plugins'
+arch=('x86_64')
+url='https://github.com/tuthan/omasafe'
+license=('MIT')
+depends=('glibc')
+makedepends=('bash' 'cargo')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/tuthan/omasafe/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "omasafe-$pkgver"
+  OMASAFE_SOURCE_REVISION="v$pkgver" cargo build --locked --release -p omasafe-cli
+}
+
+package() {
+  cd "omasafe-$pkgver"
+
+  ./scripts/generate-cli-assets.sh
+
+  install -Dm755 "target/release/omasafe-cli" \
+    "$pkgdir/usr/bin/omasafe-cli"
+  install -Dm644 docs/man/omasafe-cli.1 \
+    "$pkgdir/usr/share/man/man1/omasafe-cli.1"
+  install -Dm644 docs/completions/omasafe-cli.bash \
+    "$pkgdir/usr/share/bash-completion/completions/omasafe-cli"
+  install -Dm644 docs/completions/_omasafe-cli \
+    "$pkgdir/usr/share/zsh/site-functions/_omasafe-cli"
+  install -Dm644 docs/completions/omasafe-cli.fish \
+    "$pkgdir/usr/share/fish/vendor_completions.d/omasafe-cli.fish"
+  install -Dm644 LICENSE \
+    "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md \
+    "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

@@ -1,6 +1,8 @@
 use assert_cmd::Command;
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::fs;
+use std::path::Path;
 use tempfile::TempDir;
 
 struct Fixture {
@@ -319,4 +321,63 @@ fn stale_cached_snapshot_is_disclosed() {
     let report = fixture.inventory();
     assert_eq!(report["result"]["marketplace_stale"], true);
     assert_eq!(report["result"]["marketplace_source"], "unverified-cache");
+}
+
+#[test]
+fn provenance_report_is_deterministic_and_complete() {
+    let fixture = Fixture::new();
+    let first = fixture
+        .command()
+        .args(["provenance", "--format", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let second = fixture
+        .command()
+        .args(["provenance", "--format", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(first, second);
+    let report: Value = serde_json::from_slice(&first).unwrap();
+    assert_eq!(report["schema"], "omasafe.provenance.v1");
+    assert!(report["source_revision"].as_str().is_some());
+    assert!(report["cargo_lock_sha256"].as_str().unwrap().len() == 64);
+    assert_eq!(report["supported_runtime"]["omarchy"], "4.0.0-1");
+    assert!(
+        !report["coverage_limitations"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn cli_surface_matches_usage_commands() {
+    let source = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")).unwrap();
+    let usage = source
+        .lines()
+        .find(|line| line.contains("usage: omasafe-cli"))
+        .expect("main.rs must contain the CLI usage string");
+    let usage_commands: BTreeSet<_> = usage
+        .split("usage: omasafe-cli ")
+        .nth(1)
+        .unwrap()
+        .split(" | ")
+        .filter_map(|entry| entry.split_whitespace().next())
+        .collect();
+
+    let surface_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/cli-surface.txt");
+    let surface = fs::read_to_string(surface_path).unwrap();
+    let surface_commands: BTreeSet<_> = surface
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
+
+    assert_eq!(usage_commands, surface_commands);
 }

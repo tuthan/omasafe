@@ -6,12 +6,15 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
     name: Build ${{ matrix.target }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     strategy:
       fail-fast: true
       matrix:
@@ -28,20 +31,18 @@ jobs:
           target: ${{ matrix.target }}
 
       - name: Build CLI
+        env:
+          OMASAFE_SOURCE_REVISION: ${{ github.sha }}
         run: cargo build --locked --release --target "${{ matrix.target }}" -p omasafe-cli
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.1.0
 
       - name: Stage release asset
         env:
           TARGET: ${{ matrix.target }}
           VERSION: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          asset="omasafe-cli-${VERSION}-${TARGET}"
-          mkdir -p "release/${asset}"
-          install -Dm755 "target/${TARGET}/release/omasafe-cli" "release/${asset}/omasafe-cli"
-          cp README.md LICENSE "release/${asset}/"
-          tar -C release -czf "release/${asset}.tar.gz" "${asset}"
-          sha256sum "release/${asset}.tar.gz" > "release/${asset}.tar.gz.sha256"
+        run: ./scripts/stage-release-asset.sh
 
       - uses: actions/upload-artifact@v4
         with:
@@ -67,7 +68,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release create "${GITHUB_REF_NAME}" release/* \
+          gh release create "${GITHUB_REF_NAME}" \
+            release/*.tar.gz release/*.sha256 release/*.sigstore.json \
             --repo "${GITHUB_REPOSITORY}" \
             --title "${GITHUB_REF_NAME}" \
             --generate-notes

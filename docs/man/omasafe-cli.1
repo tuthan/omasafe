@@ -1,0 +1,64 @@
+.TH OMASAFE-CLI 1 "2026-08-21" "OmaSafe 0.1.0" "User Commands"
+.SH NAME
+omasafe-cli \- local trust and drift review for Omarchy plugins
+.SH SYNOPSIS
+.B omasafe-cli
+.I COMMAND
+.RI [ OPTIONS ]
+.SH DESCRIPTION
+OmaSafe inventories installed Omarchy plugins, compares them with trusted
+baselines, and reports source drift. The CLI is the engine used by the optional
+Omarchy bar-widget plugin.
+.SH COMMANDS
+.TP
+.B paths
+Print the XDG configuration, state, and cache paths used by OmaSafe.
+.TP
+.B provenance [--format text|json]
+Print the deterministic build self-inventory, source revision, toolchain,
+lockfile identity, supported runtime versions, and coverage limitations.
+.TP
+.B scan [--format text|json] [--notify] [--only-new]
+Inventory plugins and report new or outstanding findings. Exit status 3 means
+actionable findings remain.
+.TP
+.B plugins inventory
+Print the installed plugin inventory and marketplace correlation.
+.TP
+.B plugins trust PLUGIN_ID
+Show a plugin identity and interactively accept it, or use explicit expected
+identity values with --yes.
+.TP
+.B plugins status PLUGIN_ID
+Report whether a plugin matches its trusted baseline.
+.TP
+.B plugins diff PLUGIN_ID
+Show the file-level differences from the trusted baseline.
+.TP
+.B plugins review PLUGIN_ID
+Acknowledge or revoke a reviewed finding.
+.TP
+.B marketplace refresh --commit COMMIT
+Fetch and verify a pinned marketplace snapshot.
+.TP
+.B schedule install
+Install the user-level scheduled scan unit.
+.SH FILES
+The configuration, state, and cache roots follow XDG_CONFIG_HOME,
+XDG_STATE_HOME, and XDG_CACHE_HOME, defaulting to ~/.config/omasafe,
+~/.local/state/omasafe, and ~/.cache/omasafe.
+.SH EXIT STATUS
+.TP
+.B 0
+The command completed successfully and no actionable scan findings remain.
+.TP
+.B 1
+The command failed.
+.TP
+.B 2
+Usage or argument error.
+.TP
+.B 3
+The scan completed and actionable findings remain.
+.SH SEE ALSO
+.BR omasafe-cli (1)

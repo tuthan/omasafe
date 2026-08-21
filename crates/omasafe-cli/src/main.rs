@@ -40,6 +40,14 @@ fn run(args: Vec<String>) -> Result<i32, Box<dyn std::error::Error>> {
             print_paths()?;
             0
         }
+        [command] if command == "provenance" => {
+            provenance(&[])?;
+            0
+        }
+        [command, rest @ ..] if command == "provenance" => {
+            provenance(rest)?;
+            0
+        }
         [command, subcommand, rest @ ..] if command == "plugins" && subcommand == "inventory" => {
             inventory(rest)?;
             0
@@ -84,12 +92,71 @@ fn run(args: Vec<String>) -> Result<i32, Box<dyn std::error::Error>> {
         }
         _ => {
             eprintln!(
-                "usage: omasafe-cli plugins ... | scan [--format text|json] [--notify] [--only-new] | marketplace refresh --commit COMMIT | schedule install | paths"
+                "usage: omasafe-cli plugins ... | scan [--format text|json] [--notify] [--only-new] | marketplace refresh --commit COMMIT | schedule install | paths | provenance [--format text|json]"
             );
             std::process::exit(2);
         }
     };
     Ok(exit_code)
+}
+
+fn provenance(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut format = "text";
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--format" => {
+                format = next_value(args, index, "provenance format")?;
+                index += 2;
+            }
+            value => return Err(format!("unknown provenance argument: {value}").into()),
+        }
+    }
+
+    let report = serde_json::json!({
+        "schema": "omasafe.provenance.v1",
+        "tool": "omasafe-cli",
+        "tool_version": TOOL_VERSION,
+        "source_revision": env!("OMASAFE_SOURCE_REVISION"),
+        "target": env!("OMASAFE_TARGET"),
+        "rust_toolchain": env!("OMASAFE_RUST_TOOLCHAIN"),
+        "cargo_lock_sha256": env!("OMASAFE_CARGO_LOCK_SHA256"),
+        "supported_runtime": {
+            "omarchy": "4.0.0-1",
+            "quickshell": "0.3.0"
+        },
+        "coverage_limitations": [
+            "Omarchy plugin inventory depends on omarchy plugin list --json.",
+            "Filesystem-only inventory is partial when native Omarchy metadata is unavailable.",
+            "Runtime behavior of unsandboxed plugin QML is described, not executed by the CLI."
+        ]
+    });
+
+    match format {
+        "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+        "text" => {
+            println!("OmaSafe provenance");
+            println!("schema: {}", report["schema"]);
+            println!("tool: {} {}", report["tool"], report["tool_version"]);
+            println!("source_revision: {}", report["source_revision"]);
+            println!("target: {}", report["target"]);
+            println!("rust_toolchain: {}", report["rust_toolchain"]);
+            println!("cargo_lock_sha256: {}", report["cargo_lock_sha256"]);
+            println!(
+                "supported_runtime: Omarchy {} / Quickshell {}",
+                report["supported_runtime"]["omarchy"], report["supported_runtime"]["quickshell"]
+            );
+            println!("coverage_limitations:");
+            for limitation in report["coverage_limitations"]
+                .as_array()
+                .expect("static provenance limitations")
+            {
+                println!("- {limitation}");
+            }
+        }
+        value => return Err(format!("unsupported provenance format: {value}").into()),
+    }
+    Ok(())
 }
 
 fn trust(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
