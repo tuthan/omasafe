@@ -188,6 +188,76 @@ fn acknowledge_without_scope_marks_source_drift_reviewed() {
 }
 
 #[test]
+fn untrust_revokes_the_active_baseline_without_deleting_history() {
+    let fixture = Fixture::new();
+    fixture.trust_current();
+    fixture
+        .command()
+        .args([
+            "plugins",
+            "review",
+            "io.example.cli",
+            "--action",
+            "untrust",
+            "--reason",
+            "no longer trusted",
+            "--yes",
+        ])
+        .assert()
+        .success();
+
+    let status = fixture
+        .command()
+        .args(["plugins", "status", "io.example.cli", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let report: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(report["result"]["state"], "untrusted");
+    assert!(report["result"]["trusted"].is_null());
+    assert_eq!(
+        report["result"]["reason"],
+        "trust baseline was revoked; restore or re-trust to recover it"
+    );
+
+    let history: Value = serde_json::from_slice(
+        &fs::read(fixture.state.path().join("omasafe/trust-history.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(history["records"].as_array().unwrap().len(), 1);
+    assert_eq!(history["revoked_plugins"][0], "io.example.cli");
+}
+
+#[test]
+fn missing_plugin_alerts_are_deduplicated_across_trust_history() {
+    let fixture = Fixture::new();
+    fixture.trust_current();
+    let history_path = fixture.state.path().join("omasafe/trust-history.json");
+    let mut history: Value = serde_json::from_slice(&fs::read(&history_path).unwrap()).unwrap();
+    let duplicate = history["records"][0].clone();
+    history["records"].as_array_mut().unwrap().push(duplicate);
+    fs::write(&history_path, serde_json::to_vec(&history).unwrap()).unwrap();
+    fs::remove_dir_all(&fixture.plugin).unwrap();
+
+    let output = fixture
+        .command()
+        .args(["scan", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let missing = report["result"]["alerts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|alert| alert["kind"] == "missing-plugin")
+        .count();
+    assert_eq!(missing, 1);
+    assert!(report["result"]["outstanding"].as_u64().unwrap() >= 1);
+    assert_eq!(report["result"]["new"], report["result"]["outstanding"]);
+}
+
+#[test]
 fn inventory_uses_verified_cached_marketplace_snapshot_by_default() {
     let fixture = Fixture::new();
     let cache = fixture.cache.path().join("omasafe");
@@ -209,6 +279,29 @@ fn inventory_uses_verified_cached_marketplace_snapshot_by_default() {
         report["result"]["marketplace_retrieved_at"],
         "2026-08-20T00:00:00Z"
     );
+}
+
+#[test]
+fn inventory_text_separates_backup_folders_from_installed_plugins() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(
+        fixture
+            .config
+            .path()
+            .join("omarchy/plugins/.io.example.cli.bak.20260821"),
+    )
+    .unwrap();
+    fixture
+        .command()
+        .args(["plugins", "inventory"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "1 installed plugin(s) collected.",
+        ))
+        .stdout(predicates::str::contains(
+            "1 backup folder(s) retained separately for audit visibility.",
+        ));
 }
 
 #[test]
@@ -253,6 +346,8 @@ fn scan_reports_outstanding_findings_with_exit_code_three() {
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(report["result"]["outstanding"].as_u64().unwrap() > 0);
     assert!(report["result"]["new"].as_u64().unwrap() > 0);
+    assert_eq!(report["result"]["highest_severity"], "warning");
+    assert_eq!(report["result"]["alerts"][0]["severity"], "warning");
 }
 
 #[test]
@@ -277,6 +372,33 @@ fn only_new_scan_is_quiet_after_notification_delivery() {
         .stdout(predicates::str::contains(
             "No new actionable changes detected.",
         ));
+}
+
+#[test]
+fn only_new_scan_keeps_highest_severity_for_outstanding_findings() {
+    let fixture = Fixture::new();
+    fixture.trust_current();
+    fs::write(
+        fixture.plugin.join("main.qml"),
+        "Item { property bool changed: true }\n",
+    )
+    .unwrap();
+    fixture
+        .command()
+        .args(["scan", "--notify"])
+        .assert()
+        .code(3);
+
+    let output = fixture
+        .command()
+        .args(["scan", "--format", "json", "--only-new"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(report["result"]["outstanding"].as_u64().unwrap() > 0);
+    assert_eq!(report["result"]["new"], 0);
+    assert_eq!(report["result"]["highest_severity"], "warning");
 }
 
 #[test]

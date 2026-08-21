@@ -74,8 +74,11 @@ omasafe-cli plugins trust PLUGIN_ID \
 omasafe-cli plugins status PLUGIN_ID --format json
 omasafe-cli plugins diff PLUGIN_ID
 
-# Record a review decision: acknowledge | rebaseline | restore | exclude
+# Record a review decision: acknowledge | rebaseline | restore | untrust | exclude
 omasafe-cli plugins review PLUGIN_ID --action acknowledge --reason "reviewed" --yes
+
+# Remove the active trust baseline while keeping the historical record
+omasafe-cli plugins review PLUGIN_ID --action untrust --reason "no longer trusted" --yes
 
 # Post-change drift scan across all plugins (optionally desktop-notify only new alerts)
 omasafe-cli scan --format json --notify --only-new

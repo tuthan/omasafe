@@ -171,12 +171,20 @@ fn collect_internal(
         };
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
+        let backup = is_backup(&name);
         let manifest_id = manifest_id(&path);
-        let shell_key = manifest_id
-            .as_deref()
-            .filter(|id| shell_by_id.contains_key(*id))
-            .map(str::to_owned)
-            .or_else(|| Some(name.clone()));
+        // Backups frequently retain a copy of the live manifest. They must
+        // never consume the shell record for that live plugin, or the same
+        // plugin ID appears twice with a spurious directory-ID limitation.
+        let shell_key = if backup {
+            None
+        } else {
+            manifest_id
+                .as_deref()
+                .filter(|id| shell_by_id.contains_key(*id))
+                .map(str::to_owned)
+                .or_else(|| Some(name.clone()))
+        };
         let shell_plugin = shell_key.and_then(|key| shell_by_id.remove(&key));
         if let Some(target_id) = target_id
             && manifest_id.as_deref() != Some(target_id)
@@ -878,6 +886,45 @@ mod tests {
                 .limitations
                 .iter()
                 .any(|limitation| limitation == "directory_id_mismatch")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn backup_manifest_does_not_consume_live_shell_plugin_record() {
+        let root = fixture_root();
+        let backup = root.join(".io.example.widget.bak.20260821");
+        manifest(&backup, "io.example.widget", &["bar-widget"]);
+        manifest(
+            &root.join("io.example.widget"),
+            "io.example.widget",
+            &["bar-widget"],
+        );
+        let inventory = collect(
+            &root,
+            Some(
+                r#"[{"id":"io.example.widget","enabled":true,"active":true,"firstParty":false,"kinds":["bar-widget"]}]"#,
+            ),
+        );
+        let backup = inventory
+            .plugins
+            .iter()
+            .find(|plugin| plugin.classification == "backup")
+            .unwrap();
+        let live = inventory
+            .plugins
+            .iter()
+            .find(|plugin| plugin.id == "io.example.widget")
+            .unwrap();
+        assert_eq!(backup.id, ".io.example.widget.bak.20260821");
+        assert_eq!(live.enabled, Some(true));
+        assert_eq!(
+            inventory
+                .plugins
+                .iter()
+                .filter(|plugin| plugin.id == "io.example.widget")
+                .count(),
+            1
         );
         fs::remove_dir_all(root).unwrap();
     }

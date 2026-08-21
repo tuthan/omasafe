@@ -41,6 +41,8 @@ pub struct TrustHistory {
     pub records: Vec<TrustRecord>,
     #[serde(default)]
     pub decisions: Vec<ReviewDecision>,
+    #[serde(default)]
+    pub revoked_plugins: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -73,6 +75,7 @@ impl Default for TrustHistory {
             schema_version: HISTORY_SCHEMA_VERSION,
             records: Vec::new(),
             decisions: Vec::new(),
+            revoked_plugins: Vec::new(),
         }
     }
 }
@@ -93,6 +96,7 @@ impl TrustHistory {
                 schema_version: HISTORY_SCHEMA_VERSION,
                 records: Vec::new(),
                 decisions: Vec::new(),
+                revoked_plugins: Vec::new(),
             });
         }
         let history: Self =
@@ -112,10 +116,25 @@ impl TrustHistory {
 
     pub fn accept(&mut self, record: TrustRecord) {
         self.schema_version = HISTORY_SCHEMA_VERSION;
+        self.revoked_plugins.retain(|id| id != &record.plugin_id);
         self.records.push(record);
     }
 
+    pub fn revoke(&mut self, plugin_id: &str) {
+        self.schema_version = HISTORY_SCHEMA_VERSION;
+        if !self.revoked_plugins.iter().any(|id| id == plugin_id) {
+            self.revoked_plugins.push(plugin_id.to_owned());
+        }
+    }
+
+    pub fn is_revoked(&self, plugin_id: &str) -> bool {
+        self.revoked_plugins.iter().any(|id| id == plugin_id)
+    }
+
     pub fn latest(&self, plugin_id: &str) -> Option<&TrustRecord> {
+        if self.is_revoked(plugin_id) {
+            return None;
+        }
         self.records
             .iter()
             .rev()
@@ -289,6 +308,39 @@ mod tests {
         );
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("lock"));
+    }
+
+    #[test]
+    fn revoking_hides_a_baseline_until_it_is_trusted_again() {
+        let identity = SourceIdentity {
+            plugin_id: "io.example.revocable".into(),
+            repository: None,
+            head: Some("head".into()),
+            tree: Some("tree".into()),
+            content_digest: Some("digest".into()),
+            file_count: 1,
+            limitations: Vec::new(),
+            file_digests: std::collections::BTreeMap::new(),
+        };
+        let mut history = TrustHistory::default();
+        history.accept(TrustRecord {
+            plugin_id: identity.plugin_id.clone(),
+            accepted: identity.clone(),
+            accepted_at: "first".into(),
+            note: "first trust".into(),
+        });
+        assert!(history.latest(&identity.plugin_id).is_some());
+
+        history.revoke(&identity.plugin_id);
+        assert!(history.latest(&identity.plugin_id).is_none());
+
+        history.accept(TrustRecord {
+            plugin_id: identity.plugin_id.clone(),
+            accepted: identity,
+            accepted_at: "second".into(),
+            note: "trusted again".into(),
+        });
+        assert!(history.latest("io.example.revocable").is_some());
     }
 
     #[test]
