@@ -5,7 +5,8 @@ not add new detection behavior.
 
 ## Required artifacts
 
-- `packaging/arch/PKGBUILD` for the CLI and plugin files.
+- `packaging/arch/PKGBUILD` for the CLI package. The Omarchy plugin remains a
+  separate marketplace repository and is not bundled into this package.
 - Man pages for the supported CLI commands and configuration/state locations.
 - Shell completions generated from the authoritative CLI command surface.
 - A deterministic self-inventory/provenance report containing source revision,
@@ -15,9 +16,21 @@ not add new detection behavior.
 
 The repository now has a tag-triggered release workflow at
 `.github/workflows/release.yml`. It builds the locked `omasafe-cli` workspace binary
-for `x86_64-unknown-linux-gnu`, publishes a tarball, and publishes its SHA-256 file.
-The workflow is an asset-publishing mechanism, not a replacement for package signing.
-  instructions.
+for `x86_64-unknown-linux-gnu`, generates the man pages, completions, and
+provenance report, and publishes a tarball, SHA-256 file, and Cosign Sigstore
+bundle. The workflow is the first distribution path for M7. AUR publication is
+explicitly out of scope for this milestone; the `PKGBUILD` is present for clean-build
+and local package validation and can be published later after the package lifecycle
+is ready.
+
+Signing details and detached verification commands are documented in
+[`docs/release-signing.md`](release-signing.md). The source tag is maintainer-GPG
+signed; the release archive is keylessly signed by GitHub Actions through Sigstore.
+
+The static project site is a separate GitHub Pages artifact. It is sourced from
+`site/` and deployed by `.github/workflows/pages.yml`; it is not included in the
+CLI release archive and is not an AUR publication mechanism. GitHub repository
+Pages settings must use **GitHub Actions** as the build and deployment source.
 
 ## Release gates
 
@@ -34,12 +47,16 @@ The workflow is an asset-publishing mechanism, not a replacement for package sig
       exact committed tree.
 - [ ] Document installation, upgrade, removal, signature verification, supported
       runtime versions, and known VM/runtime limitations.
+- [ ] Verify the static site deployment from `site/` at the GitHub Pages URL.
 
 ## Decisions before implementation
 
-1. Package name and split, if any, between the CLI and Omarchy plugin.
+1. Package name and split: M7 packages `omasafe-cli`; the Omarchy plugin remains a
+   separate marketplace repository. AUR publication is deferred.
 2. Installation locations for the binary, man pages, completions, and plugin.
-3. Signing key and artifact format accepted for release verification.
+3. Signing format: maintainer GPG-signed source tags plus Cosign keyless
+   Sigstore bundles for GitHub release archives; verification is detached and
+   restricted to the OmaSafe release workflow's GitHub OIDC identity.
 4. Supported Arch/Omarchy/Quickshell versions and the VM image source.
 5. Whether package upgrades preserve user state by default and how removal is
    confirmed.
@@ -56,10 +73,29 @@ one of these M7 distribution layouts:
   the CLI engine; or
 - combine the two repositories later if a single source repository is preferred.
 
-Neither layout causes `omarchy plugin add` to install `omasafe-cli`. The CLI must be
-installed separately through the Arch package/release workflow, and the plugin should
-document the missing-CLI state as unavailable rather than downloading or executing a
+`omasafe-plugin` is intentionally a thin UI-only repository. A user may install it
+from the marketplace before knowing about or installing the CLI, so its README must
+document the dependency and the widget must show an explicit unavailable state rather
+than implying a clean result. The plugin must not download, install, or execute a
 release asset at runtime.
+
+`omarchy plugin add` only installs the plugin checkout; it does not install
+`omasafe-cli` or run dependency hooks. The CLI is installed separately from the
+GitHub release archive or the future Arch package and must be visible on the
+`omarchy-shell` session `PATH`. The CLI creates its XDG configuration, state, and
+cache directories automatically on first use. The documented marketplace-first flow
+is:
+
+```text
+omarchy plugin add <plugin-repository> --enable
+# Install and verify omasafe-cli from the main OmaSafe release/package.
+omasafe-cli scan --format json
+omarchy-shell shell rescanPlugins
+omarchy plugin enable io.github.tuthan.omasafe --section right
+```
+
+The plugin and CLI have independent update and removal lifecycles. M7 must verify
+both install orders: CLI first/plugin second and marketplace plugin first/CLI second.
 
 The milestone should remain open until the signed-artifact and clean-VM gates are
 reproduced from a fresh checkout.

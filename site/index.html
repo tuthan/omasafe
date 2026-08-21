@@ -1,0 +1,636 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="OmaSafe records Omarchy plugin identity, provenance, and drift.">
+<title>OmaSafe</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500&display=swap">
+
+<style>
+  :root {
+    --ground: #f2f4f3;
+    --ground-deep: #e8ebea;
+    --surface: #ffffff;
+    --surface-sunk: #f7f8f8;
+    --ink: #12161c;
+    --ink-soft: #414c59;
+    --ink-faint: #6f7a87;
+    --rule: #d7dddc;
+    --rule-soft: #e6eae9;
+    --accent: #2b3a9e;
+    --accent-soft: #eceefb;
+    --pinned: #2e7d5b;
+    --drift: #b0651b;
+    --drift-soft: #f8eee2;
+    --critical: #b33a3a;
+    --shadow: 0 1px 2px rgba(18, 22, 28, .05), 0 14px 34px -20px rgba(18, 22, 28, .24);
+
+    --display: "Bricolage Grotesque", "Helvetica Neue", Arial, sans-serif;
+    --body: "IBM Plex Sans", system-ui, -apple-system, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #10141a;
+      --ground-deep: #0b0e13;
+      --surface: #171c23;
+      --surface-sunk: #131820;
+      --ink: #eef1f4;
+      --ink-soft: #b4bdc8;
+      --ink-faint: #808c99;
+      --rule: #272e38;
+      --rule-soft: #1e242c;
+      --accent: #93a0ff;
+      --accent-soft: #1b2136;
+      --pinned: #63c096;
+      --drift: #e0a161;
+      --drift-soft: #241a10;
+      --critical: #e5827e;
+      --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 16px 40px -24px rgba(0, 0, 0, .85);
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground: #10141a;
+    --ground-deep: #0b0e13;
+    --surface: #171c23;
+    --surface-sunk: #131820;
+    --ink: #eef1f4;
+    --ink-soft: #b4bdc8;
+    --ink-faint: #808c99;
+    --rule: #272e38;
+    --rule-soft: #1e242c;
+    --accent: #93a0ff;
+    --accent-soft: #1b2136;
+    --pinned: #63c096;
+    --drift: #e0a161;
+    --drift-soft: #241a10;
+    --critical: #e5827e;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 16px 40px -24px rgba(0, 0, 0, .85);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--body);
+    font-size: 16.5px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap { width: 100%; max-width: 1060px; margin: 0 auto; padding: 0 28px; }
+
+  a { color: inherit; }
+  a:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 2px; }
+
+  h1, h2, h3 { font-family: var(--display); font-weight: 700; margin: 0; letter-spacing: -.02em; text-wrap: balance; }
+
+  .eyebrow {
+    margin: 0;
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: .15em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+
+  .hash { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  .muted { color: var(--ink-faint); }
+
+  /* masthead */
+
+  .masthead {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    background: color-mix(in srgb, var(--ground) 86%, transparent);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--rule-soft);
+  }
+
+  .masthead-inner { display: flex; align-items: center; gap: 22px; height: 60px; }
+
+  .mark { display: flex; align-items: baseline; gap: 9px; text-decoration: none; margin-right: auto; }
+  .mark strong { font-family: var(--display); font-weight: 800; font-size: 19px; letter-spacing: -.02em; }
+  .mark span { font-family: var(--mono); font-size: 10.5px; letter-spacing: .12em; text-transform: uppercase; color: var(--ink-faint); }
+
+  .nav { display: flex; gap: 22px; font-family: var(--mono); font-size: 12.5px; }
+  .nav a { color: var(--ink-soft); text-decoration: none; }
+  .nav a:hover { color: var(--accent); }
+  @media (max-width: 560px) { .nav a.opt { display: none; } }
+
+  /* hero */
+
+  .hero { padding: 84px 0 76px; }
+
+  .hero-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, .88fr);
+    gap: 54px;
+    align-items: center;
+  }
+
+  @media (max-width: 900px) {
+    .hero { padding: 52px 0 56px; }
+    .hero-grid { grid-template-columns: minmax(0, 1fr); gap: 38px; align-items: start; }
+  }
+
+  .hero-copy { display: flex; flex-direction: column; gap: 20px; }
+
+  .hero h1 { font-size: clamp(38px, 5.6vw, 58px); line-height: 1.02; letter-spacing: -.034em; }
+  .hero h1 em { font-style: normal; display: block; color: var(--ink-faint); }
+
+  .lede { margin: 0; max-width: 40ch; font-size: 17px; color: var(--ink-soft); }
+
+  .cta-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    font-family: var(--mono);
+    font-size: 13px;
+    font-weight: 500;
+    text-decoration: none;
+    padding: 11px 17px;
+    border-radius: 3px;
+    border: 1px solid transparent;
+    transition: transform .16s ease, border-color .16s ease, color .16s ease;
+  }
+
+  .btn-primary { background: var(--accent); color: color-mix(in srgb, var(--ground-deep) 84%, var(--surface)); }
+  .btn-primary:hover { transform: translateY(-1px); }
+  .btn-ghost { border-color: var(--rule); color: var(--ink-soft); }
+  .btn-ghost:hover { border-color: var(--accent); color: var(--accent); }
+
+  .note { margin: 0; font-family: var(--mono); font-size: 12px; line-height: 1.55; color: var(--ink-faint); border-left: 2px solid var(--rule); padding-left: 13px; max-width: 42ch; }
+
+  /* record card */
+
+  .record {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    box-shadow: var(--shadow);
+    overflow: hidden;
+    font-family: var(--mono);
+    font-size: 12.5px;
+  }
+
+  .record-bar {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--rule-soft);
+    background: var(--surface-sunk);
+    color: var(--ink-faint);
+    font-size: 11px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+  }
+
+  .shield { width: 12px; height: 12px; flex: none; border-radius: 2px 2px 5px 5px; background: var(--drift); }
+
+  .record-cmd { padding: 14px 16px 6px; color: var(--ink-soft); overflow-x: auto; white-space: nowrap; }
+  .record-cmd b { color: var(--accent); font-weight: 500; }
+
+  .record-body { margin: 0; padding: 6px 16px 16px; display: flex; flex-direction: column; }
+
+  .row {
+    display: grid;
+    grid-template-columns: 78px minmax(0, 1fr);
+    gap: 14px;
+    padding: 7px 0;
+    border-bottom: 1px dashed var(--rule-soft);
+    align-items: baseline;
+  }
+
+  .row:last-child { border-bottom: 0; }
+  .row dt { color: var(--ink-faint); letter-spacing: .04em; }
+  .row dd { margin: 0; overflow-wrap: anywhere; }
+
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--mono);
+    font-size: 10.5px;
+    font-weight: 500;
+    letter-spacing: .07em;
+    text-transform: uppercase;
+    padding: 3px 8px;
+    border-radius: 3px;
+    white-space: nowrap;
+  }
+
+  .pill::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+  .pill-drift { background: var(--drift-soft); color: var(--drift); }
+  .pill-info { background: var(--accent-soft); color: var(--accent); }
+
+  /* bands */
+
+  .band { padding: 74px 0; }
+  .band-sunk { background: var(--ground-deep); border-block: 1px solid var(--rule-soft); }
+
+  .sec-head { display: flex; flex-direction: column; gap: 11px; margin-bottom: 34px; max-width: 54ch; }
+  .sec-head h2 { font-size: clamp(25px, 3.3vw, 33px); line-height: 1.1; }
+  .sec-head p { margin: 0; color: var(--ink-soft); font-size: 15.5px; }
+
+  /* stats */
+
+  .stats { display: flex; flex-wrap: wrap; gap: 12px 56px; align-items: flex-end; }
+
+  .stat { display: flex; flex-direction: column; gap: 2px; min-width: 150px; }
+  .stat b { font-family: var(--display); font-weight: 700; font-size: 46px; line-height: 1; letter-spacing: -.035em; font-variant-numeric: tabular-nums; }
+  .stat .drifted { color: var(--drift); }
+  .stat span { font-family: var(--mono); font-size: 11.5px; color: var(--ink-faint); line-height: 1.5; }
+
+  /* answers */
+
+  .answers {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 1px;
+    background: var(--rule);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    overflow: hidden;
+  }
+
+  @media (max-width: 860px) { .answers { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  @media (max-width: 520px) { .answers { grid-template-columns: minmax(0, 1fr); } }
+
+  .answer { background: var(--surface); padding: 22px 20px; display: flex; flex-direction: column; gap: 8px; }
+  .answer span { font-family: var(--mono); font-size: 10.5px; letter-spacing: .12em; text-transform: uppercase; color: var(--accent); }
+  .answer h3 { font-size: 17px; line-height: 1.25; }
+  .answer p { margin: 0; font-size: 13.5px; color: var(--ink-faint); line-height: 1.5; }
+
+  /* timeline */
+
+  .track {
+    display: grid;
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap: 0 18px;
+    margin-top: 46px;
+  }
+
+  .stop {
+    padding: 22px 4px 0;
+    border-top: 2px solid var(--rule);
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+    position: relative;
+  }
+
+  .stop::before {
+    content: "";
+    position: absolute;
+    top: -6px;
+    left: 0;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--ground-deep);
+    border: 2px solid var(--rule);
+  }
+
+  .stop-done { border-top-color: var(--accent); }
+  .stop-done::before { background: var(--accent); border-color: var(--accent); }
+
+  .stop-now { border-top-color: var(--accent); }
+  .stop-now::before {
+    background: var(--drift);
+    border-color: var(--drift);
+    box-shadow: 0 0 0 4px var(--drift-soft);
+  }
+
+  .stop b {
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+
+  .stop-now b { color: var(--drift); }
+
+  .stop h3 { font-size: 17px; line-height: 1.2; }
+  .stop p { margin: 0; font-size: 13.5px; line-height: 1.5; color: var(--ink-faint); }
+
+  .ticks { display: flex; gap: 3px; margin-top: 2px; }
+  .ticks i { width: 100%; height: 4px; border-radius: 1px; background: var(--rule); }
+  .ticks i.on { background: var(--pinned); }
+  .ticks-label { font-family: var(--mono); font-size: 10.5px; letter-spacing: .06em; color: var(--ink-faint); }
+
+  @media (max-width: 880px) {
+    .track { grid-template-columns: minmax(0, 1fr); gap: 0; margin-top: 34px; }
+    .stop {
+      border-top: 0;
+      border-left: 2px solid var(--rule);
+      padding: 0 0 26px 24px;
+    }
+    .stop:last-child { border-left-color: transparent; }
+    .stop::before { top: 4px; left: -6px; }
+    .stop-done, .stop-now { border-left-color: var(--accent); }
+  }
+
+  /* boundaries */
+
+  .bounds { margin: 0; padding: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 44px; }
+  @media (max-width: 660px) { .bounds { grid-template-columns: minmax(0, 1fr); } }
+
+  .bounds li {
+    list-style: none;
+    display: grid;
+    grid-template-columns: 16px minmax(0, 1fr);
+    gap: 12px;
+    padding: 11px 0;
+    border-bottom: 1px solid var(--rule-soft);
+    font-size: 14.5px;
+    color: var(--ink-soft);
+  }
+
+  .bounds li::before { content: "\2715"; font-family: var(--mono); font-size: 11px; color: var(--critical); line-height: 1.9; }
+
+  /* install */
+
+  .install { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
+  @media (max-width: 780px) { .install { grid-template-columns: minmax(0, 1fr); } }
+
+  .term { background: var(--surface); border: 1px solid var(--rule); border-radius: 5px; overflow: hidden; }
+
+  .term-head {
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--rule-soft);
+    background: var(--surface-sunk);
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+
+  .term pre { margin: 0; padding: 15px 16px; overflow-x: auto; font-family: var(--mono); font-size: 12.5px; line-height: 1.9; }
+  .term pre .p { color: var(--accent); }
+  .term pre .c { color: var(--ink-faint); }
+
+  /* footer */
+
+  footer { border-top: 1px solid var(--rule); background: var(--ground-deep); padding: 34px 0 48px; }
+
+  .foot {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px 40px;
+    justify-content: space-between;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--ink-faint);
+    line-height: 1.9;
+  }
+
+  .foot a { color: var(--ink-soft); text-decoration: none; }
+  .foot a:hover { color: var(--accent); }
+  .foot-links { display: flex; gap: 18px; flex-wrap: wrap; }
+
+  .reveal { opacity: 0; transform: translateY(8px); transition: opacity .5s ease, transform .5s ease; }
+  .reveal.in { opacity: 1; transform: none; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .reveal { opacity: 1; transform: none; transition: none; }
+    .btn { transition: none; }
+  }
+</style>
+
+</head>
+<body>
+
+<header class="masthead">
+  <div class="wrap masthead-inner">
+    <a class="mark" href="#top"><strong>OmaSafe</strong><span>for Omarchy</span></a>
+    <nav class="nav">
+      <a class="opt" href="#answers">Scope</a>
+      <a href="#roadmap">Roadmap</a>
+      <a href="#install">Install</a>
+      <a class="opt" href="https://github.com/tuthan/omasafe">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+  <section class="wrap hero">
+    <div class="hero-grid">
+      <div class="hero-copy">
+        <p class="eyebrow">Local trust layer &middot; Omarchy plugins</p>
+        <h1>Your plugins are unsandboxed.<em>At least know when they change.</em></h1>
+        <p class="lede">
+          OmaSafe records the exact plugin revision on this machine, what the marketplace
+          validated, and what moved since you trusted it.
+        </p>
+        <div class="cta-row">
+          <a class="btn btn-primary" href="#install">Install the CLI</a>
+          <a class="btn btn-ghost" href="#roadmap">Roadmap</a>
+        </div>
+        <p class="note">Reports identity, provenance, and drift. Never declares a plugin safe or malicious.</p>
+      </div>
+
+      <div class="record reveal">
+        <div class="record-bar"><span class="shield" aria-hidden="true"></span> plugin trust record</div>
+        <div class="record-cmd"><span class="muted">$</span> omasafe-cli plugins status <b>io.github.example.weather</b></div>
+        <dl class="record-body">
+          <div class="row"><dt>head</dt><dd class="hash">4f9c1ae7&hellip; <span class="muted">baseline 8b21d033&hellip;</span></dd></div>
+          <div class="row"><dt>tree</dt><dd class="hash">a07e55b2&hellip; <span class="muted">clean</span></dd></div>
+          <div class="row"><dt>source</dt><dd><span class="pill pill-drift">drift &middot; 3 commits</span></dd></div>
+          <div class="row"><dt>registry</dt><dd><span class="pill pill-info">listed &middot; unverified</span></dd></div>
+          <div class="row"><dt>claim</dt><dd class="muted">validated 8b21d033&hellip; &mdash; upstream moved</dd></div>
+        </dl>
+      </div>
+    </div>
+  </section>
+
+  <section class="band band-sunk">
+    <div class="wrap">
+      <div class="sec-head">
+        <p class="eyebrow">Why</p>
+        <h2>The marketplace validates a commit. Your machine runs a branch.</h2>
+      </div>
+      <div class="stats reveal">
+        <div class="stat"><b>689</b><span>listings in the catalog</span></div>
+        <div class="stat"><b class="drifted">297</b><span>community listings unverified</span></div>
+        <div class="stat"><b class="drifted">274</b><span>upstream commit &ne; validated commit</span></div>
+      </div>
+      <p class="note" style="margin-top: 26px;">Marketplace catalog snapshot, 2026-08-20. Attributed to that snapshot, not treated as timeless fact.</p>
+    </div>
+  </section>
+
+  <section class="band wrap" id="answers">
+    <div class="sec-head">
+      <p class="eyebrow">Scope</p>
+      <h2>Four questions, answered after install</h2>
+    </div>
+    <div class="answers reveal">
+      <div class="answer">
+        <span>identity</span>
+        <h3>What is installed?</h3>
+        <p>Repository, HEAD, tree OID, dirty worktree.</p>
+      </div>
+      <div class="answer">
+        <span>provenance</span>
+        <h3>Is it what was checked?</h3>
+        <p>Correlated against a commit-pinned catalog.</p>
+      </div>
+      <div class="answer">
+        <span>drift</span>
+        <h3>What changed since?</h3>
+        <p>Your baseline, a diff, a daily quiet sweep.</p>
+      </div>
+      <div class="answer">
+        <span>review</span>
+        <h3>What should I read?</h3>
+        <p>Payload and capability evidence &mdash; v0.2.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="band band-sunk" id="roadmap">
+    <div class="wrap">
+      <div class="sec-head">
+        <p class="eyebrow">Roadmap</p>
+        <h2>Ordered by dependency, not ambition</h2>
+        <p>Identity and diff before the analyzer. The analyzer's report contract before anything privileged.</p>
+      </div>
+
+      <div class="track">
+        <div class="stop stop-now reveal">
+          <b>v0.1</b>
+          <h3>Local plugin trust</h3>
+          <p>Inventory, catalog correlation, commit identity, baseline, diff, drift alerts.</p>
+          <div class="ticks" role="img" aria-label="Milestones M0 to M7: five complete, three open">
+            <i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i></i><i></i><i></i>
+          </div>
+          <span class="ticks-label">5 of 8 milestones</span>
+        </div>
+
+        <div class="stop reveal">
+          <b>v0.2</b>
+          <h3>Capability analyzer</h3>
+          <p>QML-aware parsing, payload edges, sensitive shell APIs, reviewed updates.</p>
+        </div>
+
+        <div class="stop reveal">
+          <b>v0.3</b>
+          <h3>AUR review</h3>
+          <p>PKGBUILD static analysis and update diffs, never executing a build file.</p>
+        </div>
+
+        <div class="stop reveal">
+          <b>v0.4</b>
+          <h3>Posture regressions</h3>
+          <p>LUKS, firewall, SSH, persistence surfaces. Change state, not a grade.</p>
+        </div>
+
+        <div class="stop reveal">
+          <b>v0.5</b>
+          <h3>Narrow remediation</h3>
+          <p>Per-action polkit helper, first hardening installer, report export.</p>
+        </div>
+
+        <div class="stop reveal">
+          <b>later</b>
+          <h3>Held</h3>
+          <p>Secrets sweep, panic workflow, VirusTotal hash lookups, AIDE.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="band wrap">
+    <div class="sec-head">
+      <p class="eyebrow">Boundaries</p>
+      <h2>What it will never claim to be</h2>
+    </div>
+    <ul class="bounds reveal">
+      <li>Antivirus, sandboxing, or EDR</li>
+      <li>A universal security score</li>
+      <li>A promise to stop every malicious plugin</li>
+      <li>Automatic privileged remediation</li>
+      <li>A hosted reputation service</li>
+      <li>Affiliated with or endorsed by Omarchy</li>
+    </ul>
+  </section>
+
+  <section class="band band-sunk" id="install">
+    <div class="wrap">
+      <div class="sec-head">
+        <p class="eyebrow">Getting started</p>
+        <h2>Download the engine, then pin what you trust</h2>
+        <p>GitHub releases are the first distribution path. The optional Omarchy bar widget is maintained and installed separately.</p>
+      </div>
+      <div class="cta-row" style="margin-bottom: 28px;">
+        <a class="btn btn-primary" href="https://github.com/tuthan/omasafe/releases/latest">Download the CLI release</a>
+        <a class="btn btn-ghost" href="https://github.com/tuthan/omasafe#installation-boundary">Installation instructions</a>
+      </div>
+      <div class="install reveal">
+        <div class="term">
+          <div class="term-head">developer build</div>
+<pre>cargo build --release --locked
+
+omasafe-cli plugins inventory <span class="p">--format json</span>
+omasafe-cli plugins status PLUGIN_ID</pre>
+        </div>
+        <div class="term">
+          <div class="term-head">pin &amp; watch</div>
+<pre>omasafe-cli plugins trust PLUGIN_ID <span class="p">--yes</span> \
+  <span class="p">--expected-head</span> HEAD <span class="p">--expected-tree</span> TREE
+
+omasafe-cli plugins diff PLUGIN_ID
+omasafe-cli schedule install   <span class="c"># daily sweep</span></pre>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap foot">
+    <div>
+      io.github.tuthan.omasafe &middot; v0.1.0 &middot; MIT<br>
+      A trust and drift-review tool <em>for</em> Omarchy. Not an official Omarchy project.
+    </div>
+    <div class="foot-links">
+      <a href="#answers">Scope</a>
+      <a href="#roadmap">Roadmap</a>
+      <a href="#install">Install</a>
+      <a href="https://github.com/tuthan/omasafe/releases/latest">Releases</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+  (function () {
+    var targets = document.querySelectorAll('.reveal');
+    if (!('IntersectionObserver' in window) ||
+        window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      targets.forEach(function (el) { el.classList.add('in'); });
+      return;
+    }
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); }
+      });
+    }, { rootMargin: '0px 0px -8% 0px', threshold: 0.08 });
+    targets.forEach(function (el) { io.observe(el); });
+  })();
+</script>
+</body>
+</html>
