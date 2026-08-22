@@ -170,6 +170,89 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
+pub fn resolve_latest_commit(repository_url: &str) -> Result<String, Error> {
+    validate_https_repository(repository_url)?;
+    let output = git_command()
+        .args([
+            "ls-remote",
+            "--exit-code",
+            "--symref",
+            repository_url,
+            "HEAD",
+        ])
+        .output()
+        .map_err(|error| Error::Git(error.to_string()))?;
+    if !output.status.success() {
+        return Err(git_error(
+            &output.stderr,
+            "catalog remote did not advertise a default branch",
+        ));
+    }
+    parse_remote_head(&output.stdout)
+}
+
+fn parse_remote_head(output: &[u8]) -> Result<String, Error> {
+    let text = std::str::from_utf8(output)
+        .map_err(|_| Error::Git("catalog remote returned non-UTF-8 output".into()))?;
+    let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+    let symref_line = lines
+        .next()
+        .ok_or_else(|| Error::Git("catalog remote omitted its default branch".into()))?;
+    let mut symref_fields = symref_line.split_ascii_whitespace();
+    let marker = symref_fields.next();
+    let branch_ref = symref_fields.next();
+    let head = symref_fields.next();
+    if marker != Some("ref:")
+        || head != Some("HEAD")
+        || symref_fields.next().is_some()
+        || !branch_ref.is_some_and(|value| {
+            value.starts_with("refs/heads/") && value.len() > "refs/heads/".len()
+        })
+    {
+        return Err(Error::Git(
+            "catalog remote omitted a valid default branch".into(),
+        ));
+    }
+
+    let commit_line = lines
+        .next()
+        .ok_or_else(|| Error::Git("catalog remote omitted the default branch commit".into()))?;
+    let mut commit_fields = commit_line.split_ascii_whitespace();
+    let commit = commit_fields
+        .next()
+        .ok_or_else(|| Error::Git("catalog remote response omitted the commit".into()))?;
+    let reference = commit_fields
+        .next()
+        .ok_or_else(|| Error::Git("catalog remote response omitted the ref".into()))?;
+    if commit_fields.next().is_some() || reference != "HEAD" || !valid_commit(commit) {
+        return Err(Error::Git(
+            "catalog remote response was not an exact HEAD commit mapping".into(),
+        ));
+    }
+    if lines.next().is_some() {
+        return Err(Error::Git(
+            "catalog remote HEAD resolution returned multiple revisions".into(),
+        ));
+    }
+    Ok(commit.to_ascii_lowercase())
+}
+
+fn validate_https_repository(repository_url: &str) -> Result<(), Error> {
+    if !repository_url.starts_with("https://") || repository_url.starts_with('-') {
+        return Err(Error::Git("catalog repository must be an HTTPS URL".into()));
+    }
+    Ok(())
+}
+
+fn git_error(stderr: &[u8], fallback: &str) -> Error {
+    let message = String::from_utf8_lossy(stderr).trim().to_owned();
+    Error::Git(if message.is_empty() {
+        fallback.into()
+    } else {
+        message
+    })
+}
+
 pub fn fetch_pinned_catalog(
     cache_dir: &Path,
     repository_url: &str,
@@ -179,9 +262,7 @@ pub fn fetch_pinned_catalog(
     if !valid_commit(repository_commit) {
         return Err(Error::InvalidCommit);
     }
-    if !repository_url.starts_with("https://") || repository_url.starts_with("-") {
-        return Err(Error::Git("catalog repository must be an HTTPS URL".into()));
-    }
+    validate_https_repository(repository_url)?;
     fs::create_dir_all(cache_dir)?;
     let repository_dir = cache_dir.join("catalog.git");
     if !repository_dir.exists() {
@@ -478,6 +559,35 @@ mod tests {
             normalize_repository("git@github.com:Example/Widget.git"),
             "github.com/example/widget"
         );
+    }
+
+    #[test]
+    fn parses_only_an_exact_remote_head_commit_mapping() {
+        let commit = "ABCDEF0123456789ABCDEF0123456789ABCDEF01";
+        assert_eq!(
+            parse_remote_head(format!("ref: refs/heads/master HEAD\n{commit}\tHEAD\n").as_bytes(),)
+                .unwrap(),
+            commit.to_ascii_lowercase()
+        );
+        assert!(parse_remote_head(b"abc\tHEAD\n").is_err());
+        assert!(
+            parse_remote_head(format!("ref: refs/tags/v1 HEAD\n{commit}\tHEAD\n").as_bytes())
+                .is_err()
+        );
+        assert!(
+            parse_remote_head(
+                format!("ref: refs/heads/main HEAD\n{commit}\tHEAD\n{commit}\tHEAD\n").as_bytes(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn supplies_a_message_when_git_returns_no_stderr() {
+        assert!(matches!(
+            git_error(b"", "default branch lookup failed"),
+            Error::Git(message) if message == "default branch lookup failed"
+        ));
     }
 
     #[test]

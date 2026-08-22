@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use omasafe_core::{TOOL_VERSION, paths::XdgPaths};
 use omasafe_marketplace::{
     Correlation, OFFICIAL_REPOSITORY, correlate, fetch_pinned_catalog, load_cached_catalog,
-    load_catalog, valid_commit,
+    load_catalog, resolve_latest_commit, valid_commit,
 };
 use omasafe_plugin_trust::{
     DiffResult, SourceIdentity,
@@ -92,7 +92,7 @@ fn run(args: Vec<String>) -> Result<i32, Box<dyn std::error::Error>> {
         }
         _ => {
             eprintln!(
-                "usage: omasafe-cli plugins ... | scan [--format text|json] [--notify] [--only-new] | marketplace refresh --commit COMMIT | schedule install | paths | provenance [--format text|json]"
+                "usage: omasafe-cli plugins ... | scan [--format text|json] [--notify] [--only-new] | marketplace refresh [--commit COMMIT|--latest] | schedule install | paths | provenance [--format text|json]"
             );
             std::process::exit(2);
         }
@@ -1250,6 +1250,12 @@ fn inventory(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => return Err("catalog options must be supplied together".into()),
     };
+    let marketplace_snapshot_verified = snapshot.as_ref().map(|value| value.verified);
+    let marketplace_repository = snapshot.as_ref().map(|value| value.repository.clone());
+    let marketplace_repository_commit = snapshot
+        .as_ref()
+        .map(|value| value.repository_commit.clone());
+    let marketplace_file_digest = snapshot.as_ref().map(|value| value.file_digest.clone());
     let correlations = snapshot.as_ref().map(|snapshot| {
         result
             .plugins
@@ -1284,6 +1290,30 @@ fn inventory(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 value.as_object_mut().unwrap().insert(
                     "marketplace_source".into(),
                     serde_json::Value::String(source.into()),
+                );
+            }
+            if let Some(verified) = marketplace_snapshot_verified {
+                value.as_object_mut().unwrap().insert(
+                    "marketplace_snapshot_verified".into(),
+                    serde_json::Value::Bool(verified),
+                );
+            }
+            if let Some(repository) = marketplace_repository {
+                value.as_object_mut().unwrap().insert(
+                    "marketplace_repository".into(),
+                    serde_json::Value::String(repository),
+                );
+            }
+            if let Some(commit) = marketplace_repository_commit {
+                value.as_object_mut().unwrap().insert(
+                    "marketplace_repository_commit".into(),
+                    serde_json::Value::String(commit),
+                );
+            }
+            if let Some(digest) = marketplace_file_digest {
+                value.as_object_mut().unwrap().insert(
+                    "marketplace_file_digest".into(),
+                    serde_json::Value::String(digest),
                 );
             }
             if let Some(retrieved_at) = &marketplace_retrieved_at {
@@ -1330,6 +1360,15 @@ fn inventory(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(source) = marketplace_source {
             println!("Marketplace source: {source}");
         }
+        if let Some(verified) = marketplace_snapshot_verified {
+            println!(
+                "Marketplace snapshot integrity: {}",
+                if verified { "verified" } else { "unverified" }
+            );
+        }
+        if let Some(commit) = marketplace_repository_commit {
+            println!("Marketplace catalog commit: {}", safe_text(&commit));
+        }
         if let Some(retrieved_at) = marketplace_retrieved_at {
             println!("Marketplace retrieved at: {}", safe_text(&retrieved_at));
         }
@@ -1354,16 +1393,32 @@ fn inventory(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 fn marketplace_refresh(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut commit = None;
+    let mut latest = false;
     let mut index = 0;
     while index < args.len() {
-        if args[index] == "--commit" {
-            commit = Some(next_value(args, index, "marketplace commit")?.to_owned());
-            index += 2;
-        } else {
-            return Err(format!("unknown marketplace argument: {}", args[index]).into());
+        match args[index].as_str() {
+            "--commit" => {
+                commit = Some(next_value(args, index, "marketplace commit")?.to_owned());
+                index += 2;
+            }
+            "--latest" => {
+                latest = true;
+                index += 1;
+            }
+            value => return Err(format!("unknown marketplace argument: {value}").into()),
         }
     }
-    let commit = commit.ok_or("marketplace refresh requires --commit")?;
+    if latest && commit.is_some() {
+        return Err("marketplace refresh accepts either --commit or --latest, not both".into());
+    }
+    let commit = match (commit, latest) {
+        (Some(commit), false) => commit,
+        (None, true) => resolve_latest_commit(OFFICIAL_REPOSITORY)?,
+        (None, false) => {
+            return Err("marketplace refresh requires --commit COMMIT or --latest".into());
+        }
+        (Some(_), true) => unreachable!(),
+    };
     if !valid_commit(&commit) {
         return Err("marketplace commit must be 40 or 64 hexadecimal characters".into());
     }

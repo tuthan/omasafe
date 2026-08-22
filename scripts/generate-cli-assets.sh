@@ -80,7 +80,7 @@ Show the file-level differences from the trusted baseline.
 Acknowledge findings, change review decisions, rebaseline, restore, or untrust a
 plugin. Untrust revokes the active baseline while preserving its history.
 .TP
-.B marketplace refresh --commit COMMIT
+.B marketplace refresh (--commit COMMIT | --latest)
 Fetch and verify a pinned marketplace snapshot.
 .TP
 .B schedule install
@@ -121,7 +121,7 @@ _omasafe_cli() {
     fi
     case "\${COMP_WORDS[1]}" in
         scan|provenance|plugins|marketplace)
-            COMPREPLY=(\$(compgen -W "--format --notify --only-new --yes --expected-head --expected-tree --expected-digest --action --reason --commit" -- "\${cur}"))
+            COMPREPLY=(\$(compgen -W "--format --notify --only-new --yes --expected-head --expected-tree --expected-digest --action --reason --commit --latest" -- "\${cur}"))
             ;;
         paths|schedule)
             COMPREPLY=()
@@ -135,7 +135,7 @@ EOF
 write_asset docs/completions/_omasafe-cli "$(cat <<EOF
 #compdef omasafe-cli
 # zsh completion for omasafe-cli; generated from docs/cli-surface.txt
-_arguments '1:command:($top_level)' '*:option:(--format --notify --only-new --yes --expected-head --expected-tree --expected-digest --action --reason --commit)'
+_arguments '1:command:($top_level)' '*:option:(--format --notify --only-new --yes --expected-head --expected-tree --expected-digest --action --reason --commit --latest)'
 EOF
 )"
 

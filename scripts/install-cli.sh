@@ -54,7 +54,7 @@ done
 
 case "$(uname -s):$(uname -m)" in
   Linux:x86_64|Linux:amd64)
-    target='x86_64-unknown-linux-gnu'
+    platform='x86_64-linux'
     ;;
   *)
     printf 'unsupported host: %s %s (only x86_64 Linux is currently released)\n' \
@@ -93,7 +93,7 @@ fi
   exit 2
 }
 
-asset="omasafe-cli-${version}-${target}"
+asset="omasafe-cli-${version}-${platform}"
 base_url="https://github.com/$repo/releases/download/$version/$asset"
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT

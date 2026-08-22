@@ -18,8 +18,9 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        target:
-          - x86_64-unknown-linux-gnu
+        include:
+          - target: x86_64-unknown-linux-gnu
+            label: x86_64-linux
     steps:
       - uses: actions/checkout@v4
         with:
@@ -41,6 +42,7 @@ jobs:
       - name: Stage release asset
         env:
           TARGET: ${{ matrix.target }}
+          LABEL: ${{ matrix.label }}
           VERSION: ${{ github.ref_name }}
         run: ./scripts/stage-release-asset.sh
 

@@ -66,6 +66,9 @@ omasafe-cli plugins inventory --format json
 omasafe-cli marketplace refresh --commit CATALOG_COMMIT
 omasafe-cli plugins inventory --format json
 
+# Or manually resolve the official main branch to an exact commit and refresh
+omasafe-cli marketplace refresh --latest
+
 # Pin a trust baseline (interactive review, or unattended with --yes + exact identity)
 omasafe-cli plugins trust PLUGIN_ID \
   --yes --expected-head HEAD --expected-tree TREE --expected-digest SHA256
@@ -123,14 +126,14 @@ and removal lifecycles.
     https://raw.githubusercontent.com/tuthan/omasafe/d4fb76d/scripts/install-cli.sh \
     --output install-cli.sh
   less install-cli.sh
-  bash install-cli.sh --version v0.1.0
+  bash install-cli.sh --version v0.1.2
   ```
 
   The pinned commit contains the installer; reviewing it locally avoids piping
   a network response directly to the shell. `latest` selects the current signed
-  release, while `v0.1.0` selects an exact signed archive. From a repository
+  release, while `v0.1.2` selects an exact signed archive. From a repository
   checkout, run `./scripts/install-cli.sh --version latest` or
-  `./scripts/install-cli.sh --version v0.1.0`.
+  `./scripts/install-cli.sh --version v0.1.2`.
 
   Release signatures and detached verification instructions are in
   [`docs/release-signing.md`](docs/release-signing.md).

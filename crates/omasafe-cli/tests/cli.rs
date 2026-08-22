@@ -1,5 +1,6 @@
 use assert_cmd::Command;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
@@ -258,7 +259,7 @@ fn missing_plugin_alerts_are_deduplicated_across_trust_history() {
 }
 
 #[test]
-fn inventory_uses_verified_cached_marketplace_snapshot_by_default() {
+fn inventory_discloses_unverified_cached_marketplace_snapshot() {
     let fixture = Fixture::new();
     let cache = fixture.cache.path().join("omasafe");
     fs::create_dir_all(&cache).unwrap();
@@ -275,10 +276,100 @@ fn inventory_uses_verified_cached_marketplace_snapshot_by_default() {
     .unwrap();
     let report = fixture.inventory();
     assert_eq!(report["result"]["marketplace_source"], "unverified-cache");
+    assert_eq!(report["result"]["marketplace_snapshot_verified"], false);
+    assert_eq!(
+        report["result"]["marketplace_repository_commit"],
+        "0123456789abcdef0123456789abcdef01234567"
+    );
+    assert_eq!(
+        report["result"]["marketplace_repository"],
+        "https://github.com/HANCORE-linux/omarchy-plugin-marketplace"
+    );
+    assert_eq!(
+        report["result"]["marketplace_file_digest"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
     assert_eq!(
         report["result"]["marketplace_retrieved_at"],
         "2026-08-20T00:00:00Z"
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn inventory_discloses_verified_snapshot_without_a_matching_listing() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new();
+    let source = TempDir::new().unwrap();
+    let catalog = b"[]\n";
+    fs::create_dir_all(source.path().join("site")).unwrap();
+    fs::write(source.path().join("site/catalog.json"), catalog).unwrap();
+
+    for args in [
+        vec!["init"],
+        vec!["config", "user.name", "OmaSafe test"],
+        vec!["config", "user.email", "omasafe@example.invalid"],
+        vec!["add", "site/catalog.json"],
+        vec!["commit", "-m", "catalog fixture"],
+    ] {
+        let output = std::process::Command::new("/usr/bin/git")
+            .args(args)
+            .current_dir(source.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let revision = std::process::Command::new("/usr/bin/git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(source.path())
+        .output()
+        .unwrap();
+    assert!(revision.status.success());
+    let revision = String::from_utf8(revision.stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+
+    let cache = fixture.cache.path().join("omasafe");
+    fs::create_dir_all(&cache).unwrap();
+    let clone = std::process::Command::new("/usr/bin/git")
+        .args(["clone", "--bare"])
+        .arg(source.path())
+        .arg(cache.join("catalog.git"))
+        .output()
+        .unwrap();
+    assert!(
+        clone.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clone.stderr)
+    );
+    fs::write(cache.join("catalog.json"), catalog).unwrap();
+    fs::write(
+        cache.join("catalog.meta.json"),
+        serde_json::json!({
+            "repository_commit": revision,
+            "repository_url": "https://github.com/HANCORE-linux/omarchy-plugin-marketplace",
+            "retrieved_at": "2026-08-22T00:00:00Z",
+            "file_digest": format!("{:x}", Sha256::digest(catalog))
+        })
+        .to_string(),
+    )
+    .unwrap();
+    symlink("/usr/bin/git", fixture.bin.path().join("git")).unwrap();
+
+    let report = fixture.inventory();
+    assert_eq!(report["result"]["marketplace_source"], "pinned-fetch");
+    assert_eq!(report["result"]["marketplace_snapshot_verified"], true);
+    assert_eq!(report["result"]["marketplace_repository_commit"], revision);
+    assert_eq!(report["result"]["marketplace"][0]["status"], "unlisted");
 }
 
 #[test]

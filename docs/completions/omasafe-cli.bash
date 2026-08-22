@@ -11,7 +11,7 @@ _omasafe_cli() {
     fi
     case "${COMP_WORDS[1]}" in
         scan|provenance|plugins|marketplace)
-            COMPREPLY=($(compgen -W "--format --notify --only-new --yes --expected-head --expected-tree --expected-digest --action --reason --commit" -- "${cur}"))
+            COMPREPLY=($(compgen -W "--format --notify --only-new --yes --expected-head --expected-tree --expected-digest --action --reason --commit --latest" -- "${cur}"))
             ;;
         paths|schedule)
             COMPREPLY=()

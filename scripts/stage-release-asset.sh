@@ -4,8 +4,12 @@ set -euo pipefail
 root_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 : "${TARGET:?TARGET must be set to a Rust target triple}"
 : "${VERSION:?VERSION must be set to the release tag}"
+# LABEL is the human-facing platform name used in the published asset; it is
+# decoupled from TARGET (the cargo build triple) so the archive omits the
+# "unknown" vendor field. Defaults to TARGET for ad-hoc local runs.
+: "${LABEL:="$TARGET"}"
 
-asset="omasafe-cli-${VERSION}-${TARGET}"
+asset="omasafe-cli-${VERSION}-${LABEL}"
 mkdir -p "$root_dir/release/$asset"
 install -Dm755 "$root_dir/target/$TARGET/release/omasafe-cli" \
   "$root_dir/release/$asset/omasafe-cli"
