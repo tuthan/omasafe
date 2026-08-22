@@ -116,23 +116,25 @@ and removal lifecycles.
   ```sh
   # Download the pinned installer, review it, then run it locally
   curl --fail --proto '=https' --tlsv1.2 --location \
-    https://raw.githubusercontent.com/tuthan/omasafe/d4fb76d/scripts/install-cli.sh \
+    https://raw.githubusercontent.com/tuthan/omasafe/v0.1.2/scripts/install-cli.sh \
     --output install-cli.sh
   less install-cli.sh
   bash install-cli.sh --version latest
 
   # Or review and run it for an exact release
   curl --fail --proto '=https' --tlsv1.2 --location \
-    https://raw.githubusercontent.com/tuthan/omasafe/d4fb76d/scripts/install-cli.sh \
+    https://raw.githubusercontent.com/tuthan/omasafe/v0.1.2/scripts/install-cli.sh \
     --output install-cli.sh
   less install-cli.sh
   bash install-cli.sh --version v0.1.2
   ```
 
-  The pinned commit contains the installer; reviewing it locally avoids piping
-  a network response directly to the shell. `latest` selects the current signed
-  release, while `v0.1.2` selects an exact signed archive. From a repository
-  checkout, run `./scripts/install-cli.sh --version latest` or
+  The URL is pinned to the release tag, so the installer you review is the exact
+  one that produced that release's signed assets; reviewing it locally avoids
+  piping a network response directly to the shell. `latest` selects the current
+  signed release, while `v0.1.2` selects an exact signed archive. When installing
+  an exact release, pin the URL to the same tag you pass to `--version`. From a
+  repository checkout, run `./scripts/install-cli.sh --version latest` or
   `./scripts/install-cli.sh --version v0.1.2`.
 
   Release signatures and detached verification instructions are in
