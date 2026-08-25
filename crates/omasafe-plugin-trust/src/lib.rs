@@ -7,6 +7,13 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use omasafe_core::bounds::{
+    MAX_FILE_BYTES, MAX_FILES, MAX_METADATA_BYTES, MAX_TOTAL_BYTES, SAMPLE_BYTES,
+};
+
+/// Public re-export preserving the v0.1 API surface.
+pub use omasafe_core::bounds::MAX_DIFF_BYTES;
+
 pub mod baseline;
 
 #[derive(Debug, Default, Serialize)]
@@ -74,13 +81,6 @@ impl SourceIdentity {
         .expect("source identity serialization cannot fail")
     }
 }
-
-const MAX_FILES: usize = 10_000;
-const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
-pub const MAX_DIFF_BYTES: usize = 128 * 1024;
-const MAX_METADATA_BYTES: usize = 1024 * 1024;
-const SAMPLE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DiffResult {

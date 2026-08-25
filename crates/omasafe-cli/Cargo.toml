@@ -9,6 +9,7 @@ name = "omasafe-cli"
 path = "src/main.rs"
 
 [dependencies]
+omasafe-analyzer = { path = "../omasafe-analyzer" }
 omasafe-core = { path = "../omasafe-core" }
 omasafe-marketplace = { path = "../omasafe-marketplace" }
 omasafe-plugin-trust = { path = "../omasafe-plugin-trust" }

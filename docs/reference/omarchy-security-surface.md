@@ -1,6 +1,12 @@
 # Omarchy Plugin Security Surface
 
-Verified: 2026-08-20 · Omarchy 4.0.0-1 · Quickshell 0.3.0
+Verified: 2026-08-25 · Omarchy 4.0.0-1 · Quickshell 0.3.0 (quickshell-git 0.3.0.r20.g28771c7-2, rev 28771c7c74b42e20afca0b1b63980cb46515537c)
+
+Reverification 2026-08-25: versions unchanged since 2026-08-20; shell.qml/plugin registry
+anchors present; Process/execDetached/FileView/network/Polkit/PAM/WlSessionLock/Hyprland
+surfaces still reachable; plugin IPC (`rescanPlugins`, `setPluginEnabled`) unchanged;
+manifest validation remains path containment with no third-party import allowlist; no rule
+meaning changes.
 
 This is the versioned source-to-sink inventory for OmaSafe's plugin rules and threat model.
 Reverify it for every supported Omarchy/Quickshell release. A newer unverified runtime

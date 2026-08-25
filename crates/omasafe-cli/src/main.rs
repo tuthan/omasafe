@@ -90,9 +90,13 @@ fn run(args: Vec<String>) -> Result<i32, Box<dyn std::error::Error>> {
             marketplace_refresh(rest)?;
             0
         }
+        [command, subcommand, rest @ ..] if command == "rules" && subcommand == "list" => {
+            rules_list(rest)?;
+            0
+        }
         _ => {
             eprintln!(
-                "usage: omasafe-cli plugins ... | scan [--format text|json] [--notify] [--only-new] | marketplace refresh [--commit COMMIT|--latest] | schedule install | paths | provenance [--format text|json]"
+                "usage: omasafe-cli plugins ... | scan [--format text|json] [--notify] [--only-new] | marketplace refresh [--commit COMMIT|--latest] | rules list [--format text|json] | schedule install | paths | provenance [--format text|json]"
             );
             std::process::exit(2);
         }
@@ -1430,6 +1434,61 @@ fn marketplace_refresh(args: &[String]) -> Result<(), Box<dyn std::error::Error>
         snapshot.entries.len(),
         snapshot.repository_commit
     );
+    Ok(())
+}
+
+fn rules_list(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut format = "text";
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--format" => {
+                format = next_value(args, index, "rules format")?;
+                index += 2;
+            }
+            value => return Err(format!("unknown rules list argument: {value}").into()),
+        }
+    }
+    if !matches!(format, "text" | "json") {
+        return Err("rules format must be text or json".into());
+    }
+
+    let policy_identity = omasafe_analyzer::policy_identity();
+    let catalog = omasafe_analyzer::catalog();
+    if format == "json" {
+        let result = serde_json::json!({
+            "policy_identity": policy_identity,
+            "rule_catalog_version": omasafe_analyzer::RULE_CATALOG_VERSION,
+            "severity_table_version": omasafe_analyzer::SEVERITY_TABLE_VERSION,
+            "supported_surface_version": omasafe_analyzer::SUPPORTED_SURFACE_VERSION,
+            "equivalence_map_version": omasafe_analyzer::EQUIVALENCE_MAP_VERSION,
+            "rules": catalog,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&Report::new(TOOL_VERSION, now(), result))?
+        );
+    } else {
+        println!(
+            "OmaSafe rule catalog v{} (severity table v{}, surface {}, analyzer {})",
+            omasafe_analyzer::RULE_CATALOG_VERSION,
+            omasafe_analyzer::SEVERITY_TABLE_VERSION,
+            policy_identity.supported_surface_version,
+            policy_identity.analyzer_version
+        );
+        for definition in catalog {
+            println!(
+                "{}  [{}] {}  severity:{}  capability:{}",
+                definition.id,
+                definition.language,
+                definition.title,
+                definition.default_severity,
+                definition.capability
+            );
+            println!("    {}", definition.summary);
+            println!("    Guidance: {}", definition.review_guidance);
+        }
+    }
     Ok(())
 }
 

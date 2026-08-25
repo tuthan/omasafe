@@ -191,10 +191,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "omasafe-analyzer"
+version = "0.1.2"
+dependencies = [
+ "omasafe-core",
+ "omasafe-report",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "omasafe-cli"
 version = "0.1.2"
 dependencies = [
  "assert_cmd",
+ "omasafe-analyzer",
  "omasafe-core",
  "omasafe-marketplace",
  "omasafe-plugin-trust",
@@ -210,6 +222,7 @@ dependencies = [
 name = "omasafe-core"
 version = "0.1.2"
 dependencies = [
+ "libc",
  "thiserror",
 ]
 

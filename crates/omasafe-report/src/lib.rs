@@ -1,5 +1,7 @@
 use serde::Serialize;
 
+pub mod analysis;
+
 pub const SCHEMA_VERSION: &str = "omasafe.report.v1";
 
 #[derive(Debug, Serialize)]

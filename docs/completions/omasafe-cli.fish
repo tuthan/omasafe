@@ -1,5 +1,5 @@
 # fish completion for omasafe-cli; generated from docs/cli-surface.txt
-complete -c omasafe-cli -f -n "__fish_use_subcommand" -a "marketplace paths plugins provenance scan schedule"
+complete -c omasafe-cli -f -n "__fish_use_subcommand" -a "marketplace paths plugins provenance rules scan schedule"
 complete -c omasafe-cli -l format -r -a "text json"
 complete -c omasafe-cli -l notify
 complete -c omasafe-cli -l only-new

@@ -80,6 +80,11 @@ Show the file-level differences from the trusted baseline.
 Acknowledge findings, change review decisions, rebaseline, restore, or untrust a
 plugin. Untrust revokes the active baseline while preserving its history.
 .TP
+.B rules list [--format text|json]
+Print the OmaSafe-owned capability rule catalog with severities, capabilities,
+and review guidance. The catalog is static and versioned through the analyzer
+policy identity.
+.TP
 .B marketplace refresh (--commit COMMIT | --latest)
 Fetch and verify a pinned marketplace snapshot.
 .TP
@@ -120,7 +125,7 @@ _omasafe_cli() {
         return
     fi
     case "\${COMP_WORDS[1]}" in
-        scan|provenance|plugins|marketplace)
+        scan|provenance|plugins|marketplace|rules)
             COMPREPLY=(\$(compgen -W "--format --notify --only-new --yes --expected-head --expected-tree --expected-digest --action --reason --commit --latest" -- "\${cur}"))
             ;;
         paths|schedule)

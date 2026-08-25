@@ -278,3 +278,69 @@ identity, locking, and diff regressions. v0.1 (M0–M7) is feature-complete,
 packaged, and signed. Automated verification covers format, clippy, workspace
 tests, and hermetic CLI integration tests on the pinned stable toolchain; the
 per-release clean-VM lifecycle gates are tracked in the M7 checklist.
+
+## v0.2 planning
+
+Status: **complete**
+
+- [`plans/v0.2-implementation.md`](plans/v0.2-implementation.md) decomposes the
+  v0.2 release into vertical slices S0–S8 with milestone traceability, strategy
+  decisions (tree-sitter-qmljs primary parser subject to the M3 kill criterion;
+  additive `omasafe.report.v1` analysis fields; one new `omasafe-analyzer`
+  crate), risks, and per-slice exits.
+- Codex plan review applied: pinned entry-point subset moved into S2,
+  `--fail-on` ownership assigned, suppression CLI actions specified,
+  cancellation owned by S8, traceability table corrected.
+
+## v0.2 S0 — Analysis Foundations and Security-Surface Reverify
+
+Status: **complete**
+
+Implemented:
+
+- Security-surface reverification against installed Omarchy 4.0.0-1 /
+  Quickshell 0.3.0 (quickshell-git r20): anchors present, sinks unchanged, no
+  import allowlist, manifest checks still path containment only; stamp
+  refreshed in [`reference/omarchy-security-surface.md`](reference/omarchy-security-surface.md)
+  with no rule-meaning changes.
+- Shared bounded-ingest primitives extracted to `omasafe-core::bounds`: file/
+  byte/metadata/diff limits shared with plugin-trust plus new tree-depth,
+  time-budget, Git child-process budget, cache quota, and evidence-cap
+  constants; `TimeBudget` and argv-only `run_bounded()` child execution using
+  `waitid(WNOWAIT)` non-reaping exit observation, poll(2)-bounded output
+  drains with per-stream caps, truncation disclosure, and process-group kill
+  covering descendants on timeout or held pipes.
+- New `omasafe-analyzer` crate: OmaSafe-owned rule catalog v1 seeded from the
+  verified sink table (12 rules incl. high-priority polkit/session-lock/PAM),
+  severity table v1, capability/language taxonomies, policy identity with
+  limits and rule-catalog content fingerprints, and analysis fingerprint
+  canonicalization over sorted normalized results (fallible path
+  normalization; confidence participates).
+- `omasafe-report` gained the documented additive `analysis` module
+  (`omasafe.analysis.v1`) with the optional analysis section and policy
+  identity schema; inventory/trust outputs remain byte-compatible.
+- `rules list [--format text|json]` CLI command rendering the catalog and
+  policy identity; usage string, CLI surface, man page, and completions
+  regenerated.
+- Codex pre-commit review iterated to COMMIT-READY: fixed descendant cleanup,
+  unbounded buffering, bypassable/lossy fingerprint normalization, panics on
+  traversal, presentation-limit leakage into policy identity, and a dropped
+  public API re-export.
+
+Verification:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace          # 16 analyzer unit tests + CLI integration
+./scripts/generate-cli-assets.sh --check
+cargo run -p omasafe-cli -- rules list --format json
+```
+
+Known limitations: detectors do not exist yet (catalog publication precedes
+detector availability so IDs are stable); the QML parser slot in the policy
+identity records `lexical-fallback-unassigned` until the S2 decision;
+plugin-trust still uses its own walker without depth/time enforcement until
+the S1 ingestion frontend adopts the shared budgets.
+
+Next: **v0.2 S1 — Payload inventory end-to-end**.

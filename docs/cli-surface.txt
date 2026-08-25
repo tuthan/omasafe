@@ -8,5 +8,6 @@ plugins trust PLUGIN_ID	[--yes] [--expected-head VALUE] [--expected-tree VALUE] 
 plugins status PLUGIN_ID	[--format text|json]
 plugins diff PLUGIN_ID	[--format text|json]
 plugins review PLUGIN_ID	--action acknowledge|exclude|rebaseline|restore|untrust|revoke [--reason TEXT] [--yes]
+rules list	[--format text|json]
 marketplace refresh	(--commit COMMIT | --latest)
 schedule install

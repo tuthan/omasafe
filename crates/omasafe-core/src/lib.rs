@@ -1,3 +1,4 @@
+pub mod bounds;
 pub mod error;
 pub mod git;
 pub mod paths;

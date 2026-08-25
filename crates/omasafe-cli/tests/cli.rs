@@ -594,3 +594,85 @@ fn cli_surface_matches_usage_commands() {
 
     assert_eq!(usage_commands, surface_commands);
 }
+
+#[test]
+fn rules_list_reports_catalog_and_policy_identity() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .command()
+        .args(["rules", "list", "--format", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(report["schema"], "omasafe.report.v1");
+    assert_eq!(
+        report["result"]["policy_identity"]["supported_surface_version"],
+        "omarchy-security-surface.v1"
+    );
+    assert_eq!(
+        report["result"]["policy_identity"]["parser_versions"]["qml"],
+        "lexical-fallback-unassigned"
+    );
+    assert!(report["result"]["equivalence_map_version"].is_null());
+    let rules = report["result"]["rules"].as_array().unwrap();
+    assert!(!rules.is_empty());
+    let ids: BTreeSet<_> = rules
+        .iter()
+        .map(|rule| rule["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(ids.len(), rules.len());
+    for required in [
+        "oma.qml.process-execution",
+        "oma.qml.polkit-agent-ui",
+        "oma.qml.session-lock",
+        "oma.qml.pam-authentication",
+        "oma.context.replaces-bar",
+    ] {
+        assert!(ids.contains(required), "missing {required}");
+    }
+}
+
+#[test]
+fn rules_list_text_is_deterministic() {
+    let fixture = Fixture::new();
+    let first = fixture
+        .command()
+        .args(["rules", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let second = fixture
+        .command()
+        .args(["rules", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(first, second);
+    let rendered = String::from_utf8(first).unwrap();
+    assert!(rendered.contains("rule catalog v1"));
+    assert!(rendered.contains("oma.qml.session-lock"));
+}
+
+#[test]
+fn rules_list_rejects_unknown_arguments_and_formats() {
+    let fixture = Fixture::new();
+    fixture
+        .command()
+        .args(["rules", "list", "--bogus"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("unknown rules list argument"));
+    fixture
+        .command()
+        .args(["rules", "list", "--format", "yaml"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("text or json"));
+}
