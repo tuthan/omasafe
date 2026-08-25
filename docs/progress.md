@@ -344,3 +344,63 @@ plugin-trust still uses its own walker without depth/time enforcement until
 the S1 ingestion frontend adopts the shared budgets.
 
 Next: **v0.2 S1 — Payload inventory end-to-end**.
+
+## v0.2 S1 — Payload Inventory End-to-End
+
+Status: **complete**
+
+Implemented:
+
+- `omasafe-analyzer::payload`: deterministic file classification (QML,
+  JavaScript, shell, Python, extensionless executables, ELF/Mach-O/PE native
+  magics, data binaries via NUL sniffing) with precedence native-magic >
+  extension > shebang (exact interpreter basenames; `MZ` requires the PE
+  signature at `e_lfanew`), and coverage states
+  `analyzed|partial|skipped|truncated|unsupported|unreferenced` — pre-S2 all
+  fully read files report `unsupported`, never clean.
+- `omasafe-analyzer::ingest`: one bounded walker feeding three frontends —
+  installed plugin trees, local directories (`scan-plugin --path`), and
+  immutable Git revisions (`scan-plugin --git URL --revision`) read as raw
+  objects via `ls-tree -l -z` + per-object `cat-file` (no checkout, filters,
+  hooks, submodules, or LFS). Enforced limits: file count, aggregate bytes
+  (precise, probe-based), tree depth, elapsed time; oversize/budget-exhausted
+  entries become sampled-digest `Skipped` records; symlinks stay metadata and
+  are never followed; entry-bomb directories skip whole with disclosure;
+  non-UTF-8 Git paths degrade lossily instead of aborting.
+- Pinned-revision fetch: HTTPS-only URLs (credential-bearing authorities
+  rejected before any Git call), revision-length-aware object format init,
+  argv-only children under remaining-budget caps with truncation-tolerant
+  reads, whole-cache flock serialization, and cache quota enforced both pre-
+  and post-fetch (offending repository removed on violation).
+- CLI: `plugins analyze PLUGIN_ID` and `scan-plugin (--path|--git+--revision)`
+  emit inventory reports through the additive `omasafe.analysis.v1` section
+  with policy identity, empty-set fingerprint, coverage-state counts, and full
+  entry list; text views are capped at 200 rows; `--fail-on` accepted and
+  validated as a documented no-op until detectors land.
+- Surface/man/completions regenerated; integration tests cover bundled
+  executable payloads, binary blobs, symlinks, determinism, argument strictness,
+  credentialed-URL rejection, quota symlink safety, and oversized-repo-blob
+  degradation to Skipped.
+- Codex pre-commit review iterated to COMMIT-READY: fixed unenforced output
+  caps, missing git-side aggregate/time accounting, cache-quota races,
+  filesystem softness, credential leakage paths, classification precedence,
+  and CLI failure semantics.
+
+Verification:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace          # 93 tests across 12 suites
+./scripts/generate-cli-assets.sh --check
+cargo run -p omasafe-cli -- plugins analyze io.example.cli --format json
+```
+
+Known limitations: no language analyzers exist yet, so every fully ingested
+file is explicitly `unsupported`; Git blob sampling is head-only (no seekable
+tail in object storage); a setsid-descendant escaping its process group can
+still hold pipes past the budget (disclosed as truncation); `--fail-on`
+remains a validated no-op until S3; per-repository submodule entries are
+recorded but not traversed by design.
+
+Next: **v0.2 S2 — Parser spike, measurement, and ADR**.

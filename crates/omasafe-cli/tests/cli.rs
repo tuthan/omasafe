@@ -676,3 +676,187 @@ fn rules_list_rejects_unknown_arguments_and_formats() {
         .failure()
         .stderr(predicates::str::contains("text or json"));
 }
+
+/// Enriches the default single-plugin fixture with a full shipped-payload
+/// surface: QML entry, JS resource, shell/python executables, an ELF payload,
+/// a data binary, and a symlink.
+fn enrich_plugin(plugin: &Path) {
+    fs::create_dir_all(plugin.join("lib")).unwrap();
+    fs::write(plugin.join("Main.qml"), "import QtQuick\nItem {}\n").unwrap();
+    fs::write(plugin.join("lib/helper.js"), "function f(){return 1}\n").unwrap();
+    fs::write(plugin.join("install.sh"), "#!/bin/sh\necho hi\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(plugin.join("install.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let elf = {
+        let mut bytes = vec![b'A'; 32];
+        bytes[0..4].copy_from_slice(b"\x7fELF");
+        bytes
+    };
+    fs::write(plugin.join("payload"), elf).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("manifest.json", plugin.join("link.json")).unwrap();
+}
+
+#[test]
+fn analyze_reports_full_payload_inventory_end_to_end() {
+    let mut fixture = Fixture::new();
+    enrich_plugin(&fixture.plugin);
+    // Rebuild Fixture with the enriched tree: Fixture::new already created it,
+    // so mutate through its stored path via a second instance is wrong; use
+    // the existing one directly by re-deriving command envs below.
+    let _ = &mut fixture;
+    let output = fixture
+        .command()
+        .args(["plugins", "analyze", "io.example.cli", "--format", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(report["schema"], "omasafe.report.v1");
+    assert_eq!(report["result"]["target"]["source"], "installed-plugin");
+    let analysis = &report["result"]["analysis"];
+    assert_eq!(analysis["schema"], "omasafe.analysis.v1");
+    assert_eq!(analysis["policy_identity"]["rule_catalog_version"], 1);
+    let inventory = &report["result"]["payload_inventory"];
+    let states = &inventory["coverage_states"];
+    let unsupported = states["unsupported"].as_u64().unwrap();
+    assert!(unsupported >= 5, "states: {states}");
+    let entries = inventory["entries"].as_array().unwrap();
+    let kinds: Vec<&str> = entries
+        .iter()
+        .map(|entry| entry["kind"].as_str().unwrap())
+        .collect();
+    assert!(kinds.contains(&"qml"), "{kinds:?}");
+    assert!(kinds.contains(&"javascript"));
+    let payload_entry = entries
+        .iter()
+        .find(|entry| entry["relative_path"] == "payload")
+        .expect("ELF payload inventoried");
+    assert_eq!(payload_entry["coverage_state"], "unsupported");
+    assert!(
+        !kinds.contains(&"analyzed"),
+        "S1 never claims analyzed coverage"
+    );
+}
+
+#[test]
+fn analyze_is_deterministic_for_unchanged_input() {
+    let fixture = Fixture::new();
+    enrich_plugin(&fixture.plugin);
+    let first = fixture
+        .command()
+        .args(["plugins", "analyze", "io.example.cli", "--format", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let second = fixture
+        .command()
+        .args(["plugins", "analyze", "io.example.cli", "--format", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let first: Value = serde_json::from_slice(&first).unwrap();
+    let second: Value = serde_json::from_slice(&second).unwrap();
+    assert_eq!(first["result"], second["result"]);
+}
+
+#[test]
+fn analyze_rejects_unknown_plugins_and_arguments() {
+    let fixture = Fixture::new();
+    fixture
+        .command()
+        .args(["plugins", "analyze", "io.missing.plugin"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("plugin not found"));
+    fixture
+        .command()
+        .args([
+            "plugins",
+            "analyze",
+            "io.example.cli",
+            "--fail-on",
+            "catastrophic",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "--fail-on must be one of info|low|medium|high|critical",
+        ));
+}
+
+#[test]
+fn scan_plugin_analyzes_local_directories() {
+    let temp = tempfile::TempDir::new().unwrap();
+    fs::write(temp.path().join("panel.qml"), "Item {}\n").unwrap();
+    fs::write(temp.path().join("tool.sh"), "#!/bin/sh\nx\n").unwrap();
+    let fixture = Fixture::new();
+    let output = fixture
+        .command()
+        .args([
+            "scan-plugin",
+            "--path",
+            temp.path().to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(report["result"]["target"]["source"], "local-directory");
+    let entries = report["result"]["payload_inventory"]["entries"]
+        .as_array()
+        .unwrap();
+    assert_eq!(entries.len(), 2);
+}
+
+#[test]
+fn scan_plugin_argument_shapes_are_strict() {
+    let fixture = Fixture::new();
+    fixture
+        .command()
+        .args(["scan-plugin"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "requires --path DIR or --git URL",
+        ));
+    fixture
+        .command()
+        .args(["scan-plugin", "--path", ".", "--revision", "a"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("not both"));
+    fixture
+        .command()
+        .args(["scan-plugin", "--git", "https://example.test/r.git"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--git requires --revision"));
+    fixture
+        .command()
+        .args([
+            "scan-plugin",
+            "--git",
+            "https://example.test/r.git",
+            "--revision",
+            "zz",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "--revision must be 40 or 64 hexadecimal",
+        ));
+}

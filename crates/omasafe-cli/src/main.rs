@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use omasafe_core::{TOOL_VERSION, paths::XdgPaths};
@@ -94,9 +94,17 @@ fn run(args: Vec<String>) -> Result<i32, Box<dyn std::error::Error>> {
             rules_list(rest)?;
             0
         }
+        [command, subcommand, id, rest @ ..] if command == "plugins" && subcommand == "analyze" => {
+            plugins_analyze(id, rest)?;
+            0
+        }
+        [command, rest @ ..] if command == "scan-plugin" => {
+            scan_plugin(rest)?;
+            0
+        }
         _ => {
             eprintln!(
-                "usage: omasafe-cli plugins ... | scan [--format text|json] [--notify] [--only-new] | marketplace refresh [--commit COMMIT|--latest] | rules list [--format text|json] | schedule install | paths | provenance [--format text|json]"
+                "usage: omasafe-cli plugins ... | scan [--format text|json] [--notify] [--only-new] | marketplace refresh [--commit COMMIT|--latest] | rules list [--format text|json] | plugins analyze PLUGIN_ID [--format text|json] [--fail-on SEVERITY] | scan-plugin (--path DIR|--git URL --revision COMMIT) [--format text|json] | schedule install | paths | provenance [--format text|json]"
             );
             std::process::exit(2);
         }
@@ -1487,6 +1495,249 @@ fn rules_list(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             );
             println!("    {}", definition.summary);
             println!("    Guidance: {}", definition.review_guidance);
+        }
+    }
+    Ok(())
+}
+
+fn plugins_analyze(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut format = "text";
+    let mut fail_on = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--format" => {
+                format = next_value(args, index, "analyze format")?;
+                index += 2;
+            }
+            "--fail-on" => {
+                let value = next_value(args, index, "--fail-on severity")?;
+                validate_fail_on(value)?;
+                fail_on = Some(value);
+                index += 2;
+            }
+            value => return Err(format!("unknown analyze argument: {value}").into()),
+        }
+    }
+    if !matches!(format, "text" | "json") {
+        return Err("analyze format must be text or json".into());
+    }
+    // Reserved for S3 when capability results exist; accepted and validated
+    // here so scripts can already pass it. With no findings emitted, it is a
+    // documented no-op.
+    let _ = fail_on;
+
+    let plugin_root = plugin_root()?;
+    let (shell_json, _shell_error) = query_shell();
+    let inventory = collect_one(&plugin_root, id, shell_json.as_deref());
+    let record = inventory
+        .plugins
+        .iter()
+        .find(|plugin| plugin.id == id)
+        .ok_or_else(|| format!("plugin not found: {id}"))?;
+
+    let target = serde_json::json!({
+        "source": "installed-plugin",
+        "id": id,
+        "path": record.path,
+        "classification": record.classification,
+    });
+    let ingest_result = omasafe_analyzer::ingest_filesystem(
+        Path::new(&record.path),
+        omasafe_analyzer::Limits::default(),
+        omasafe_core::bounds::TimeBudget::default(),
+    );
+    emit_analysis_report(target, ingest_result.map_err(Into::into), format)?;
+    Ok(())
+}
+
+fn scan_plugin(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut format = "text";
+    let mut fail_on = None;
+    let mut path_target = None;
+    let mut git_url = None;
+    let mut revision = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--format" => {
+                format = next_value(args, index, "scan-plugin format")?;
+                index += 2;
+            }
+            "--fail-on" => {
+                let value = next_value(args, index, "--fail-on severity")?;
+                validate_fail_on(value)?;
+                fail_on = Some(value);
+                index += 2;
+            }
+            "--path" => {
+                path_target = Some(next_value(args, index, "--path")?.to_owned());
+                index += 2;
+            }
+            "--git" => {
+                git_url = Some(next_value(args, index, "--git")?.to_owned());
+                index += 2;
+            }
+            "--revision" => {
+                revision = Some(next_value(args, index, "--revision")?.to_owned());
+                index += 2;
+            }
+            value => return Err(format!("unknown scan-plugin argument: {value}").into()),
+        }
+    }
+    if !matches!(format, "text" | "json") {
+        return Err("scan-plugin format must be text or json".into());
+    }
+    let _ = fail_on;
+
+    match (path_target, git_url, revision) {
+        (Some(path), None, None) => {
+            let target = serde_json::json!({ "source": "local-directory", "path": path });
+            let result = omasafe_analyzer::ingest_filesystem(
+                Path::new(&path),
+                omasafe_analyzer::Limits::default(),
+                omasafe_core::bounds::TimeBudget::default(),
+            );
+            match result {
+                Ok(inventory) => emit_analysis_report(target, Ok(inventory), format),
+                Err(omasafe_analyzer::IngestError::NotADirectory) => {
+                    Err("scan-plugin target is not a directory".into())
+                }
+                Err(error) => Err(Box::new(error)),
+            }
+        }
+        (None, Some(url), Some(revision)) => {
+            let paths = XdgPaths::discover()?;
+            paths.ensure()?;
+            let cache_root = paths.cache.join("analysis");
+            match omasafe_analyzer::ensure_pinned_repository(&cache_root, &url, &revision) {
+                Ok(repository_dir) => {
+                    let target = serde_json::json!({
+                        "source": "pinned-revision", "url": url, "revision": revision
+                    });
+                    let result = omasafe_analyzer::ingest_pinned_tree(
+                        &repository_dir,
+                        &revision,
+                        omasafe_analyzer::Limits::default(),
+                        omasafe_core::bounds::TimeBudget::default(),
+                    );
+                    emit_analysis_report(target, result.map_err(Into::into), format)
+                }
+                Err(omasafe_analyzer::IngestError::InvalidRevision) => {
+                    Err("scan-plugin --revision must be 40 or 64 hexadecimal characters".into())
+                }
+                Err(error) => Err(error.into()),
+            }
+        }
+        (None, Some(_), None) => Err("scan-plugin --git requires --revision".into()),
+        (None, None, Some(_)) => Err("scan-plugin --revision requires --git".into()),
+        (None, None, None) => {
+            Err("scan-plugin requires --path DIR or --git URL with --revision".into())
+        }
+        _ => Err(
+            "scan-plugin accepts either --path or the --git URL + --revision pair, not both".into(),
+        ),
+    }
+}
+
+fn validate_fail_on(value: &str) -> Result<(), String> {
+    if matches!(value, "info" | "low" | "medium" | "high" | "critical") {
+        Ok(())
+    } else {
+        Err("--fail-on must be one of info|low|medium|high|critical".to_owned())
+    }
+}
+
+fn emit_analysis_report(
+    target: serde_json::Value,
+    ingest_result: Result<omasafe_analyzer::PayloadInventory, Box<dyn std::error::Error>>,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Ingestion failures are command failures; only per-file degradation is
+    // reported inside a successful inventory.
+    let inventory = ingest_result?;
+
+    let policy_identity = omasafe_analyzer::policy_identity();
+    // S1 emits no capability results; the fingerprint over an empty normalized
+    // result set stays constant until detectors land in S2/S3.
+    let fingerprint = omasafe_analyzer::fingerprint_results(&[]);
+    let analysis = omasafe_report::analysis::AnalysisSection::new(
+        policy_identity.clone(),
+        fingerprint,
+        inventory.limitations.clone(),
+    );
+
+    let states = serde_json::json!({
+        "analyzed": inventory.state_count(omasafe_analyzer::CoverageState::Analyzed),
+        "partial": inventory.state_count(omasafe_analyzer::CoverageState::Partial),
+        "skipped": inventory.state_count(omasafe_analyzer::CoverageState::Skipped),
+        "truncated": inventory.state_count(omasafe_analyzer::CoverageState::Truncated),
+        "unsupported": inventory.state_count(omasafe_analyzer::CoverageState::Unsupported),
+        "unreferenced": inventory.state_count(omasafe_analyzer::CoverageState::Unreferenced),
+    });
+
+    if format == "json" {
+        let result = serde_json::json!({
+            "target": target,
+            "analysis": analysis,
+            "payload_inventory": {
+                "totals": {
+                    "files_seen": inventory.total_files_seen,
+                    "bytes_ingested": inventory.total_bytes_ingested,
+                    "entries": inventory.entries.len(),
+                },
+                "coverage_states": states,
+                "limitations": inventory.limitations,
+                "entries": inventory.entries,
+            },
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&Report::new(TOOL_VERSION, now(), result))?
+        );
+    } else {
+        println!(
+            "Analysis of {} ({})",
+            safe_text(
+                target["id"]
+                    .as_str()
+                    .or_else(|| target["path"].as_str())
+                    .unwrap_or("?")
+            ),
+            safe_text(target["source"].as_str().unwrap_or("?"))
+        );
+        println!(
+            "Files seen: {}  Bytes ingested: {}  Entries: {}",
+            inventory.total_files_seen,
+            inventory.total_bytes_ingested,
+            inventory.entries.len()
+        );
+        for (state, count) in states.as_object().unwrap() {
+            if count.as_u64().unwrap_or(0) > 0 {
+                println!("Coverage state {}: {}", state, count);
+            }
+        }
+        const TEXT_ENTRY_CAP: usize = 200;
+        let omitted = inventory.entries.len().saturating_sub(TEXT_ENTRY_CAP);
+        for entry in inventory.entries.iter().take(TEXT_ENTRY_CAP) {
+            println!(
+                "{}\t{}\t{}\t{:o}\t{}B{}",
+                safe_text(&entry.relative_path),
+                entry.kind.as_str(),
+                entry.coverage_state.as_str(),
+                entry.mode,
+                entry.size,
+                if entry.sampled_digest { " sampled" } else { "" }
+            );
+        }
+        if omitted > 0 {
+            println!(
+                "… {} more entries omitted from the text view; use --format json",
+                omitted
+            );
+        }
+        for limitation in &inventory.limitations {
+            println!("Coverage limitation: {}", safe_text(limitation));
         }
     }
     Ok(())

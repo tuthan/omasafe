@@ -121,16 +121,30 @@ fn fail_child_cleanup(child: &mut Child) {
     }
 }
 
-/// Runs an argv-only child command under a hard wall-clock budget.
-///
-/// Returns `Ok(None)` when the budget expired; the direct child is killed and
-/// reaped in that case. On Unix the child runs in its own process group so the
-/// timeout kill also reaches forked descendants, and output drains happen on
-/// worker threads so a chatty child can neither block the polling loop nor fill
-/// its pipe buffer and deadlock. Never spawns a shell.
+/// Runs an argv-only child command under a hard wall-clock budget and the
+/// default per-stream output cap.
 pub fn run_bounded(
     command: &mut Command,
     budget: Duration,
+) -> io::Result<Option<BoundedProcessOutput>> {
+    run_bounded_capped(command, budget, MAX_PROCESS_OUTPUT_BYTES_PER_STREAM)
+}
+
+/// Like [`run_bounded`] but with an explicit per-stream output cap. Workers
+/// stop reading at the cap and report `truncated`; the child may receive
+/// EPIPE/SIGPIPE when the readers close, which self-limits chatty writers.
+pub fn run_bounded_capped(
+    command: &mut Command,
+    budget: Duration,
+    max_output_bytes_per_stream: usize,
+) -> io::Result<Option<BoundedProcessOutput>> {
+    spawn_bounded(command, budget, max_output_bytes_per_stream)
+}
+
+fn spawn_bounded(
+    command: &mut Command,
+    budget: Duration,
+    output_cap: usize,
 ) -> io::Result<Option<BoundedProcessOutput>> {
     command
         .stdin(Stdio::null())
@@ -144,7 +158,11 @@ pub fn run_bounded(
     }
     let mut child = command.spawn()?;
     let deadline = Instant::now() + budget;
-    let stdout_drain = match child.stdout.take().map(|pipe| spawn_drain(pipe, deadline)) {
+    let stdout_drain = match child
+        .stdout
+        .take()
+        .map(|pipe| spawn_drain(pipe, deadline, output_cap))
+    {
         Some(result) => match result {
             Ok(handle) => Some(handle),
             Err(error) => {
@@ -154,7 +172,11 @@ pub fn run_bounded(
         },
         None => None,
     };
-    let stderr_drain = match child.stderr.take().map(|pipe| spawn_drain(pipe, deadline)) {
+    let stderr_drain = match child
+        .stderr
+        .take()
+        .map(|pipe| spawn_drain(pipe, deadline, output_cap))
+    {
         Some(result) => match result {
             Ok(handle) => Some(handle),
             Err(error) => {
@@ -331,7 +353,7 @@ fn non_unix_run_bounded(
     }
 }
 
-fn spawn_drain<R>(pipe: R, deadline: Instant) -> io::Result<DrainHandle>
+fn spawn_drain<R>(pipe: R, deadline: Instant, output_cap: usize) -> io::Result<DrainHandle>
 where
     R: io::Read + Send + AsRawFdMarker + 'static,
 {
@@ -339,7 +361,7 @@ where
     let worker = std::thread::Builder::new()
         .name("omasafe-drain".to_owned())
         .spawn(move || {
-            let outcome = drain_stream(pipe, deadline);
+            let outcome = drain_stream(pipe, deadline, output_cap);
             let _ = sender.send(outcome);
         })
         .map_err(|error| {
@@ -362,7 +384,11 @@ pub trait AsRawFdMarker {}
 #[cfg(not(unix))]
 impl<T> AsRawFdMarker for T {}
 
-fn drain_stream<S: io::Read + AsRawFdMarker>(mut stream: S, deadline: Instant) -> DrainOutcome {
+fn drain_stream<S: io::Read + AsRawFdMarker>(
+    mut stream: S,
+    deadline: Instant,
+    output_cap: usize,
+) -> DrainOutcome {
     let mut bytes = Vec::new();
     let mut truncated = false;
     let mut deadline_hit = false;
@@ -389,7 +415,7 @@ fn drain_stream<S: io::Read + AsRawFdMarker>(mut stream: S, deadline: Instant) -
         match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(read) => {
-                let budget = MAX_PROCESS_OUTPUT_BYTES_PER_STREAM.saturating_sub(bytes.len());
+                let budget = output_cap.saturating_sub(bytes.len());
                 if budget == 0 {
                     truncated = true;
                     break;

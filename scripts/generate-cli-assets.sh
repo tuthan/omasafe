@@ -85,6 +85,16 @@ Print the OmaSafe-owned capability rule catalog with severities, capabilities,
 and review guidance. The catalog is static and versioned through the analyzer
 policy identity.
 .TP
+.B plugins analyze PLUGIN_ID [--format text|json]
+Inventory every shipped payload file of an installed plugin with type, mode,
+size, digest, executable bit, and explicit analysis coverage state. Exit
+status is 0 even when findings exist; CI policy uses --fail-on.
+.TP
+.B scan-plugin (--path DIR | --git URL --revision COMMIT) [--format text|json]
+Run the same bounded payload inventory against a local directory or a pinned
+immutable Git revision read as raw objects (no checkout, filters, hooks, or
+submodules). URLs carrying credentials are rejected.
+.TP
 .B marketplace refresh (--commit COMMIT | --latest)
 Fetch and verify a pinned marketplace snapshot.
 .TP
@@ -103,7 +113,7 @@ The command completed successfully and no actionable scan findings remain.
 The command failed.
 .TP
 .B 2
-Usage or argument error.
+Usage error: unrecognized top-level command.
 .TP
 .B 3
 The scan completed and actionable findings remain.
@@ -125,8 +135,8 @@ _omasafe_cli() {
         return
     fi
     case "\${COMP_WORDS[1]}" in
-        scan|provenance|plugins|marketplace|rules)
-            COMPREPLY=(\$(compgen -W "--format --notify --only-new --yes --expected-head --expected-tree --expected-digest --action --reason --commit --latest" -- "\${cur}"))
+        scan|provenance|plugins|marketplace|rules|scan-plugin)
+            COMPREPLY=(\$(compgen -W "--format --notify --only-new --yes --expected-head --expected-tree --expected-digest --action --reason --commit --latest --path --git --revision --fail-on" -- "\${cur}"))
             ;;
         paths|schedule)
             COMPREPLY=()
@@ -140,7 +150,7 @@ EOF
 write_asset docs/completions/_omasafe-cli "$(cat <<EOF
 #compdef omasafe-cli
 # zsh completion for omasafe-cli; generated from docs/cli-surface.txt
-_arguments '1:command:($top_level)' '*:option:(--format --notify --only-new --yes --expected-head --expected-tree --expected-digest --action --reason --commit --latest)'
+_arguments '1:command:($top_level)' '*:option:(--format --notify --only-new --yes --expected-head --expected-tree --expected-digest --action --reason --commit --latest --path --git --revision --fail-on)'
 EOF
 )"
 
@@ -157,6 +167,10 @@ complete -c omasafe-cli -l expected-digest -r
 complete -c omasafe-cli -l action -r -a "acknowledge exclude rebaseline restore untrust revoke"
 complete -c omasafe-cli -l reason -r
 complete -c omasafe-cli -l commit -r
+complete -c omasafe-cli -l path -r
+complete -c omasafe-cli -l git -r
+complete -c omasafe-cli -l revision -r
+complete -c omasafe-cli -l fail-on -r -a "info low medium high critical"
 EOF
 )"
 

@@ -50,9 +50,11 @@ impl std::fmt::Display for Severity {
 #[serde(rename_all = "kebab-case")]
 pub enum Language {
     Qml,
+    #[serde(rename = "javascript")]
     JavaScript,
     Shell,
     Python,
+    #[serde(rename = "payload-binary")]
     PayloadBinary,
     Context,
 }

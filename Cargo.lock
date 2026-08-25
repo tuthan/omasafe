@@ -194,11 +194,14 @@ dependencies = [
 name = "omasafe-analyzer"
 version = "0.1.2"
 dependencies = [
+ "libc",
  "omasafe-core",
  "omasafe-report",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

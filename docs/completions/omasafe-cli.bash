@@ -4,14 +4,14 @@ _omasafe_cli() {
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]:-}"
-    local commands="marketplace paths plugins provenance rules scan schedule"
+    local commands="marketplace paths plugins provenance rules scan scan-plugin schedule"
     if [[ "${COMP_CWORD}" -eq 1 ]]; then
         COMPREPLY=($(compgen -W "${commands}" -- "${cur}"))
         return
     fi
     case "${COMP_WORDS[1]}" in
-        scan|provenance|plugins|marketplace|rules)
-            COMPREPLY=($(compgen -W "--format --notify --only-new --yes --expected-head --expected-tree --expected-digest --action --reason --commit --latest" -- "${cur}"))
+        scan|provenance|plugins|marketplace|rules|scan-plugin)
+            COMPREPLY=($(compgen -W "--format --notify --only-new --yes --expected-head --expected-tree --expected-digest --action --reason --commit --latest --path --git --revision --fail-on" -- "${cur}"))
             ;;
         paths|schedule)
             COMPREPLY=()
