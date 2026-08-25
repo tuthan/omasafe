@@ -612,9 +612,11 @@ fn rules_list_reports_catalog_and_policy_identity() {
         report["result"]["policy_identity"]["supported_surface_version"],
         "omarchy-security-surface.v1"
     );
+    // The CLI build enables the qml-parser feature, so the policy identity
+    // must advertise the real parser (ADR 0001), not the lexical fallback.
     assert_eq!(
         report["result"]["policy_identity"]["parser_versions"]["qml"],
-        "lexical-fallback-unassigned"
+        "tree-sitter-qmljs/0.3.1"
     );
     assert!(report["result"]["equivalence_map_version"].is_null());
     let rules = report["result"]["rules"].as_array().unwrap();

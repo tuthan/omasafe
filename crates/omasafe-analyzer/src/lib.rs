@@ -13,6 +13,9 @@ pub mod payload;
 pub mod policy;
 pub mod rules;
 
+#[cfg(feature = "qml-parser")]
+pub mod qml;
+
 pub use fingerprint::{Confidence, NormalizedResult, fingerprint_results};
 pub use ingest::{
     IngestError, Limits, TargetSource, ensure_pinned_repository, ingest_filesystem,

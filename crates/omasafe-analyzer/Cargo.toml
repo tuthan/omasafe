@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# tree-sitter pulls a C compiler into the build; the feature keeps the crate
+# buildable in constrained environments, with lexical fallback semantics
+# documented in docs/adr/0001-qml-parser.md.
+qml-parser = ["dep:tree-sitter", "dep:tree-sitter-qmljs"]
+
 [dependencies]
 omasafe-core = { path = "../omasafe-core" }
 omasafe-report = { path = "../omasafe-report" }
@@ -12,6 +19,12 @@ serde_json.workspace = true
 sha2.workspace = true
 libc.workspace = true
 thiserror.workspace = true
+tree-sitter = { version = "=0.26.13", optional = true }
+tree-sitter-qmljs = { version = "=0.3.1", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+
+[[example]]
+name = "qml-coverage"
+required-features = ["qml-parser"]

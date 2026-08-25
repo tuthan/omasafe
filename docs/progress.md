@@ -404,3 +404,58 @@ remains a validated no-op until S3; per-repository submodule entries are
 recorded but not traversed by design.
 
 Next: **v0.2 S2 — Parser spike, measurement, and ADR**.
+
+## v0.2 S2 — Parser Spike, Measurement, and ADR
+
+Status: **complete**
+
+Decision (ADR 0001, accepted): **tree-sitter-qmljs 0.3.1 on tree-sitter
+0.26.13** behind the `qml-parser` crate feature (on by default for the CLI
+build); exact-pinned dependencies; grammar ABI 14 pinned by test.
+
+Implemented:
+
+- `corpus/entry-points.json`: deterministic stratified sample of 50 community
+  plugins from the frozen catalog snapshot (commit `964dc08d…`), each pinned
+  by `upstreamObservedCommit`; generator `scripts/generate-entry-point-corpus.py`
+  reproduces it exactly and records provenance + selection rule in the file.
+- `omasafe-analyzer::qml` (feature-gated): inert parse trees plus coverage
+  metrics — leaf-span byte union, non-whitespace gap materiality, ERROR/
+  missing-node counts, line metrics, explicit `parse_failed` state, and a
+  strict `parses_cleanly()` (no errors, no missing items, zero non-whitespace
+  gap bytes). Policy identity now reports `tree-sitter-qmljs/0.3.1` when the
+  feature is on and `lexical-fallback-unassigned` when off.
+- Measurement harness (`examples/qml-coverage.rs`): fetches every pinned
+  revision through production `ensure_pinned_repository` into disposable bare
+  cache (one retry on transient budget exhaustion), reads QML as raw objects,
+  discovers entry points from `manifest.json` blobs, emits versioned JSON.
+- Measured results (2026-08-25): 50/50 plugins ingested; **119/119 entry-point
+  files clean (100%)**; **594/594 QML files clean (100%)**; **0 non-whitespace
+  uncovered bytes across 5,828,386 bytes**. Kill criterion met decisively —
+  no lexical-fallback downgrade needed.
+- qmllint probe (Qt 6.11.2): output dominated by environment-dependent import
+  resolution; documented as optional human-advisory signal only, never the
+  capability engine; QQmlSA stays a future option.
+- ADR `docs/adr/0001-qml-parser.md`: decision, method, numbers, unsupported-
+  syntax behavior, lexical-fallback semantics via policy identity, report
+  metadata fields (`analysis.parser` wiring lands with S3 detectors).
+
+Verification:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace                      # 101 tests (feature off)
+cargo test --workspace --features omasafe-analyzer/qml-parser   # 101 (on)
+./scripts/generate-cli-assets.sh --check
+codex review iterated to COMMIT-READY (ABI truth, exact pins, parse_failed
+state, line-metric retention, segment-exact '..' rejection, test strength)
+```
+
+Known limitations: harness is dev tooling outside the shipped CLI surface;
+oversized-QML records carry zeros rather than metrics (disclosed per record);
+generator layout allocation is proportional to catalog composition (49 root-
+plugin / 1 suite), so suites are under-weighted relative to their QML mass;
+qmllint remains unexercised by CI.
+
+Next: **v0.2 S3 — Embedded-JS analysis, first capabilities, invocation edges**.

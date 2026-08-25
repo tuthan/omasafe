@@ -1,0 +1,362 @@
+{
+  "manifestVersion": 1,
+  "plugins": [
+    {
+      "id": "37signals.basecamp",
+      "kind": "Bar widget",
+      "repo": "https://github.com/basecamp/omarchy-basecamp-plugin",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "abc1ba72aaf47db530d2a0c6901d99f0f98e6aa7"
+    },
+    {
+      "id": "alvarosaavedra.agent-usage-zai-synthetic",
+      "kind": "Service",
+      "repo": "https://github.com/alvarosaavedra/omarchy-agent-usage-zai-synthetic",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "a0d7eab1e00806f7b71f93ed20f709d24224082b"
+    },
+    {
+      "id": "arh.workspaces",
+      "kind": "Bar widget",
+      "repo": "https://github.com/iamArham10/arh-workspaces",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "58163923d28a715ad114dcf00b2c1e14cd2a61f8"
+    },
+    {
+      "id": "b404dev.gitbar",
+      "kind": "Bar widget",
+      "repo": "https://github.com/b404dev/Gitbar-Omarchy",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "4adbe01523b42203be95bfea8e99bbf9bb21471e"
+    },
+    {
+      "id": "bpbagayas.renameable-workspaces",
+      "kind": "Bar widget",
+      "repo": "https://github.com/bagayasbryan-code/omarchy-renameable-workspaces",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "28d8c229faf1295e08aaefe518b5c545899e42d3"
+    },
+    {
+      "id": "chagel.alternative-clock",
+      "kind": "Bar widget",
+      "repo": "https://github.com/chagel/omarchy-alternative-clock",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "5d0011d3c3ce8b079c12dc2eeb614738eae6d557"
+    },
+    {
+      "id": "com.sighmon.spacex-tv",
+      "kind": "Bar widget",
+      "repo": "https://github.com/sighmon/omarchy-spacex-tv",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "6270485093db5e6c2e78d3850822cc98f6da8dc2"
+    },
+    {
+      "id": "danglenoir.duolingo",
+      "kind": "Bar widget",
+      "repo": "https://github.com/danglenoir/omarchy-duolingo",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "f36952416d1474c686e82951db28cfbb8d2f8219"
+    },
+    {
+      "id": "display.panel",
+      "kind": "Bar widget",
+      "repo": "https://github.com/Apagafuegos/omarchy-display-panel",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "e1eabff40a64c14101ef05ae7bc173e1fb92d43e"
+    },
+    {
+      "id": "eduard.power-timings",
+      "kind": "Bar widget",
+      "repo": "https://github.com/eddygarcas/omarchy-power-timings",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "1caded46f63907ee8640b703aea0df77374dc52d"
+    },
+    {
+      "id": "fr.ldng.caracteres-francais",
+      "kind": "Bar widget",
+      "repo": "https://github.com/SeanGSR/omarchy-french-characters",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "3501d70936a280673db3c7002f3ba79f4caac7ed"
+    },
+    {
+      "id": "gurvindersingh-web.system-stats",
+      "kind": "Bar widget",
+      "repo": "https://github.com/gurvindersingh-web/quickshellomarchy",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "eccdaf535c34cf36207c2226ddf150625758deb4"
+    },
+    {
+      "id": "hancore.shibumi",
+      "kind": "Suite",
+      "repo": "https://github.com/HANCORE-linux/Shibumi-Shell",
+      "repositoryLayout": "suite",
+      "upstreamObservedCommit": "e92d8ee1ce9821d0b203a9d4d5dd9932d2e460fb"
+    },
+    {
+      "id": "i3-workspaces",
+      "kind": "Bar widget",
+      "repo": "https://github.com/coquer/i3-workspaces",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "dd99cd47f4590ee2090184db2c759afb9964156a"
+    },
+    {
+      "id": "io.github.agata.omanano",
+      "kind": "Bar widget",
+      "repo": "https://github.com/agata/omanano",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "35bb24e78f18419558682594f0e92610a81de845"
+    },
+    {
+      "id": "io.github.babdbtc.routstr",
+      "kind": "Bar widget",
+      "repo": "https://github.com/babdbtc/omarchy-routstr",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "4e4664ddcf80c452f9c14de7e23295d659cbee11"
+    },
+    {
+      "id": "io.github.bwest8.open-apps",
+      "kind": "Bar widget",
+      "repo": "https://github.com/Bwest8/omarchy-open-apps",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "162a8d7626a68e9a590bf1608f17c4febbd180b8"
+    },
+    {
+      "id": "io.github.ctl0v0.kalm",
+      "kind": "Bar widget",
+      "repo": "https://github.com/ctl0v0/kalm-omarchy-plugin",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "c91a8e97021fa65696f62599d37c4d99592763ae"
+    },
+    {
+      "id": "io.github.dkgamer02ai.lock",
+      "kind": "Service",
+      "repo": "https://github.com/dkgamer02ai/nova-lock",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "40e67105d35a2a336597dfb4b2ef8c38bb104f3d"
+    },
+    {
+      "id": "io.github.ejuro.phosphor",
+      "kind": "Bar widget",
+      "repo": "https://github.com/ejuro/phosphor-crt-overlay",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "a42c03d4368f22171ffc0a1f7e647eb7c231afac"
+    },
+    {
+      "id": "io.github.gardnmi.boomux",
+      "kind": "Bar widget",
+      "repo": "https://github.com/gardnmi/omarchy-boomux",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "ec994afd62a8f84daf70e8d9e37818f15f1d747a"
+    },
+    {
+      "id": "io.github.ilyazar.keyboard-layout",
+      "kind": "Bar widget",
+      "repo": "https://github.com/ilyaZar/omarchy-keyboard-layout",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "f7c86bf3b52d0df32ccb0ec75651ec4e7d4b7541"
+    },
+    {
+      "id": "io.github.jonathanriche.verde",
+      "kind": "Bar widget",
+      "repo": "https://github.com/JonathanRiche/omarchy-verde",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "d8d6835706698638f2eff95e5ca6aa907ba2a672"
+    },
+    {
+      "id": "io.github.krishang-zinzuwadia.omarchy-clipboard",
+      "kind": "Overlay",
+      "repo": "https://github.com/Krishang-Zinzuwadia/omarchy-clipboard",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "7efa1b3ada68bcde437ba83a9cb01c73cbb056f1"
+    },
+    {
+      "id": "io.github.mich-nduka.pgmarchy",
+      "kind": "Bar widget",
+      "repo": "https://github.com/mich-nduka/pgmarchy",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "2b11e1335df541c965ad5189cbb305829929a5c2"
+    },
+    {
+      "id": "io.github.omadeezer",
+      "kind": "Bar widget",
+      "repo": "https://github.com/Deunnis/OmaDeezer",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "75840b3e046093f7cf00ca2106e5a8ef77019481"
+    },
+    {
+      "id": "io.github.rafaelvzago.rss",
+      "kind": "Bar widget",
+      "repo": "https://github.com/rafaelvzago/omarchy-rss-plugin",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "57295d660995b75ee3e3b5afc128e676a5cf4fe8"
+    },
+    {
+      "id": "io.github.rohan-patnaik.window-switcher",
+      "kind": "Overlay",
+      "repo": "https://github.com/rohan-patnaik/orbit",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "a8b45399fb890d0212aed4db09b55dea71166d02"
+    },
+    {
+      "id": "io.github.sasirulk.totp",
+      "kind": "Bar widget",
+      "repo": "https://github.com/sasiruLK/omarchy-totp",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "2098caabacbf90657615efebfdb7a49a9d095445"
+    },
+    {
+      "id": "io.github.sumdahl.livewallpaper",
+      "kind": "Bar widget",
+      "repo": "https://github.com/sumdahl/omarchy-plugin-livewallpaper",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "1a3795d139cf042e9fb1cc765296ffd845e05a8c"
+    },
+    {
+      "id": "io.github.treramey.raindrop-bookmarks",
+      "kind": "Overlay",
+      "repo": "https://github.com/treramey/omarchy-raindrop-bookmarks",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "86122615a67dcddf7b602ee6331fbac8aa4a6b51"
+    },
+    {
+      "id": "io.github.vyomjain6904.sony-headphones",
+      "kind": "Bar widget",
+      "repo": "https://github.com/VyomJain6904/sony-headphones-linux",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "f6144b3c27bc829842547b1b8f2ac2f7c3c141c4"
+    },
+    {
+      "id": "itdir.cava",
+      "kind": "Bar widget",
+      "repo": "https://github.com/ltehacker/omarchy-quattro-wave",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "f3fb80011bbe75abfc6fe15f2d0eeee689b96a59"
+    },
+    {
+      "id": "jonathan.gospel-of-the-day",
+      "kind": "Bar widget",
+      "repo": "https://github.com/tuxmontero/omarchy-gospel-of-the-day",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "d60ce8ac58fc800fb61a6d410703929b6f953758"
+    },
+    {
+      "id": "l3aro.sudoku",
+      "kind": "Bar widget",
+      "repo": "https://github.com/l3aro/omarchy-sudoku",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "b48c210afd79c9b0590624d1f2f9bf3ee8a3b769"
+    },
+    {
+      "id": "local.warp",
+      "kind": "Bar widget",
+      "repo": "https://github.com/tobi/omarchy-warp",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "1b2d23faa730f3c8ac3b27e7f2568c068d8c0c24"
+    },
+    {
+      "id": "markbusai.opencode-usage",
+      "kind": "Bar widget",
+      "repo": "https://github.com/markbus-ai/omarchy-opencode-usage",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "b2cf4c812c5df27db231b2b71f543323bc6df8d7"
+    },
+    {
+      "id": "mirador",
+      "kind": "Overlay",
+      "repo": "https://github.com/sanjyay/Mirador",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "88fa54be938cb8bf833f33fdaf8fe7b6d92ae72c"
+    },
+    {
+      "id": "ncc.yet-another-active-window",
+      "kind": "Bar widget",
+      "repo": "https://github.com/ncc001/yet-another-active-window",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "2524a03369a51e53c7a702abf7d35f45757e2840"
+    },
+    {
+      "id": "nosignal.quattroids",
+      "kind": "Bar widget",
+      "repo": "https://github.com/28allday/Quattroids",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "162b2e71236d1206a1b2641bee407c9232579d5c"
+    },
+    {
+      "id": "omaramp",
+      "kind": "Bar widget",
+      "repo": "https://github.com/JoeJoeflyn/omaramp",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "2509b764b4a85a2c84f8c768da3b90044acafb81"
+    },
+    {
+      "id": "parm.clock",
+      "kind": "Bar widget",
+      "repo": "https://github.com/iamparmjeet/omarchy-google-calendar-clock",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "f2eb86223fa0afa1920715c4f4b42ec6fea1cb01"
+    },
+    {
+      "id": "ragnacron.workspaces-per-monitor",
+      "kind": "Bar widget",
+      "repo": "https://github.com/ragnacron/omarchy-workspaces-per-monitor",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "b0de0f78296c53816ee085e4b34af12fe03961e9"
+    },
+    {
+      "id": "ryanyogan.omatop",
+      "kind": "Bar widget",
+      "repo": "https://github.com/ryanyogan/omarchy-omatop",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "aba9f67839d431625cc2aa0a7bc8e62da05c9e19"
+    },
+    {
+      "id": "shafayet.finder",
+      "kind": "Overlay",
+      "repo": "https://github.com/shafayetejaman/shafayet.finder",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "b30b0af2b038198e261347f683bd14edef2a581c"
+    },
+    {
+      "id": "soup.airpods",
+      "kind": "Bar widget",
+      "repo": "https://github.com/s0up4200/omarchy-airpods",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "5d3d251c1e2bdb0d286afe7d79ff77ad2386c25b"
+    },
+    {
+      "id": "svighnesh.pacman-sentry",
+      "kind": "Bar widget",
+      "repo": "https://github.com/SVIGHNESH/pacman-sentry",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "90cdd91f6a11f22d7b22705d1430cc8fc8364a1b"
+    },
+    {
+      "id": "tmn73.jira",
+      "kind": "Bar widget",
+      "repo": "https://github.com/tmn73/omarchy-jira",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "8b2fa7a9b263993f8a77ce8c0b0ebe095e0d9e51"
+    },
+    {
+      "id": "user.omastream",
+      "kind": "Bar widget",
+      "repo": "https://github.com/yaredow/omastream",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "bdf13a2a2ba72db7b8b1f402037e8aafeb9d6cf2"
+    },
+    {
+      "id": "white.nights",
+      "kind": "Bar widget",
+      "repo": "https://github.com/nightdevil00/white.nights",
+      "repositoryLayout": "root-plugin",
+      "upstreamObservedCommit": "dd0a09f55ce5a7ac1a68865d870da091bf8198ac"
+    }
+  ],
+  "selectionRule": "candidates = entries with https repo and valid upstreamObservedCommit; grouped by repositoryLayout; proportional allocation across layout buckets; evenly spaced sample of 50 from 1281; result sorted by id",
+  "source": {
+    "catalogCommit": "964dc08df2a3450578727b665908272cd3a277e5",
+    "catalogFileDigest": "ddb3809c3edc112fef39f04aede38fbebd1b17857bcbecca007350db3cc795a6",
+    "catalogRepository": "https://github.com/HANCORE-linux/omarchy-plugin-marketplace",
+    "retrievedAt": "2026-08-25T03:27:21Z"
+  }
+}

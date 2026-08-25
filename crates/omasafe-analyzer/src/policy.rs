@@ -77,11 +77,20 @@ pub fn rule_catalog_fingerprint() -> String {
         .clone()
 }
 
+/// The QML parsing strategy this build was compiled with. Builds with the
+/// `qml-parser` feature parse real syntax; builds without it fall back to
+/// lexical detection and say so, so report consumers can tell the difference
+/// from the policy identity alone (ADR 0001).
+#[cfg(feature = "qml-parser")]
+pub const QML_PARSER_IDENTITY: &str = "tree-sitter-qmljs/0.3.1";
+#[cfg(not(feature = "qml-parser"))]
+pub const QML_PARSER_IDENTITY: &str = "lexical-fallback-unassigned";
+
 /// Builds the current policy identity. No timestamp or environment value
 /// participates; two calls in one build always agree.
 pub fn policy_identity() -> PolicyIdentity {
     let mut parser_versions = BTreeMap::new();
-    parser_versions.insert("qml".to_owned(), "lexical-fallback-unassigned".to_owned());
+    parser_versions.insert("qml".to_owned(), QML_PARSER_IDENTITY.to_owned());
     PolicyIdentity {
         analyzer_version: env!("CARGO_PKG_VERSION").to_owned(),
         rule_catalog_version: RULE_CATALOG_VERSION,
@@ -146,11 +155,15 @@ mod tests {
     }
 
     #[test]
-    fn qml_parser_state_is_explicit_until_s2_lands() {
+    fn qml_parser_state_is_explicit_and_feature_consistent() {
         let identity = policy_identity();
-        assert_eq!(
-            identity.parser_versions.get("qml").map(String::as_str),
-            Some("lexical-fallback-unassigned")
-        );
+        let reported = identity.parser_versions.get("qml").map(String::as_str);
+        #[cfg(feature = "qml-parser")]
+        {
+            assert_eq!(reported, Some(crate::qml::QML_PARSER_REPORT_VALUE));
+            assert!(reported.unwrap().starts_with("tree-sitter-qmljs/"));
+        }
+        #[cfg(not(feature = "qml-parser"))]
+        assert_eq!(reported, Some("lexical-fallback-unassigned"));
     }
 }
