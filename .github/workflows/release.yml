@@ -52,9 +52,60 @@ jobs:
           path: release/*
           if-no-files-found: error
 
+  # Evidence published with the release: OmaSafe's own source scan, the
+  # pinned-corpus sample report, and the native-validator parity report.
+  # Sample-based and informational — the full corpus run lives in the
+  # scheduled nightly workflow; the release gate consumes these artifacts
+  # per the README checklist before a tag is cut locally.
+  reports:
+    name: Self-scan, corpus, and parity reports
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Build CLI
+        run: cargo build --locked --release -p omasafe-cli
+
+      - name: Generate self-scan report
+        run: |
+          ./target/release/omasafe-cli scan-plugin --path . --format json \
+            > release-reports/self-scan.json
+
+      - name: Generate corpus sample report
+        run: |
+          python3 scripts/run-corpus.py \
+            --manifest fixtures/corpus/manifest.json \
+            --sample 12 \
+            --cache "$RUNNER_TEMP/omasafe-corpus-cache" \
+            --output release-reports/corpus-sample.json
+
+      - name: Generate validator-parity report
+        run: |
+          python3 scripts/validator-parity.py \
+            --manifest fixtures/corpus/manifest.json \
+            --cache "$RUNNER_TEMP/omasafe-corpus-cache" \
+            --sample 12 \
+            --output release-reports/validator-parity.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-reports
+          path: release-reports/*
+          if-no-files-found: error
+
   publish:
     name: Publish GitHub release
-    needs: build
+    needs: [build, reports]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -62,7 +113,13 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: release
-          pattern: release-*
+          pattern: release-x86_64-unknown-linux-gnu
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-reports
+          pattern: release-reports
           merge-multiple: true
 
       - name: Publish release assets
@@ -72,6 +129,7 @@ jobs:
           set -euo pipefail
           gh release create "${GITHUB_REF_NAME}" \
             release/*.tar.gz release/*.sha256 release/*.sigstore.json \
+            release-reports/*.json \
             --repo "${GITHUB_REPOSITORY}" \
             --title "${GITHUB_REF_NAME}" \
             --generate-notes

@@ -20,14 +20,65 @@ use omasafe_report::Report;
 use sha2::{Digest, Sha256};
 
 fn main() {
+    omasafe_core::interrupt::install();
     match run(std::env::args().skip(1).collect()) {
         Ok(code) => std::process::exit(code),
         Err(error) => {
             eprintln!("omasafe: {error}");
+            if omasafe_core::interrupt::raised() {
+                std::process::exit(INTERRUPTED_EXIT_CODE);
+            }
             std::process::exit(1);
         }
     }
 }
+
+/// Exit status for commands stopped by SIGINT/SIGTERM after cooperative
+/// cleanup (conventional 128+SIGINT).
+const INTERRUPTED_EXIT_CODE: i32 = 130;
+
+fn interrupted(context: &str) -> Box<dyn std::error::Error> {
+    format!("interrupted: {context}; no partial state was committed").into()
+}
+
+/// Phase-boundary stop for long-running commands: bounded children are
+/// already killed by their poll loops once the flag is set, so reaching a
+/// checkpoint with the flag up means unwind now.
+fn interruption_checkpoint(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if omasafe_core::interrupt::raised() {
+        return Err(interrupted(context));
+    }
+    Ok(())
+}
+
+/// Removes candidate checkouts orphaned by hard deaths (SIGKILL, power loss)
+/// whose owning pid no longer exists. Live concurrent runs are never touched.
+#[cfg(unix)]
+fn sweep_orphaned_review_checkouts() {
+    let prefix = "omasafe-review-update-";
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        let Some(pid_text) = name.rsplit('-').next() else {
+            continue;
+        };
+        let Ok(pid) = pid_text.parse::<i32>() else {
+            continue;
+        };
+        if pid == std::process::id() as i32 || omasafe_core::interrupt::process_alive(pid) {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(entry.path());
+    }
+}
+
+#[cfg(not(unix))]
+fn sweep_orphaned_review_checkouts() {}
 
 fn run(args: Vec<String>) -> Result<i32, Box<dyn std::error::Error>> {
     let exit_code = match args.as_slice() {
@@ -334,6 +385,9 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
         );
     }
 
+    sweep_orphaned_review_checkouts();
+    interruption_checkpoint("before evaluation started")?;
+
     let paths = XdgPaths::discover()?;
     paths.ensure()?;
     let flow_path = paths.state.join("review-update.json");
@@ -552,6 +606,8 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
         tree,
     );
 
+    interruption_checkpoint("after candidate evaluation")?;
+
     // --- Delta versus the trusted baseline ---
     let previous_event = ScanState::load(&paths.state.join("scan-state.json"))
         .ok()
@@ -675,10 +731,15 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
         eprint!("Type 'update' to apply exactly commit {candidate}: ");
         let mut answer = String::new();
         std::io::stdin().read_line(&mut answer)?;
+        if omasafe_core::interrupt::raised() {
+            return Err(interrupted("during confirmation"));
+        }
         if answer.trim() != "update" {
             return Err("update rejected; nothing was modified".into());
         }
     }
+
+    interruption_checkpoint("before approval was recorded")?;
 
     // --- Interrupted-state record goes live right before the first mutation ---
     let mut flow = UpdateFlowRecord {
@@ -717,9 +778,22 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
         flow.quiesced.push("disabled".into());
     }
     flow.store(&flow_path)?;
-
+    interruption_checkpoint(
+        "after quiescing; the plugin stays disabled and the recovery record is kept",
+    )?;
     // --- Delegate the mutation; never fork native lifecycle logic ---
     let outcome = omarchy_plugin_update(id);
+    if !outcome.success && omasafe_core::interrupt::raised() {
+        flow.phase = "failed".into();
+        flow.store(&flow_path)?;
+        eprintln!(
+            "interrupted during the native update; the updater was stopped and\n\
+             the plugin stays disabled. Inspect manually:\n\
+               git -C ~/.config/omarchy/plugins/{id} log --oneline -3\n\
+               omarchy plugin validate ~/.config/omarchy/plugins/{id}"
+        );
+        return Err(interrupted("during the native update"));
+    }
     if !outcome.success {
         flow.phase = "failed".into();
         flow.store(&flow_path)?;
@@ -737,6 +811,17 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
     }
 
     // --- Postconditions: exact HEAD + fresh rescan before anything goes live ---
+    if omasafe_core::interrupt::raised() {
+        flow.phase = "failed".into();
+        flow.store(&flow_path)?;
+        eprintln!(
+            "interrupted after the native update ran but BEFORE verification;\n\
+             the plugin stays disabled. Inspect HEAD manually:\n\
+               git -C ~/.config/omarchy/plugins/{id} log --oneline -3\n\
+             then re-enable only if it matches a reviewed commit."
+        );
+        return Err(interrupted("between mutation and verification"));
+    }
     flow.phase = "verifying".into();
     flow.store(&flow_path)?;
     let (fresh_shell_json, fresh_shell_error) = query_shell();
@@ -780,6 +865,22 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
         flow.phase = "failed".into();
         flow.store(&flow_path)?;
         eprintln!("postcondition warning: worktree reports dirty after fast-forward merge");
+    }
+
+    if omasafe_core::interrupt::raised() {
+        // Verified content is installed, but service restore and the trust
+        // advance are deliberate operator actions when the flow stops here.
+        flow.phase = "verifying".into();
+        flow.store(&flow_path)?;
+        eprintln!(
+            "interrupted after verification passed and before re-enable/trust.\n\
+             The reviewed commit {candidate} IS installed and verified.\n\
+             Manual completion:\n\
+               omarchy plugin enable {id}\n\
+               omasafe-cli plugins review {id} --action rebaseline --yes \\\n\
+                 --expected-head {candidate} --reason 'complete interrupted review'"
+        );
+        return Err(interrupted("between verification and re-enable"));
     }
 
     // --- Restore availability, then trust the verified identity ---
@@ -2536,6 +2637,7 @@ fn plugins_analyze(id: &str, args: &[String]) -> Result<i32, Box<dyn std::error:
     if !matches!(format, "text" | "json") {
         return Err("analyze format must be text or json".into());
     }
+    interruption_checkpoint("before analysis started")?;
     let fail_on = parse_fail_on(fail_on)?;
     let plugin_root = plugin_root()?;
     let (shell_json, _shell_error) = query_shell();
@@ -2557,6 +2659,7 @@ fn plugins_analyze(id: &str, args: &[String]) -> Result<i32, Box<dyn std::error:
         omasafe_analyzer::Limits::default(),
         omasafe_core::bounds::TimeBudget::default(),
     );
+    interruption_checkpoint("before report emission")?;
     emit_analysis_report(
         target,
         ingest_result.map_err(Into::into),
@@ -2568,6 +2671,7 @@ fn plugins_analyze(id: &str, args: &[String]) -> Result<i32, Box<dyn std::error:
 }
 
 fn scan_plugin(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
+    interruption_checkpoint("before analysis started")?;
     let mut format = "text";
     let mut fail_on = None;
     let mut path_target = None;

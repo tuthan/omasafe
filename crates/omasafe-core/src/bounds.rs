@@ -274,7 +274,7 @@ fn unix_poll_exit(child: &Child, deadline: Instant) -> io::Result<PollExit> {
                 return Err(error);
             }
         }
-        if Instant::now() >= deadline {
+        if Instant::now() >= deadline || crate::interrupt::raised() {
             kill_process_group(child.id() as libc::pid_t);
             reap_collecting(child.id() as libc::pid_t)?;
             return Ok(PollExit::Expired);

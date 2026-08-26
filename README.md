@@ -178,7 +178,29 @@ plugin from its own checkout with `omarchy plugin validate .` and
 Every command treats scanned repositories as untrusted input: no plugin code is
 executed, sourced, or rendered; Git hooks/submodules/LFS filters never run;
 process execution is argv-only; and elapsed-time, file-count, and byte limits are
-enforced throughout.
+enforced throughout. Long-running commands (`plugins analyze`, `scan-plugin`,
+`plugins review-update`) handle SIGINT/SIGTERM cooperatively: bounded children
+are stopped, temporary checkouts are swept (including ones orphaned by hard
+deaths of earlier runs), and no partial state is committed — a reviewed update
+interrupted mid-flow stays disabled with recovery guidance.
+
+### Release gate
+
+Run the full release checklist locally before tagging:
+
+```sh
+scripts/release-gate.sh              # add --skip-network only for quick iterations
+```
+
+It runs both test configurations, lint/format gates, generated-asset checks,
+the determinism canary, corpus-tooling self-tests, a bounded pinned-corpus
+sample, native-validator parity, the self-scan, and writes the evidence
+reports (`self-scan.json`, `corpus-sample.json`, `validator-parity.json`)
+that are also published with every GitHub release. The tag-triggered
+workflow builds and Sigstore-signs artifacts; clean-VM lifecycle checks
+(install/upgrade/downgrade/uninstall, panel lifecycle, schedule coexistence,
+notification independence) are codified in `scripts/vm-lifecycle.sh` and run
+against a fresh VM snapshot per release.
 
 ## Scope
 

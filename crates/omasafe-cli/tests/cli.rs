@@ -1918,6 +1918,12 @@ case "$*" in
       echo "omarchy-plugin-update: update of 'io.example.cli' failed validation; rolled back" >&2
       exit 1
     fi
+    if [[ $mode == "sleep" ]]; then
+      # Only jq and bash builtins are guaranteed on the fixture PATH.
+      jq -n '{fakeUpdateStarted: true}' > "$OMASAFE_FAKE_STARTED"
+      end=$((SECONDS + 30))
+      while (( SECONDS < end )); do :; done
+    fi
     source="$ORIGIN"
     [[ $mode == "race" ]] && source="$RACE_ORIGIN"
     git -C "$PLUGIN_DIR" fetch -q "$source" HEAD
@@ -2643,4 +2649,232 @@ fn install_verified_catalog(fixture: &Fixture, candidate: &str) {
 
 fn installed_head_of(update: &UpdateFixture) -> String {
     run_git(&update.fixture.plugin, &["rev-parse", "HEAD"])
+}
+
+#[test]
+#[cfg(unix)]
+fn review_update_sigint_during_native_update_fails_closed_with_exit_130() {
+    let update = UpdateFixture::new();
+    update.seed_trust();
+    update.fake.set_mode("sleep");
+    let started_marker = update.fixture.state.path().join("fake-update-started");
+
+    // Raw std Command: this test needs a live child process with piped
+    // streams to signal mid-flight; assert_cmd only offers blocking runs.
+    // CARGO_BIN_EXE_ is exported for integration tests by cargo itself.
+    let mut raw = std::process::Command::new(env!("CARGO_BIN_EXE_omasafe-cli"));
+    let fixture = &update.fixture;
+    raw.env("HOME", fixture._home.path())
+        .env("XDG_CONFIG_HOME", fixture.config.path())
+        .env("XDG_STATE_HOME", fixture.state.path())
+        .env("XDG_CACHE_HOME", fixture.cache.path())
+        .env("PATH", fixture.bin.path())
+        .env("OMASAFE_FAKE_STATE", &update.fake.state_path)
+        .env("OMASAFE_FAKE_LOG", &update.fake.log_path)
+        .env("OMASAFE_FAKE_ORIGIN", update.origin.path())
+        .env("OMASAFE_FAKE_RACE_ORIGIN", update.race_origin.path())
+        .env("OMASAFE_FAKE_PLUGIN_DIR", &fixture.plugin)
+        .env("OMASAFE_FAKE_STARTED", &started_marker)
+        .args([
+            "plugins",
+            "review-update",
+            "io.example.cli",
+            "--yes",
+            "--expected-commit",
+            &update.candidate,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = raw.spawn().expect("review-update spawns");
+
+    // Wait until the fake native updater is mid-flight, then SIGINT the CLI.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !started_marker.exists() {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let dumped = child.wait_wait_with_output();
+            panic!(
+                "shim never started\nstdout:\n{}\nstderr:\n{}\nstate:{}\nlog:\n{}",
+                String::from_utf8_lossy(&dumped.stdout),
+                String::from_utf8_lossy(&dumped.stderr),
+                fs::read_to_string(&update.fake.state_path).unwrap_or_default(),
+                fs::read_to_string(&update.fake.log_path).unwrap_or_default()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    // The shim runs in its own process group (spawn_bounded), so signaling
+    // only the CLI pid exercises exactly the cooperative-handler path: the
+    // bounded poll loop must kill the sleeping child and unwind cleanly.
+    let status = std::process::Command::new("/bin/sh")
+        .args(["-c", &format!("kill -INT {}", child.id())])
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "kill failed");
+
+    let output = child.wait_wait_with_output();
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("interrupted"), "{stderr}");
+    assert!(stderr.contains("stays disabled"), "{stderr}");
+    // Fail-closed: quiesce already disabled the plugin; no auto re-enable,
+    // recovery record kept, live tree untouched.
+    assert!(!update.fake.enabled());
+    let record = flow_record(&update.fixture).expect("recovery record kept after interruption");
+    assert_eq!(record["phase"], Value::String("failed".into()));
+    assert_ne!(
+        run_git(&update.fixture.plugin, &["rev-parse", "HEAD"]),
+        update.candidate
+    );
+}
+
+use std::io::Read as _;
+
+trait ChildExt {
+    fn wait_wait_with_output(self) -> std::process::Output;
+}
+
+impl ChildExt for std::process::Child {
+    fn wait_wait_with_output(mut self) -> std::process::Output {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        if let Some(pipe) = self.stdout.take() {
+            let mut pipe = pipe;
+            let _ = pipe.read_to_end(&mut stdout);
+        }
+        if let Some(pipe) = self.stderr.take() {
+            let mut pipe = pipe;
+            let _ = pipe.read_to_end(&mut stderr);
+        }
+        let status = self.wait().unwrap();
+        std::process::Output {
+            status,
+            stdout,
+            stderr,
+        }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn panel_data_contract_pins_the_json_sections_the_ui_consumes() {
+    // The omarchy panel consumes argv invocations and parses bounded JSON.
+    // This pins the exact sections it may rely on so plugin-side changes
+    // never silently break the UI contract.
+    let fixture = Fixture::new();
+    let plugin = fixture.plugin.clone();
+    fs::write(
+        plugin.join("manifest.json"),
+        r#"{"schemaVersion":1,"id":"io.example.cli","name":"n","version":"1","kinds":["bar-widget"],"entryPoints":{"barWidget":"main.qml"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        plugin.join("main.qml"),
+        "import QtQuick\nItem {\n  property string u: \"https://example.test\"\n}\n",
+    )
+    .unwrap();
+
+    let output = fixture
+        .command()
+        .args([
+            "scan-plugin",
+            "--path",
+            plugin.to_string_lossy().as_ref(),
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let result = &report["result"];
+
+    let analysis = &result["analysis"];
+    assert_eq!(
+        analysis["schema"],
+        Value::String("omasafe.analysis.v1".into())
+    );
+    for section in [
+        "findings",
+        "capabilities",
+        "invocation_edges",
+        "coverage_limitations",
+        "analysis_fingerprint",
+        "policy_identity",
+        "parser",
+        "equivalence",
+    ] {
+        assert!(
+            analysis.get(section).is_some(),
+            "panel contract: missing analysis.{section}"
+        );
+    }
+    // Findings carry review-facing fields with confidence, never a grade.
+    if let Some(findings) = analysis["findings"].as_array() {
+        for finding in findings {
+            for field in [
+                "rule_id",
+                "severity",
+                "confidence",
+                "relative_path",
+                "evidence",
+            ] {
+                assert!(
+                    finding.get(field).is_some(),
+                    "panel contract: finding missing {field}"
+                );
+            }
+        }
+    }
+    // The parser block is present but may be explicitly null in
+    // lexical-fallback builds — that null IS the visible degradation signal
+    // the panel must render, so the key itself is contractual.
+    assert!(
+        analysis.get("parser").is_some(),
+        "panel contract: parser key required (null allowed)"
+    );
+    if !analysis["parser"].is_null() {
+        for field in [
+            "grammar",
+            "grammar_version",
+            "tree_sitter_version",
+            "language_abi_version",
+        ] {
+            assert!(
+                analysis["parser"].get(field).is_some(),
+                "panel contract: parser.{field} required when a parser participated"
+            );
+        }
+    }
+
+    let inventory = &result["payload_inventory"];
+    for section in ["entries", "totals", "limitations", "coverage_states"] {
+        assert!(
+            inventory.get(section).is_some(),
+            "panel contract: missing payload_inventory.{section}"
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn review_update_sweeps_orphaned_checkouts_from_dead_pids() {
+    // Simulate a SIGKILLed earlier run by creating its temp checkout naming
+    // pattern with a pid that cannot exist; the next run must remove it.
+    let update = UpdateFixture::new();
+    let dead_dir = std::env::temp_dir().join("omasafe-review-update-x-4000000");
+    let _ = fs::remove_dir_all(&dead_dir);
+    fs::create_dir_all(dead_dir.join("leftover")).unwrap();
+
+    // Any invocation sweeps before its own outcome; this one still fails on
+    // the missing trusted baseline afterwards.
+    update.review_update(&[]);
+    assert!(!dead_dir.exists(), "orphaned checkout was not swept");
 }

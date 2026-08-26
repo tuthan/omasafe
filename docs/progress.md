@@ -851,4 +851,52 @@ the upstream proposal is tracked in docs/plans/later.md.
 
 Next: **v0.2 S8 — UI, packaging, release**.
 
+## S8 — UI, packaging, release (2026-08-26)
+
+**Cancellation and interruption safety** (the explicit M9 requirement).
+SIGINT/SIGTERM handlers set an atomic flag (omasafe-core::interrupt); the
+bounded-child poll loops watch the same flag, so one Ctrl-C stops in-flight
+git/updater processes promptly and every long-running command unwinds
+through its normal cleanup paths instead of dying mid-write. Phase-boundary
+checkpoints cover `plugins analyze`, `scan-plugin`, and `review-update`;
+interrupted exits use 130. review-update interruption is fail-closed at
+every stage: during quiescing or the native update the plugin stays
+disabled with the recovery record kept; after a verified update but before
+re-enable/trust, the flow stops with manual completion steps — trust never
+advances on an interrupted run. Temporary candidate checkouts orphaned by
+hard deaths are swept by pid liveness at each run's start.
+
+**Panel data contract.** `scan-plugin --format json` / `plugins analyze
+--format json` already carried everything the omarchy panel consumes; an
+integration test now pins the schema: analysis sections (findings with
+rule_id/severity/confidence/evidence, capabilities, invocation_edges,
+coverage_limitations, fingerprint, policy_identity, equivalence), payload
+inventory sections, and the parser block whose explicit null in
+lexical-fallback builds is itself the visible degradation signal. The
+panel-side views live in the sibling omasafe-plugin repo and evolve there
+against this pinned contract.
+
+**Release tooling.** `scripts/release-gate.sh` implements the release
+checklist verbatim: format + clippy/tests in BOTH configurations,
+generated-asset currency, determinism canary, corpus-tooling self-tests,
+a bounded corpus sample, native-validator parity, the self-scan of
+OmaSafe's own source, and provenance — writing all evidence reports to
+release-reports/. The tag-triggered workflow gained a reports job that
+generates self-scan/corpus/parity JSON in CI and publishes them as release
+assets alongside the signed archive. Clean-VM lifecycle checks
+(install/upgrade/downgrade/uninstall via the reviewed pinned installer,
+schedule coexistence, panel enable/rescan/disable lifecycle, third-party-
+bar notification independence) are codified in `scripts/vm-lifecycle.sh`
+for per-release runs against a fresh VM snapshot.
+
+Verified locally end-to-end: gate exit 0 with live corpus sample (12
+scanned, 0 incomplete) and parity (12 compared, 0 disagreements against
+4.0.1); self-scan produced 13 findings / 160 capability observations with
+disclosed coverage limitations. Remaining manual steps before v0.2 tagging:
+review the self-scan findings, confirm the nightly full-corpus baseline is
+provisioned, sign the tag. The sibling panel repo ships its views
+separately with its own update cadence, as documented in the README.
+
+Next: **codex review round for S8**, then v0.2 tag.
+
 
