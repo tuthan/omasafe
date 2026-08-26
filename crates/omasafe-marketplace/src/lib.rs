@@ -1,3 +1,5 @@
+pub mod manifest;
+
 use std::fs;
 use std::path::Path;
 

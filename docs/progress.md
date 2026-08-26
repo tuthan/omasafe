@@ -695,3 +695,80 @@ stability, and `fingerprint_analysis` takes no version input by
 construction).
 
 Next: **v0.2 S6 — Pinned corpus, FP budget, validator parity**.
+
+## v0.2 S6 — Pinned Corpus, FP Budget, Validator Parity
+
+Status: **complete**
+
+Implemented:
+
+- **Corpus manifest** (`fixtures/corpus/manifest.json`, generator
+  `scripts/generate-corpus-manifest.py`): every community catalog entry with
+  an https repository and a valid pinned `upstreamObservedCommit`, sorted by
+  id — 1281 plugins from the frozen snapshot (catalog commit `964dc08d…`,
+  retrieved 2026-08-25; the plan's "653" predates the current snapshot size,
+  which the manifest records in its provenance block). Fields per plugin:
+  repository, commit, layout, manifest path (root-plugin layouts; null
+  elsewhere with runner-side discovery), kind, status, expected
+  availability. No plugin content is committed; live-catalog refresh stays a
+  manual regeneration against a new frozen snapshot.
+- **Expectation ledger** (`fixtures/corpus/expectations/dispositions.jsonl` +
+  README): append-only JSONL keyed `{plugin_id, commit, rule_id}` with
+  `true-positive`/`false-positive` dispositions and required human notes;
+  last record per key wins. Starts intentionally empty.
+- **Runner** (`scripts/run-corpus.py`): deterministic evenly-spaced PR
+  subsets (`--sample N`) or full corpus (`--full`); shallow-fetches each
+  pinned commit into a disposable cache (re-clone on any drift), scans each
+  clone via `scan-plugin` under an isolated XDG environment so local
+  suppressions/snapshots cannot influence results, classifies findings
+  through the ledger, and publishes per-rule TP/FP/untriaged counts plus
+  incomplete repositories. Unclonable or unanalyzable repositories are
+  **incomplete, never clean**. `--gate-high` implements the release gate:
+  fails on any known or untriaged high-severity result (genuine highs are
+  expected and fine).
+- **Manifest checks for plain Arch use**
+  (`omasafe-marketplace::manifest` + `validate-manifest` example): full
+  mirror of the native validator for recorded Omarchy 4.0.1 — schemaVersion
+  number equality, required fields, id charset/`..`/reserved-namespace
+  rules, kinds table entry-point coverage, safe relative existing entry
+  points (newline/absolute/traversal), barWidget.defaultSection enum, and
+  symlink refusal outside `.git`. Unit tests pin every check positive and
+  negative.
+- **Validator parity canary** (`scripts/validator-parity.py`): runs native
+  `omarchy plugin validate` and OmaSafe's mirror over the same clones and
+  compares pass/fail verdicts; disagreement fails the build for the
+  recorded version. A missing runtime, or a runtime newer than the
+  recording, degrades validator coverage VISIBLY (report status
+  `degraded` + loud log line) instead of silently passing; undiscoverable
+  manifests count incomplete.
+- **CI provisioning**: `corpus-subset` job in ci.yml (deterministic sample
+  of 12 per PR, reports as artifacts) and scheduled
+  `corpus-nightly.yml` (full corpus + parity, five-hour budget, artifacts
+  always uploaded). The nightly is informational until dispositions accrue;
+  `--gate-high` wires the release gate at release time. Parity runs on
+  GitHub runners degrade visibly by design; real comparison points
+  `CORPUS_PARITY_RUNNER` at a runner carrying the recorded Omarchy version.
+
+Verification:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings          # both configs
+cargo test --workspace                     # 178 tests (parser-backed)
+cargo test --workspace --no-default-features               # 168 tests (lexical)
+./scripts/generate-cli-assets.sh --check
+./scripts/determinism-canary.sh
+run-corpus.py --sample 12   # 12 scanned, 8 untriaged, 0 incomplete
+validator-parity.py         # 12 compared, 0 disagreements; degraded path exercised
+```
+
+Known limitations: parity verdicts compare pass/fail only (not per-issue
+prose); monorepo/suite discovery accepts any depth≤2 directory declaring the
+plugin id; the nightly runner variable must be provisioned before release
+for real (non-degraded) parity — that ops cost is owned explicitly per the
+plan; corpus findings are untriaged by definition until humans accrue
+dispositions.
+
+Next: **v0.2 S7 — Reviewed update workflow**.
+
+

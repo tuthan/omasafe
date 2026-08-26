@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""Run the pinned S6 corpus through OmaSafe and classify every result.
+
+Clones pinned commits into a disposable cache (never committed), runs
+`omasafe-cli scan-plugin` per plugin with an isolated XDG environment so
+local suppressions or cached snapshots cannot influence corpus results,
+classifies each finding against the expectation ledger, and publishes
+per-rule true-positive/false-positive/untriaged counts plus incomplete
+repositories. A repository that cannot be cloned at its pinned commit is
+incomplete — never clean.
+
+PR mode (--sample N) takes a deterministic evenly spaced subset sorted by
+id; nightly/release mode (--full) takes everything. The release gate
+(--gate-high) fails on any known high-severity false positive or any
+untriaged high-severity result — genuine high findings are expected.
+
+Usage:
+  scripts/run-corpus.py --manifest fixtures/corpus/manifest.json \
+      (--sample N | --full) [--gate-high] [--output report.json]
+      [--cache DIR] [--bin PATH]
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HIGH_SEVERITIES = {"high", "critical"}
+
+
+def log(message):
+    print(f"[corpus] {message}", flush=True)
+
+
+def load_ledger(path):
+    """Last record per key wins; records are append-only."""
+    ledger = {}
+    if not Path(path).exists():
+        return ledger
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            key = (record["plugin_id"], record["commit"], record["rule_id"])
+            ledger[key] = record["disposition"]
+    return ledger
+
+
+def sample_plugins(plugins, count):
+    ordered = sorted(plugins, key=lambda item: item["pluginId"])
+    total = len(ordered)
+    count = min(count, total)
+    if count == 0:
+        return []
+    picked = set()
+    for index in range(count):
+        picked.add((index * total) // count)
+    # Evenly spaced indices over the sorted id order stay fully
+    # deterministic for a given manifest.
+    return [ordered[position] for position in sorted(picked)]
+
+
+def clone_pinned(repository, commit, destination):
+    """Fetch exactly one pinned commit; returns None on success or a reason."""
+    if destination.exists():
+        try:
+            head = git(destination, "rev-parse", "HEAD")
+        except RuntimeError:
+            # Half-initialized or corrupt cache entry: start over.
+            head = None
+        if head == commit:
+            return None
+        shutil.rmtree(destination, ignore_errors=True)
+    destination.mkdir(parents=True)
+    git(destination.parent, "init", "--quiet", str(destination.name))
+    git(destination, "remote", "add", "origin", repository)
+    try:
+        git(
+            destination,
+            "-c", "protocol.version=2",
+            "fetch", "--quiet", "--depth", "1", "origin", commit,
+        )
+        git(destination, "checkout", "--quiet", "--detach", commit)
+    except RuntimeError as error:
+        return str(error)[:400]
+    return None
+
+
+def git(cwd, *args):
+    """Runs git and returns stdout; raises RuntimeError with stderr detail."""
+    result = subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"},
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"git {' '.join(args)}: {result.stderr.strip()[:350] or 'failed'}"
+        )
+    return result.stdout.strip()
+
+
+def run_scan(bin_path, plugin_dir):
+    """scan-plugin under an isolated XDG environment; returns parsed findings."""
+    with tempfile.TemporaryDirectory(prefix="omasafe-corpus-xdg-") as xdg:
+        environment = {
+            **os.environ,
+            "HOME": xdg,
+            "XDG_CONFIG_HOME": f"{xdg}/config",
+            "XDG_STATE_HOME": f"{xdg}/state",
+            "XDG_CACHE_HOME": f"{xdg}/cache",
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        }
+        result = subprocess.run(
+            [str(bin_path), "scan-plugin", "--path", str(plugin_dir), "--format", "json"],
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=300,
+        )
+    if result.returncode != 0:
+        raise RuntimeError(f"scan-plugin failed: {result.stderr.strip()[:400]}")
+    report = json.loads(result.stdout)
+    return report["result"]["analysis"]["findings"]
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--manifest", required=True)
+    parser.add_argument("--sample", type=int)
+    parser.add_argument("--full", action="store_true")
+    parser.add_argument("--gate-high", action="store_true")
+    parser.add_argument("--output")
+    parser.add_argument("--cache", default=os.environ.get("OMASAFE_CORPUS_CACHE"))
+    parser.add_argument("--ledger", default=None)
+    parser.add_argument("--bin", default="target/debug/omasafe-cli")
+    arguments = parser.parse_args()
+
+    if not arguments.full and not arguments.sample:
+        parser.error("choose --sample N or --full")
+
+    with open(arguments.manifest, encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    plugins = manifest["plugins"]
+    if arguments.sample:
+        plugins = sample_plugins(plugins, arguments.sample)
+
+    ledger_default = (
+        Path(arguments.manifest).parent / "expectations" / "dispositions.jsonl"
+    )
+    ledger = load_ledger(arguments.ledger or ledger_default)
+
+    cache_root = Path(arguments.cache or tempfile.mkdtemp(prefix="omasafe-corpus-cache-"))
+    cache_root.mkdir(parents=True, exist_ok=True)
+    bin_path = Path(arguments.bin).resolve()
+    if not bin_path.exists():
+        log(f"building {bin_path}")
+        subprocess.run(
+            ["cargo", "build", "--quiet", "--bin", "omasafe-cli"], check=True
+        )
+
+    per_rule = {}
+    totals = {"true_positive": 0, "false_positive": 0, "untriaged": 0}
+    incomplete = []
+    gate_failures = []
+    scanned = 0
+
+    for plugin in plugins:
+        plugin_id = plugin["pluginId"]
+        commit = plugin["upstreamObservedCommit"]
+        destination = cache_root / hashlib.sha256(plugin_id.encode()).hexdigest()
+        log(f"{plugin_id} @ {commit[:12]}")
+        failure = clone_pinned(plugin["repository"], commit, destination)
+        if failure is not None:
+            log(f"  INCOMPLETE: {failure}")
+            incomplete.append({"pluginId": plugin_id, "reason": failure})
+            continue
+        try:
+            findings = run_scan(bin_path, destination)
+        except (RuntimeError, json.JSONDecodeError, subprocess.TimeoutExpired) as error:
+            log(f"  INCOMPLETE: analysis failed: {error}")
+            incomplete.append({"pluginId": plugin_id, "reason": str(error)[:400]})
+            continue
+        scanned += 1
+        for finding in findings:
+            rule_id = finding.get("rule_id", "<unknown>")
+            severity = finding.get("severity", "info")
+            disposition = ledger.get((plugin_id, commit, rule_id), "untriaged")
+            bucket = {
+                "true-positive": "true_positive",
+                "false-positive": "false_positive",
+            }.get(disposition, "untriaged")
+            rule_stats = per_rule.setdefault(
+                rule_id, {"true_positive": 0, "false_positive": 0, "untriaged": 0}
+            )
+            rule_stats[bucket] += 1
+            totals[bucket] += 1
+            if (
+                arguments.gate_high
+                and severity in HIGH_SEVERITIES
+                and bucket in ("false_positive", "untriaged")
+            ):
+                gate_failures.append(
+                    {
+                        "pluginId": plugin_id,
+                        "ruleId": rule_id,
+                        "severity": severity,
+                        "bucket": bucket,
+                    }
+                )
+
+    report = {
+        "reportVersion": 1,
+        "mode": "full" if arguments.full else f"sample:{arguments.sample}",
+        "catalogCommit": manifest["source"]["repositoryCommit"],
+        "recordedOmarchyVersion": manifest.get("recordedOmarchyVersion"),
+        "selectedPlugins": len(plugins),
+        "scanned": scanned,
+        "incompleteRepositories": incomplete,
+        "totals": totals,
+        "perRule": dict(sorted(per_rule.items())),
+    }
+    output = json.dumps(report, indent=2, sort_keys=True)
+    if arguments.output:
+        Path(arguments.output).write_text(output + "\n", encoding="utf-8")
+        log(f"report written to {arguments.output}")
+    print(output)
+
+    log(
+        "totals: tp={true_positive} fp={false_positive} untriaged={untriaged} "
+        "incomplete={count}".format(count=len(incomplete), **totals)
+    )
+    if arguments.gate_high:
+        if gate_failures:
+            log("GATE FAILED: unaccounted high-severity results:")
+            for failure in gate_failures:
+                log(f"  {failure['pluginId']} {failure['ruleId']} -> {failure['bucket']}")
+            return 1
+        log("GATE PASSED: no known or untriaged high-severity corpus results.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

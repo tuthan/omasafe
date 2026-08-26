@@ -1,0 +1,60 @@
+name: Corpus nightly
+
+# S6: full pinned-corpus run plus validator parity, published as artifacts.
+#
+# Budgets (owned explicitly per docs/plans/v0.2-implementation.md S6):
+# - Network: one shallow fetch per pinned plugin (~1.3k repositories) into an
+#   ephemeral cache; no plugin content is ever committed.
+# - Runner time: the job is allowed up to five hours; the PR subset in ci.yml
+#   stays bounded to a sample of 12.
+# - Unavailable repositories are counted incomplete and never clean; they do
+#   not fail the informational nightly. The release gate
+#   (`run-corpus.py --gate-high`) is wired at release time once dispositions
+#   have accrued — a fresh corpus would be permanently red on untriaged
+#   high-severity results, which is exactly what the ledger exists to fix.
+#
+# Validator parity runs against the recorded Omarchy version. GitHub-hosted
+# runners have no omarchy runtime, so parity degrades visibly there by
+# design; point CORPUS_PARITY_RUNNER at a runner with the recorded Omarchy
+# version (VM harness or pinned container) for real comparison.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: corpus-nightly
+  cancel-in-progress: false
+
+jobs:
+  full-corpus:
+    runs-on: ${{ vars.CORPUS_PARITY_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - name: Full pinned corpus
+        run: |
+          python3 scripts/run-corpus.py \
+            --manifest fixtures/corpus/manifest.json \
+            --full \
+            --cache "$RUNNER_TEMP/corpus-cache" \
+            --output corpus-report.json
+      - name: Validator parity over the full corpus
+        run: |
+          python3 scripts/validator-parity.py \
+            --manifest fixtures/corpus/manifest.json \
+            --cache "$RUNNER_TEMP/corpus-cache" \
+            --output parity-report.json
+      - name: Upload corpus reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: corpus-nightly-reports
+          path: |
+            corpus-report.json
+            parity-report.json
+          if-no-files-found: ignore

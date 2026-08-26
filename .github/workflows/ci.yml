@@ -32,3 +32,38 @@ jobs:
           name: determinism-canary-repro
           path: determinism-canary-failure/
           if-no-files-found: ignore
+
+  # S6: bounded deterministic pinned-corpus subset on every PR. The full
+  # corpus and release gating live in the scheduled corpus-nightly workflow;
+  # live-catalog refresh is never an input here.
+  corpus-subset:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - name: Run pinned corpus subset (sample of 12)
+        run: |
+          python3 scripts/run-corpus.py \
+            --manifest fixtures/corpus/manifest.json \
+            --sample 12 \
+            --cache "$RUNNER_TEMP/corpus-cache" \
+            --output corpus-report.json
+      - name: Validator parity over the same subset
+        run: |
+          python3 scripts/validator-parity.py \
+            --manifest fixtures/corpus/manifest.json \
+            --cache "$RUNNER_TEMP/corpus-cache" \
+            --sample 12 \
+            --output parity-report.json
+      - name: Upload corpus reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: corpus-reports
+          path: |
+            corpus-report.json
+            parity-report.json
+          if-no-files-found: ignore
