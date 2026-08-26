@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use omasafe_core::{TOOL_VERSION, paths::XdgPaths};
 use omasafe_marketplace::{
-    Correlation, OFFICIAL_REPOSITORY, correlate, fetch_pinned_catalog, load_cached_catalog,
-    load_catalog, resolve_latest_commit, valid_commit,
+    Correlation, MAX_CATALOG_BYTES, OFFICIAL_REPOSITORY, correlate, fetch_pinned_catalog,
+    load_cached_catalog, load_catalog, resolve_latest_commit, valid_commit,
 };
 use omasafe_plugin_trust::{
     DiffResult, SourceIdentity,
@@ -1670,7 +1670,14 @@ enum ContentSource {
 /// no snapshot is available or it carries no version information.
 fn observed_marketplace_baseline() -> Option<String> {
     let cache_dir = XdgPaths::discover().ok()?.cache;
-    let raw = std::fs::read_to_string(cache_dir.join("catalog.json")).ok()?;
+    let path = cache_dir.join("catalog.json");
+    // The cached snapshot is untrusted input: honor the marketplace catalog
+    // byte bound before allocating, matching the loader's own contract.
+    let size = std::fs::metadata(&path).ok()?.len();
+    if size > MAX_CATALOG_BYTES as u64 {
+        return None;
+    }
+    let raw = std::fs::read_to_string(path).ok()?;
     let document: serde_json::Value = serde_json::from_str(&raw).ok()?;
     let entries = match &document {
         // Both frozen-snapshot shapes: bare entry arrays and wrapped objects.

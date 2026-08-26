@@ -612,11 +612,12 @@ fn rules_list_reports_catalog_and_policy_identity() {
         report["result"]["policy_identity"]["supported_surface_version"],
         "omarchy-security-surface.v1"
     );
-    // The CLI build enables the qml-parser feature, so the policy identity
-    // must advertise the real parser (ADR 0001), not the lexical fallback.
+    // The policy identity advertises the compiled parser strategy (ADR 0001):
+    // the real grammar when the qml-parser feature is on, the lexical
+    // fallback marker when it is off.
     assert_eq!(
         report["result"]["policy_identity"]["parser_versions"]["qml"],
-        "tree-sitter-qmljs/0.3.1"
+        omasafe_analyzer::policy::QML_PARSER_IDENTITY
     );
     // S4 ships the marketplace baseline equivalence map.
     assert_eq!(
@@ -905,7 +906,12 @@ Item {
     let report: Value = serde_json::from_slice(&output).unwrap();
     let analysis = &report["result"]["analysis"];
     assert_eq!(analysis["schema"], "omasafe.analysis.v1");
-    assert_eq!(analysis["parser"]["grammar"], "tree-sitter-qmljs");
+    // Parser metadata is present only in parser-backed builds (ADR 0001).
+    if omasafe_analyzer::policy::QML_PARSER_IDENTITY == "lexical-fallback-unassigned" {
+        assert!(analysis["parser"].is_null());
+    } else {
+        assert_eq!(analysis["parser"]["grammar"], "tree-sitter-qmljs");
+    }
 
     // The S1 bundled-payload story, completed: the executable payload now
     // exposes its invocation edge and referenced marker.
@@ -946,14 +952,23 @@ Item {
         .unwrap();
     assert_eq!(panel["coverage_state"], "unreferenced");
 
-    // Findings carry the full contract fields.
+    // Findings carry the full contract fields. Confidence follows the
+    // compiled parser strategy (ADR 0001), so the expected label is derived
+    // from the analyzer's declared identity rather than hard-coded.
+    let parser_backed =
+        omasafe_analyzer::policy::QML_PARSER_IDENTITY != "lexical-fallback-unassigned";
+    let expected_confidence = if parser_backed {
+        "ast-backed"
+    } else {
+        "lexical-fallback"
+    };
     let findings = analysis["findings"].as_array().unwrap();
     assert!(
         findings
             .iter()
             .any(|finding| finding["rule_id"] == "oma.qml.process-execution"
                 && finding["severity"] == "medium"
-                && finding["confidence"] == "ast-backed"
+                && finding["confidence"] == expected_confidence
                 && !finding["evidence"].as_str().unwrap().is_empty()
                 && !finding["review_guidance"].as_str().unwrap().is_empty()),
         "{findings:?}"
@@ -1158,5 +1173,113 @@ fn equivalence_staleness_is_disclosed_when_cached_snapshot_moves() {
     assert!(
         text.contains("equivalence-map-stale:map-v3-observed-v9"),
         "{text}"
+    );
+}
+
+#[test]
+fn staleness_reader_accepts_wrapped_catalog_shapes() {
+    let shapes = [
+        r#"{"entries":[{"id":"x","verificationBaselineVersion":"9"}]}"#,
+        r#"{"plugins":[{"id":"x","verificationBaselineVersion":"9"}]}"#,
+    ];
+    for shape in shapes {
+        let temp = tempfile::TempDir::new().unwrap();
+        fs::write(temp.path().join("Main.qml"), "Text {}\n").unwrap();
+
+        let fixture = Fixture::new();
+        let omasafe_cache = fixture.cache.path().join("omasafe");
+        fs::create_dir_all(&omasafe_cache).unwrap();
+        fs::write(omasafe_cache.join("catalog.json"), shape).unwrap();
+        let output = fixture
+            .command()
+            .args([
+                "scan-plugin",
+                "--path",
+                temp.path().to_str().unwrap(),
+                "--format",
+                "text",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let text = String::from_utf8(output).unwrap();
+        assert!(
+            text.contains("equivalence-map-stale:map-v3-observed-v9"),
+            "{shape} must mark staleness: {text}"
+        );
+    }
+}
+
+#[test]
+fn text_output_discloses_inventory_and_analysis_limitations_together() {
+    let temp = tempfile::TempDir::new().unwrap();
+    fs::write(temp.path().join("Main.qml"), "Text {}\n").unwrap();
+    fs::write(temp.path().join("manifest.json"), b"{ not json").unwrap();
+    // A non-UTF-8 entry name trips an inventory-side collection limitation.
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let bad_name = std::ffi::OsStr::from_bytes(b"bad\xff.qml");
+        fs::write(temp.path().join(bad_name), "Text {}\n").unwrap();
+    }
+
+    let fixture = Fixture::new();
+    let output = fixture
+        .command()
+        .args([
+            "scan-plugin",
+            "--path",
+            temp.path().to_str().unwrap(),
+            "--format",
+            "text",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).unwrap();
+    #[cfg(unix)]
+    assert!(text.contains("non_utf8_entry_name_skipped"), "{text}");
+    assert!(text.contains("manifest-context-unreadable"), "{text}");
+}
+
+#[test]
+fn plugins_analyze_fail_on_returns_threshold_exit_code() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.plugin.join("main.qml"),
+        "Process { command: [\"sh\", \"-c\", \"ls\"] }\n",
+    )
+    .unwrap();
+    // Threshold above the finding: plain success.
+    fixture
+        .command()
+        .args(["plugins", "analyze", "io.example.cli", "--fail-on", "high"])
+        .assert()
+        .success();
+    // Medium finding meets the low threshold: exit 4 with a full report.
+    let output = fixture
+        .command()
+        .args([
+            "plugins",
+            "analyze",
+            "io.example.cli",
+            "--format",
+            "json",
+            "--fail-on",
+            "low",
+        ])
+        .assert()
+        .code(4)
+        .get_output()
+        .stdout
+        .clone();
+    let threshold_report: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(
+        threshold_report["result"]["analysis"]["findings"][0]["severity"],
+        "medium"
     );
 }

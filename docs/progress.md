@@ -535,7 +535,7 @@ Implemented:
   verified surface doc; clipboard and Hyprland/Wayland/Wlr tokens record
   capability context only.
 - **Remaining capability rules**: `oma.qml.dynamic-code` (Medium) detects
-  eval/Qt.createQmlObject/new Function/atob construction; 
+  eval/Qt.createQmlObject/new Function/atob construction;
   `oma.qml.obfuscated-payload-indicator` (Low) flags base64-shaped literals
   with exact 63/64 boundary and letters+digits requirements; FileView paths
   toward autostart/systemd-user locations surface persistence-location
@@ -567,19 +567,43 @@ Verification:
 ```text
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace          # 144 tests (feature off)
-cargo test --workspace --features omasafe-analyzer/qml-parser   # 144 (on)
+cargo test --workspace          # parser-backed build
+cargo test --workspace --no-default-features   # true lexical-fallback build
 ./scripts/generate-cli-assets.sh --check
 ```
 
 Codex review produced three blockers (missing new-Function detection;
 unsound NOPASSWD/comment handling; incomplete equivalence map) plus
-concerns/nits — every one fixed and pinned with tests before commit. Codex
-credits ran out before a final re-review round; the fixes are mechanically
-verified by the test suite above, including the exact regressions the
-review demanded (base64 boundaries, read-only NOPASSWD negative,
-language-exact comments, map completeness, CLI staleness e2e,
-severity-first ordering).
+concerns/nits — every one fixed and pinned with tests before commit. The
+final re-review round (run after credits returned) returned
+CHANGES-REQUIRED with three further blockers, all verified real and fixed
+in the follow-up hardening commit: (1) `sudoers` mention substituted for a
+write indicator, so non-writing NOPASSWD/sudoers mentions could yield High
+findings — both grant predicates now require a real write context
+(`>`, tee, visudo, sed -i, chattr, `.write(`), with read-only first words
+(grep/cat/less/head/tail/stat/journalctl) still suppressing; (2) the comment
+stripper failed to advance past opening quotes, so `#`/`//` inside string
+literals truncated live code, and shell `#` after control operators was not
+recognized — cursor fixed and shell word starts extended to
+whitespace/`;&|(`; (3) the equivalence staleness reader read cached
+catalog.json unbounded — now honors MAX_CATALOG_BYTES like the loader. High-
+finding provenance is quote-aware (`unquoted_text`): pipes and dynamic-code/
+download spellings inside string literals no longer create findings.
+Pinning tests added for each fix plus: exact 12-id equivalence set and
+verification SHA, per-word read-only suppression, quoted-spelling negatives,
+band tie-break order (path → rule → line), wrapped-catalog staleness shapes,
+simultaneous inventory+analysis limitations in text output, and
+`plugins analyze --fail-on` exit 4.
+
+Gate integrity correction found during this round: omasafe-cli enabled
+`omasafe-analyzer/qml-parser` through its dependency line, so feature
+unification made plain `cargo test --workspace` parser-backed — the
+documented "feature off" configuration never actually ran. The CLI now owns
+a default `qml-parser` feature alias (same shipped behavior per ADR 0001),
+the lexical configuration is exercised with `--no-default-features`, and
+two mis-gated assertions (git-sourced confidence in the ingestion test,
+policy/parser metadata in CLI tests) derive their expectations from the
+compiled parser identity instead of hard-coded values.
 
 Known limitations: Process/FileView type matching remains
 import-unqualified; AST persistence detection covers static paths only

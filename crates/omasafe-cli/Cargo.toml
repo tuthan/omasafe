@@ -8,8 +8,14 @@ license.workspace = true
 name = "omasafe-cli"
 path = "src/main.rs"
 
+# The shipped CLI parses real QML syntax (ADR 0001); the alias lets
+# `--no-default-features` exercise the documented lexical-fallback mode.
+[features]
+default = ["qml-parser"]
+qml-parser = ["omasafe-analyzer/qml-parser"]
+
 [dependencies]
-omasafe-analyzer = { path = "../omasafe-analyzer", features = ["qml-parser"] }
+omasafe-analyzer = { path = "../omasafe-analyzer" }
 omasafe-core = { path = "../omasafe-core" }
 omasafe-marketplace = { path = "../omasafe-marketplace" }
 omasafe-plugin-trust = { path = "../omasafe-plugin-trust" }

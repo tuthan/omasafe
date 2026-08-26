@@ -582,9 +582,16 @@ fn pinned_tree_analysis_reads_blob_contents_through_object_ids() {
     let findings = artifacts.rendered_findings();
     assert_eq!(findings.len(), 1, "{findings:?}");
     assert_eq!(findings[0].rule_id, "oma.qml.process-execution");
+    // Confidence follows the compiled parser strategy (ADR 0001): ast-backed
+    // with the qml-parser feature, lexical-fallback without it.
+    let expected_confidence = if cfg!(feature = "qml-parser") {
+        "ast-backed"
+    } else {
+        "lexical-fallback"
+    };
     assert_eq!(
         findings[0].confidence.as_deref(),
-        Some("ast-backed"),
-        "git-sourced analysis is parser-backed like any other"
+        Some(expected_confidence),
+        "git-sourced analysis labels evidence quality like any other source"
     );
 }

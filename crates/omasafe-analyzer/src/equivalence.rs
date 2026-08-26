@@ -96,4 +96,42 @@ mod tests {
         }
         assert!(mapped.contains(&"curl-pipe-shell"), "{mapped:?}");
     }
+
+    #[test]
+    fn map_covers_exactly_the_twelve_baseline_v3_external_ids() {
+        let map = EquivalenceMap::embedded();
+        let observed: std::collections::BTreeSet<&str> = map
+            .entries
+            .iter()
+            .map(|entry| entry.external_id.as_str())
+            .collect();
+        let expected: std::collections::BTreeSet<&str> = [
+            // Findings.
+            "cargo-git-unpinned",
+            "curl-pipe-shell",
+            "privileged-process-control-from-shared-temp",
+            "remote-git-execution-unpinned",
+            "sudoers-dangerous-passwordless-command",
+            // Capabilities.
+            "bundled-executable-binary",
+            "installer",
+            "package-manager",
+            "privilege",
+            "remote-build",
+            "service-management",
+            "sudoers-modification",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(observed, expected);
+    }
+
+    #[test]
+    fn verification_commit_is_pinned_exactly() {
+        let map = EquivalenceMap::embedded();
+        assert_eq!(
+            map.verified_at_commit,
+            "964dc08df2a3450578727b665908272cd3a277e5"
+        );
+    }
 }

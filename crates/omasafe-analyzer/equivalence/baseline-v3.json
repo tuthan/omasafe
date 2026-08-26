@@ -8,7 +8,7 @@
   "notes": [
     "Upstream PLAN.md keeps Baseline V4 as a separate future policy; this map records the shipped V3 catalogs completely.",
     "Equivalence is coverage-level, not verdict-level: OmaSafe findings and marketplace baseline outcomes are independent systems.",
-    "Every external finding and capability id appears exactly once below, with an explicit coverage relation."
+    "Every external finding and capability id from Baseline V3 is mapped below; an id may carry several OmaSafe mappings when multiple rules participate, and every mapping has an explicit coverage relation."
   ],
   "entries": [
     {
