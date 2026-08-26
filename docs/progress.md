@@ -459,3 +459,66 @@ plugin / 1 suite), so suites are under-weighted relative to their QML mass;
 qmllint remains unexercised by CI.
 
 Next: **v0.2 S3 — Embedded-JS analysis, first capabilities, invocation edges**.
+
+## v0.2 S3 — Embedded-JS Analysis, First Capabilities, Invocation Edges
+
+Status: **complete**
+
+Implemented:
+
+- `omasafe-analyzer::detect`: one bounded pass over an ingested inventory
+  producing findings (fingerprintable, suspicious-provenance only),
+  capability occurrences (context, never assertions of intent), and resolved
+  invocation edges. AST-backed QML analysis via the S2 parser; standalone
+  `.js` and fallback builds are line-lexical with `LexicalFallback` labels.
+  Rule contract enforced by construction: findings require shell-interpreter
+  chains (`sh -c …`, basename-aware for `/bin/sh`), network-response data
+  inside execution arguments, or computed reference sinks — same-file
+  co-occurrence and bare dynamic identifiers stay capability-only.
+- New catalog rule `oma.qml.dynamic-reference` (Low) for computed
+  Loader/FileView sources; RULE_CATALOG_VERSION bumped to 2.
+- Invocation edges: literal references resolve relative to the referencing
+  file first, then repository root; traversal segments, schemes (any colon),
+  spaces, directories, and symlinks never resolve. Targets gain additive
+  `invocation_target = true`; fully-observed-clean files report the now-live
+  `Unreferenced` coverage state (`Partial` when syntax errors degrade a
+  parse). The S1 bundled-executable fixture story completes: QML pointing at
+  a shell payload now exposes its edge.
+- Analysis fingerprint covers sorted findings AND capabilities
+  (`fingerprint_analysis`); golden pins per feature configuration catch
+  canonicalization drift. Workspace version bumped to 0.2.0 so policy
+  identity moves with detector introduction.
+- CLI: content readers verify identity before analysis — O_NOFOLLOW|
+  O_NONBLOCK opens with fstat regular-file confirmation, size equality, and
+  SHA-256 match against the ingested digest (git readers: bounded cat-file by
+  object id with truncation/status checks). Reader failures degrade into
+  disclosed limitations, never silent divergence. Capability records carry
+  their covering rule id/explanation/guidance.
+- `--fail-on SEVERITY` wired end-to-end: findings remain success; threshold
+  met returns exit code 4 through the normal run path, documented in the man
+  page separately from scan's exit 3. Reports gain additive `findings`,
+  `capabilities`, `invocation_edges`, and `parser` sections.
+
+Verification:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace          # 122 tests (feature off)
+cargo test --workspace --features omasafe-analyzer/qml-parser  # 122 (on)
+./scripts/generate-cli-assets.sh --check
+codex review iterated to COMMIT-READY across six rounds: provenance-only
+findings (co-occurrence removed), occurrence-complete comment-aware lexical
+scanning (quote-aware // stripping), scheme-exact edge rejection,
+digest-bound re-reads, fingerprint/capability inclusion, state semantics.
+```
+
+Known limitations: Process/FileView type matching is not import-qualified
+(same-named custom components can produce capability false positives);
+lexical mode judges only single-line spans (multi-line argument composition
+is AST-mode territory); `plugins analyze --fail-on` is exercised indirectly
+via scan-plugin tests; git-sourced CLI analysis is covered at the analyzer
+API level (production fetch is HTTPS-only, so local file:// URLs are rightly
+rejected end-to-end).
+
+Next: **v0.2 S4 — Full rule set and priority surfaces**.

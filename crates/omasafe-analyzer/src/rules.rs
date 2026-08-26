@@ -10,7 +10,7 @@ use serde::Serialize;
 
 /// Monotonic version of this catalog. Bump when rules are added, retired, or
 /// redefined; the policy identity changes with it.
-pub const RULE_CATALOG_VERSION: u32 = 1;
+pub const RULE_CATALOG_VERSION: u32 = 2;
 
 /// Monotonic version of the severity table. Severity or rule-meaning changes
 /// require a new version here.
@@ -185,6 +185,15 @@ pub const CATALOG: &[RuleDefinition] = &[
         "Flag download-and-execute chains and sensitive-data exfiltration edges.",
     ),
     qml_rule(
+        "oma.qml.dynamic-reference",
+        "QML loads content through a computed reference",
+        Capability::FilesystemAccess,
+        Severity::Low,
+        "safe relative entry-point paths",
+        "A Loader source or FileView path is computed at runtime instead of a literal.",
+        "Trace what flows into the reference; computed sinks evade static containment review.",
+    ),
+    qml_rule(
         "oma.qml.persistence-scheduling",
         "QML timer/service persistence",
         Capability::PersistenceScheduling,
@@ -329,6 +338,10 @@ mod tests {
         // mis-mapped or duplicated anchor cannot pass on count alone.
         let expected: &[(&str, &str)] = &[
             ("oma.qml.process-execution", "Quickshell.Io.Process"),
+            (
+                "oma.qml.dynamic-reference",
+                "safe relative entry-point paths",
+            ),
             ("oma.qml.detached-execution", "Quickshell.execDetached"),
             ("oma.qml.filesystem-access", "FileView"),
             ("oma.qml.network-access", "QML/Qt networking"),

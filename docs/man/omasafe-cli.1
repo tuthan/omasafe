@@ -1,4 +1,4 @@
-.TH OMASAFE-CLI 1 "2026-08-21" "OmaSafe 0.1.2" "User Commands"
+.TH OMASAFE-CLI 1 "2026-08-21" "OmaSafe 0.2.0" "User Commands"
 .SH NAME
 omasafe-cli \- local trust and drift review for Omarchy plugins
 .SH SYNOPSIS
@@ -44,12 +44,13 @@ Print the OmaSafe-owned capability rule catalog with severities, capabilities,
 and review guidance. The catalog is static and versioned through the analyzer
 policy identity.
 .TP
-.B plugins analyze PLUGIN_ID [--format text|json]
+.B plugins analyze PLUGIN_ID [--format text|json] [--fail-on SEVERITY]
 Inventory every shipped payload file of an installed plugin with type, mode,
 size, digest, executable bit, and explicit analysis coverage state. Exit
 status is 0 even when findings exist; CI policy uses --fail-on.
 .TP
 .B scan-plugin (--path DIR | --git URL --revision COMMIT) [--format text|json]
+    [--fail-on SEVERITY]
 Run the same bounded payload inventory against a local directory or a pinned
 immutable Git revision read as raw objects (no checkout, filters, hooks, or
 submodules). URLs carrying credentials are rejected.
@@ -73,6 +74,12 @@ The command failed.
 .TP
 .B 2
 Usage error: unrecognized top-level command.
+.TP
+.B 4
+Only for \fBplugins analyze\fR and \fBscan-plugin\fR with \fB--fail-on SEVERITY\fR:
+at least one finding met or exceeded the threshold. Findings are still a
+successful report; the exit code is the CI opt-in signal, separate from
+\fBscan\fR's actionable-result exit code 3.
 .TP
 .B 3
 The scan completed and actionable findings remain.

@@ -68,8 +68,9 @@ pub enum CoverageState {
     /// Fully inventoried, but no analyzer covers this language in the
     /// current policy. Never interpreted as clean behavior.
     Unsupported,
-    /// Fully analyzed and reachable analysis found nothing; reserved until
-    /// entry-point reference edges exist (S3). Never used before then.
+    /// Analyzers ran and produced neither findings nor capability
+    /// observations for this entry (S3 onward; never emitted before then).
+    /// Says "nothing was observed", not "nothing can be wrong".
     Unreferenced,
 }
 
@@ -105,6 +106,13 @@ pub struct PayloadEntry {
     pub coverage_state: CoverageState,
     /// Symlink target as stored, never followed.
     pub link_target: Option<String>,
+    /// True once an invocation edge from analyzed QML/JS points at this entry
+    /// (S3). Purely additive context; the coverage state still governs the
+    /// analysis meaning.
+    pub invocation_target: bool,
+    /// Git object id for pinned-revision ingestion, enabling bounded raw-blob
+    /// re-reads without a worktree. `None` for filesystem frontends.
+    pub object_id: Option<String>,
 }
 
 /// Aggregate view over one completed inventory pass.

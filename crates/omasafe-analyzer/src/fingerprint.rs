@@ -118,6 +118,29 @@ pub fn normalize_relative_path(path: &str) -> Result<String, NormalizationError>
     Ok(parts.join("/"))
 }
 
+/// Hex-encoded SHA-256 over the sorted canonical JSON of findings plus
+/// capability observations — every normalized semantic output participates,
+/// so a capability-only source change moves the fingerprint just like a
+/// finding does.
+pub fn fingerprint_analysis(
+    results: &[NormalizedResult],
+    capabilities: &[omasafe_report::analysis::CapabilityOccurrence],
+) -> String {
+    let mut sorted_results: Vec<&NormalizedResult> = results.iter().collect();
+    sorted_results.sort();
+    sorted_results.dedup();
+    let mut sorted_capabilities: Vec<&omasafe_report::analysis::CapabilityOccurrence> =
+        capabilities.iter().collect();
+    sorted_capabilities.sort();
+    sorted_capabilities.dedup();
+    let canonical = serde_json::to_vec(&serde_json::json!({
+        "results": sorted_results,
+        "capabilities": sorted_capabilities,
+    }))
+    .expect("normalized serialization cannot fail");
+    hex(&Sha256::digest(canonical))
+}
+
 /// Hex-encoded SHA-256 over the sorted canonical JSON array of results.
 ///
 /// Sorting plus set semantics (`dedup`) make the hash insensitive to emission

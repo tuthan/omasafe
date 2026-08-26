@@ -95,13 +95,9 @@ fn run(args: Vec<String>) -> Result<i32, Box<dyn std::error::Error>> {
             0
         }
         [command, subcommand, id, rest @ ..] if command == "plugins" && subcommand == "analyze" => {
-            plugins_analyze(id, rest)?;
-            0
+            plugins_analyze(id, rest)?
         }
-        [command, rest @ ..] if command == "scan-plugin" => {
-            scan_plugin(rest)?;
-            0
-        }
+        [command, rest @ ..] if command == "scan-plugin" => scan_plugin(rest)?,
         _ => {
             eprintln!(
                 "usage: omasafe-cli plugins ... | scan [--format text|json] [--notify] [--only-new] | marketplace refresh [--commit COMMIT|--latest] | rules list [--format text|json] | plugins analyze PLUGIN_ID [--format text|json] [--fail-on SEVERITY] | scan-plugin (--path DIR|--git URL --revision COMMIT) [--format text|json] | schedule install | paths | provenance [--format text|json]"
@@ -1500,7 +1496,7 @@ fn rules_list(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn plugins_analyze(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+fn plugins_analyze(id: &str, args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     let mut format = "text";
     let mut fail_on = None;
     let mut index = 0;
@@ -1512,8 +1508,7 @@ fn plugins_analyze(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::
             }
             "--fail-on" => {
                 let value = next_value(args, index, "--fail-on severity")?;
-                validate_fail_on(value)?;
-                fail_on = Some(value);
+                fail_on = Some(value.to_owned());
                 index += 2;
             }
             value => return Err(format!("unknown analyze argument: {value}").into()),
@@ -1522,11 +1517,7 @@ fn plugins_analyze(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::
     if !matches!(format, "text" | "json") {
         return Err("analyze format must be text or json".into());
     }
-    // Reserved for S3 when capability results exist; accepted and validated
-    // here so scripts can already pass it. With no findings emitted, it is a
-    // documented no-op.
-    let _ = fail_on;
-
+    let fail_on = parse_fail_on(fail_on)?;
     let plugin_root = plugin_root()?;
     let (shell_json, _shell_error) = query_shell();
     let inventory = collect_one(&plugin_root, id, shell_json.as_deref());
@@ -1547,11 +1538,16 @@ fn plugins_analyze(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::
         omasafe_analyzer::Limits::default(),
         omasafe_core::bounds::TimeBudget::default(),
     );
-    emit_analysis_report(target, ingest_result.map_err(Into::into), format)?;
-    Ok(())
+    emit_analysis_report(
+        target,
+        ingest_result.map_err(Into::into),
+        format,
+        fail_on,
+        ContentSource::Filesystem(PathBuf::from(&record.path)),
+    )
 }
 
-fn scan_plugin(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+fn scan_plugin(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     let mut format = "text";
     let mut fail_on = None;
     let mut path_target = None;
@@ -1566,8 +1562,7 @@ fn scan_plugin(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             "--fail-on" => {
                 let value = next_value(args, index, "--fail-on severity")?;
-                validate_fail_on(value)?;
-                fail_on = Some(value);
+                fail_on = Some(value.to_owned());
                 index += 2;
             }
             "--path" => {
@@ -1588,7 +1583,7 @@ fn scan_plugin(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if !matches!(format, "text" | "json") {
         return Err("scan-plugin format must be text or json".into());
     }
-    let _ = fail_on;
+    let fail_on = parse_fail_on(fail_on)?;
 
     match (path_target, git_url, revision) {
         (Some(path), None, None) => {
@@ -1599,7 +1594,13 @@ fn scan_plugin(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 omasafe_core::bounds::TimeBudget::default(),
             );
             match result {
-                Ok(inventory) => emit_analysis_report(target, Ok(inventory), format),
+                Ok(inventory) => emit_analysis_report(
+                    target,
+                    Ok(inventory),
+                    format,
+                    fail_on,
+                    ContentSource::Filesystem(PathBuf::from(&path)),
+                ),
                 Err(omasafe_analyzer::IngestError::NotADirectory) => {
                     Err("scan-plugin target is not a directory".into())
                 }
@@ -1621,7 +1622,13 @@ fn scan_plugin(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         omasafe_analyzer::Limits::default(),
                         omasafe_core::bounds::TimeBudget::default(),
                     );
-                    emit_analysis_report(target, result.map_err(Into::into), format)
+                    emit_analysis_report(
+                        target,
+                        result.map_err(Into::into),
+                        format,
+                        fail_on,
+                        ContentSource::GitRepository(repository_dir.clone()),
+                    )
                 }
                 Err(omasafe_analyzer::IngestError::InvalidRevision) => {
                     Err("scan-plugin --revision must be 40 or 64 hexadecimal characters".into())
@@ -1640,32 +1647,138 @@ fn scan_plugin(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn validate_fail_on(value: &str) -> Result<(), String> {
-    if matches!(value, "info" | "low" | "medium" | "high" | "critical") {
-        Ok(())
-    } else {
-        Err("--fail-on must be one of info|low|medium|high|critical".to_owned())
+fn parse_fail_on(value: Option<String>) -> Result<Option<omasafe_analyzer::Severity>, String> {
+    match value.as_deref() {
+        None => Ok(None),
+        Some("info") => Ok(Some(omasafe_analyzer::Severity::Info)),
+        Some("low") => Ok(Some(omasafe_analyzer::Severity::Low)),
+        Some("medium") => Ok(Some(omasafe_analyzer::Severity::Medium)),
+        Some("high") => Ok(Some(omasafe_analyzer::Severity::High)),
+        Some("critical") => Ok(Some(omasafe_analyzer::Severity::Critical)),
+        Some(_) => Err("--fail-on must be one of info|low|medium|high|critical".to_owned()),
     }
+}
+
+/// Where analyzed file contents come from during the detection pass.
+enum ContentSource {
+    Filesystem(PathBuf),
+    GitRepository(PathBuf),
+}
+
+/// Read at most `expected`+1 bytes so an overgrown file is detectable.
+fn read_capped(file: &std::fs::File, expected: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut buffer = Vec::new();
+    file.take(expected.saturating_add(1))
+        .read_to_end(&mut buffer)
+        .ok()?;
+    Some(buffer)
 }
 
 fn emit_analysis_report(
     target: serde_json::Value,
     ingest_result: Result<omasafe_analyzer::PayloadInventory, Box<dyn std::error::Error>>,
     format: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+    fail_on: Option<omasafe_analyzer::Severity>,
+    source: ContentSource,
+) -> Result<i32, Box<dyn std::error::Error>> {
     // Ingestion failures are command failures; only per-file degradation is
     // reported inside a successful inventory.
-    let inventory = ingest_result?;
+    let mut inventory = ingest_result?;
+
+    // Re-reads must return exactly the bytes that were inventoried: bounded
+    // by the recorded size, never following symlinks (filesystem source), and
+    // verified against the ingested digest so a race or drift degrades into a
+    // disclosed limitation instead of analyzing different content.
+    let read_content = |entry: &omasafe_analyzer::PayloadEntry| -> Option<Vec<u8>> {
+        if entry.sampled_digest || entry.sha256_sampled.is_none() {
+            // Sampled inventories have no full digest to verify against.
+            return None;
+        }
+        let expected_digest = entry.sha256_sampled.as_deref()?;
+        let bytes = match &source {
+            ContentSource::Filesystem(root) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    // O_NOFOLLOW rejects a swapped-in symlink; O_NONBLOCK
+                    // stops a swapped-in FIFO from blocking the open. The
+                    // fstat afterwards must confirm a regular file, closing
+                    // the device/socket/FIFO window; anything else fails
+                    // into a disclosed limitation.
+                    let file = std::fs::OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                        .open(root.join(&entry.relative_path))
+                        .ok()?;
+                    if !file.metadata().ok()?.is_file() {
+                        return None;
+                    }
+                    read_capped(&file, entry.size)
+                }
+                #[cfg(not(unix))]
+                {
+                    let file = std::fs::File::open(root.join(&entry.relative_path)).ok()?;
+                    if !file.metadata().ok()?.is_file() {
+                        return None;
+                    }
+                    read_capped(&file, entry.size)
+                }
+            }
+            ContentSource::GitRepository(repository_dir) => {
+                let oid = entry.object_id.as_deref()?;
+                let mut command = std::process::Command::new("git");
+                command.current_dir(repository_dir);
+                command.args(["cat-file", "blob", oid]);
+                command.env("GIT_CONFIG_GLOBAL", "/dev/null");
+                command.env("GIT_CONFIG_SYSTEM", "/dev/null");
+                let captured = omasafe_core::bounds::run_bounded_capped(
+                    &mut command,
+                    omasafe_core::bounds::GIT_PROCESS_BUDGET,
+                    entry.size as usize + 1,
+                )
+                .ok()??;
+                if captured.truncated || !captured.status.success() {
+                    return None;
+                }
+                Some(captured.stdout)
+            }
+        }?;
+        if bytes.len() as u64 != entry.size {
+            return None;
+        }
+        use sha2::Digest as _;
+        let digest = sha2::Sha256::digest(&bytes);
+        let hex_digest: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        (hex_digest == expected_digest).then_some(bytes)
+    };
+
+    let budget = omasafe_core::bounds::TimeBudget::default();
+    let artifacts = omasafe_analyzer::analyze_inventory(&mut inventory, &read_content, &budget);
+    let findings = artifacts.rendered_findings();
 
     let policy_identity = omasafe_analyzer::policy_identity();
-    // S1 emits no capability results; the fingerprint over an empty normalized
-    // result set stays constant until detectors land in S2/S3.
-    let fingerprint = omasafe_analyzer::fingerprint_results(&[]);
+    let fingerprint =
+        omasafe_analyzer::fingerprint_analysis(&artifacts.results, &artifacts.capabilities);
+    let mut coverage_limitations = inventory.limitations.clone();
+    coverage_limitations.extend(artifacts.limitations.clone());
     let analysis = omasafe_report::analysis::AnalysisSection::new(
         policy_identity.clone(),
         fingerprint,
-        inventory.limitations.clone(),
+        coverage_limitations,
+        findings.clone(),
+        artifacts.capabilities.clone(),
+        artifacts.edges.clone(),
+        omasafe_analyzer::parser_metadata(),
     );
+
+    // --fail-on: findings are success; CI opts into a failure threshold.
+    // Exit code 4 (documented separately from scan's actionable-result 3).
+    let threshold_breached = fail_on.is_some_and(|threshold| {
+        artifacts
+            .max_severity()
+            .is_some_and(|severity| severity >= threshold)
+    });
 
     let states = serde_json::json!({
         "analyzed": inventory.state_count(omasafe_analyzer::CoverageState::Analyzed),
@@ -1739,8 +1852,58 @@ fn emit_analysis_report(
         for limitation in &inventory.limitations {
             println!("Coverage limitation: {}", safe_text(limitation));
         }
+        println!("Findings: {}", findings.len());
+        const TEXT_FINDING_CAP: usize = 100;
+        for finding in findings.iter().take(TEXT_FINDING_CAP) {
+            let location = finding
+                .line
+                .map(|line| format!(":{line}"))
+                .unwrap_or_default();
+            let evidence: String = safe_text(&finding.evidence).chars().take(80).collect();
+            println!(
+                "{}\t{}\t{}{}\t{}",
+                finding.severity,
+                finding.rule_id,
+                safe_text(&finding.relative_path),
+                location,
+                evidence
+            );
+        }
+        if findings.len() > TEXT_FINDING_CAP {
+            println!(
+                "… {} more findings omitted from the text view; use --format json",
+                findings.len() - TEXT_FINDING_CAP
+            );
+        }
+        if !artifacts.capabilities.is_empty() {
+            println!("Capabilities observed: {}", artifacts.capabilities.len());
+            const TEXT_CAPABILITY_CAP: usize = 100;
+            for capability in artifacts.capabilities.iter().take(TEXT_CAPABILITY_CAP) {
+                let detail: String = safe_text(&capability.detail).chars().take(60).collect();
+                println!(
+                    "{}\t{}\t{}",
+                    capability.capability,
+                    safe_text(&capability.relative_path),
+                    detail
+                );
+            }
+        }
+        if !artifacts.edges.is_empty() {
+            println!("Invocation edges: {}", artifacts.edges.len());
+            for edge in &artifacts.edges {
+                println!(
+                    "{} -> {}",
+                    safe_text(&edge.from_path),
+                    safe_text(&edge.target_path)
+                );
+            }
+        }
     }
-    Ok(())
+
+    // Findings are still success (the report printed above); the exit code
+    // is the CI opt-in signal, distinct from scan's 3. Returned through the
+    // normal path so stdout flushes like any other run.
+    Ok(if threshold_breached { 4 } else { 0 })
 }
 
 fn print_paths() -> Result<(), Box<dyn std::error::Error>> {

