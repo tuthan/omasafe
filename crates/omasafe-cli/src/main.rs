@@ -94,13 +94,17 @@ fn run(args: Vec<String>) -> Result<i32, Box<dyn std::error::Error>> {
             rules_list(rest)?;
             0
         }
+        [command, subcommand, id, rest @ ..] if command == "rules" && subcommand == "explain" => {
+            rules_explain(id, rest)?;
+            0
+        }
         [command, subcommand, id, rest @ ..] if command == "plugins" && subcommand == "analyze" => {
             plugins_analyze(id, rest)?
         }
         [command, rest @ ..] if command == "scan-plugin" => scan_plugin(rest)?,
         _ => {
             eprintln!(
-                "usage: omasafe-cli plugins ... | scan [--format text|json] [--notify] [--only-new] | marketplace refresh [--commit COMMIT|--latest] | rules list [--format text|json] | plugins analyze PLUGIN_ID [--format text|json] [--fail-on SEVERITY] | scan-plugin (--path DIR|--git URL --revision COMMIT) [--format text|json] | schedule install | paths | provenance [--format text|json]"
+                "usage: omasafe-cli plugins ... | scan [--format text|json] [--notify] [--only-new] | marketplace refresh [--commit COMMIT|--latest] | rules list [--format text|json] | rules explain RULE_ID [--format text|json] | plugins analyze PLUGIN_ID [--format text|json] [--fail-on SEVERITY] | scan-plugin (--path DIR|--git URL --revision COMMIT) [--format text|json] | schedule install | paths | provenance [--format text|json]"
             );
             std::process::exit(2);
         }
@@ -299,6 +303,7 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
     let mut format = "text";
     let mut notify = false;
     let mut only_new = false;
+    let mut include_analysis = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -308,6 +313,10 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
             }
             "--only-new" => {
                 only_new = true;
+                index += 1;
+            }
+            "--include-analysis" => {
+                include_analysis = true;
                 index += 1;
             }
             "--format" => {
@@ -671,8 +680,200 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
             }
         }
     }
+    // Opt-in analysis events (S5): source drift, analyzer-policy updates,
+    // and fingerprint instability are DISTINCT signals with distinct
+    // wording. Default scans never touch this path. Registry/correlation
+    // claims cannot clear any of them: classification reads only local
+    // identities and locally computed fingerprints. Suppressions do not
+    // participate — event classification uses the full stored reality.
+    let mut analysis_events_dirty = false;
+    if include_analysis {
+        // Canonical JSON form (alphabetical object keys via Value) so stored
+        // identities compare stably regardless of struct field order.
+        let policy_string =
+            serde_json::to_string(&serde_json::to_value(omasafe_analyzer::policy_identity())?)?;
+        for plugin in &inventory.plugins {
+            let source_identity = plugin
+                .content_digest
+                .clone()
+                .or_else(|| plugin.tree.clone())
+                .unwrap_or_default();
+            let ingest = omasafe_analyzer::ingest_filesystem(
+                Path::new(&plugin.path),
+                omasafe_analyzer::Limits::default(),
+                omasafe_core::bounds::TimeBudget::default(),
+            );
+            let mut plugin_inventory = match ingest {
+                Ok(plugin_inventory) => plugin_inventory,
+                Err(error) => {
+                    emit_scan_alert(
+                        format!("analysis:{}:unavailable", plugin.id),
+                        plugin.id.clone(),
+                        "lost-coverage",
+                        "warning",
+                        format!("installed plugin could not be analyzed: {error}"),
+                        false,
+                        notify,
+                        only_new,
+                        &mut live_keys,
+                        &mut alerts,
+                        &mut new_alerts,
+                        &mut state,
+                        &mut highest_severity,
+                    );
+                    continue;
+                }
+            };
+            let reader = pinned_filesystem_reader(PathBuf::from(&plugin.path));
+            let budget = omasafe_core::bounds::TimeBudget::default();
+            let artifacts =
+                omasafe_analyzer::analyze_inventory(&mut plugin_inventory, &reader, &budget);
+            let fingerprint =
+                omasafe_analyzer::fingerprint_analysis(&artifacts.results, &artifacts.capabilities);
+            let finding_rule_ids: Vec<String> = artifacts
+                .rendered_findings()
+                .into_iter()
+                .map(|finding| finding.rule_id)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let capability_kinds: Vec<String> = artifacts
+                .capabilities
+                .iter()
+                .map(|capability| capability.capability.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+
+            let previous = state.analysis_events.get(&plugin.id).cloned();
+            let class_event: Option<(&str, &str, String)> = match &previous {
+                // First observation is a quiet baseline.
+                None => None,
+                Some(previous) if previous.source_identity != source_identity => {
+                    // Source drift is already alerted by the source-drift
+                    // section; refresh the baseline so policy/fingerprint
+                    // classes never mask or double-report drift.
+                    None
+                }
+                Some(previous) if previous.policy_identity != policy_string => Some((
+                    "analyzer-policy-update",
+                    "warning",
+                    "analyzer policy changed since the last evaluation; findings \
+                     and capabilities were re-evaluated under the new policy"
+                        .to_owned(),
+                )),
+                Some(previous) if previous.fingerprint != fingerprint => Some((
+                    "fingerprint-instability",
+                    "error",
+                    "analysis fingerprint changed while source identity and policy \
+                     identity stayed identical; nondeterminism is suspected and \
+                     review is required"
+                        .to_owned(),
+                )),
+                Some(_) => None,
+            };
+
+            if let (Some(previous), None) = (&previous, &class_event) {
+                // Identity-clean comparison round: report capability/rule
+                // growth against the stored snapshot.
+                let added_capabilities: Vec<String> = capability_kinds
+                    .iter()
+                    .filter(|kind| !previous.capability_kinds.contains(kind))
+                    .cloned()
+                    .collect();
+                if !added_capabilities.is_empty() && !previous.capability_kinds.is_empty() {
+                    emit_scan_alert(
+                        format!(
+                            "analysis:{}:new-capability:{}",
+                            plugin.id,
+                            added_capabilities.join(",")
+                        ),
+                        plugin.id.clone(),
+                        "new-capability",
+                        "warning",
+                        format!(
+                            "analysis observed new capabilities since the last \
+                             evaluation: {}",
+                            added_capabilities.join(", ")
+                        ),
+                        false,
+                        notify,
+                        only_new,
+                        &mut live_keys,
+                        &mut alerts,
+                        &mut new_alerts,
+                        &mut state,
+                        &mut highest_severity,
+                    );
+                }
+                let added_rules: Vec<String> = finding_rule_ids
+                    .iter()
+                    .filter(|rule| !previous.finding_rule_ids.contains(rule))
+                    .cloned()
+                    .collect();
+                if !added_rules.is_empty() && !previous.finding_rule_ids.is_empty() {
+                    emit_scan_alert(
+                        format!(
+                            "analysis:{}:finding-regression:{}",
+                            plugin.id,
+                            added_rules.join(",")
+                        ),
+                        plugin.id.clone(),
+                        "finding-regression",
+                        "warning",
+                        format!(
+                            "analysis produced new findings since the last \
+                             evaluation: {}",
+                            added_rules.join(", ")
+                        ),
+                        false,
+                        notify,
+                        only_new,
+                        &mut live_keys,
+                        &mut alerts,
+                        &mut new_alerts,
+                        &mut state,
+                        &mut highest_severity,
+                    );
+                }
+            }
+            if let Some((kind, severity, message)) = class_event {
+                emit_scan_alert(
+                    format!(
+                        "analysis:{plugin_id}:{kind}",
+                        plugin_id = plugin.id,
+                        kind = kind
+                    ),
+                    plugin.id.clone(),
+                    kind,
+                    severity,
+                    message,
+                    false,
+                    notify,
+                    only_new,
+                    &mut live_keys,
+                    &mut alerts,
+                    &mut new_alerts,
+                    &mut state,
+                    &mut highest_severity,
+                );
+            }
+
+            state.analysis_events.insert(
+                plugin.id.clone(),
+                omasafe_plugin_trust::baseline::AnalysisEventRecord {
+                    source_identity,
+                    policy_identity: policy_string.clone(),
+                    fingerprint,
+                    finding_rule_ids,
+                    capability_kinds,
+                },
+            );
+            analysis_events_dirty = true;
+        }
+    }
     state.alerts.retain(|key, _| live_keys.contains(key));
-    if notify {
+    if notify || analysis_events_dirty {
         state.write_atomic_locked(&state_path)?;
     }
     let result = ScanResult {
@@ -708,6 +909,45 @@ fn track_highest_severity(current: &mut &'static str, alert: &ScanAlert) {
         *current = "critical";
     } else if *current == "none" && !alert.severity.is_empty() {
         *current = "warning";
+    }
+}
+
+/// One scan-alert emission with the standard dedup/notify/only-new flow.
+#[allow(clippy::too_many_arguments)]
+fn emit_scan_alert(
+    key: String,
+    plugin_id: String,
+    kind: &str,
+    severity: &str,
+    message: String,
+    post_change: bool,
+    notify: bool,
+    only_new: bool,
+    live_keys: &mut BTreeSet<String>,
+    alerts: &mut Vec<ScanAlert>,
+    new_alerts: &mut Vec<ScanAlert>,
+    state: &mut ScanState,
+    highest_severity: &mut &'static str,
+) {
+    live_keys.insert(key.clone());
+    let alert = ScanAlert {
+        plugin_id,
+        kind: kind.to_owned(),
+        severity: severity.to_owned(),
+        message,
+        post_change,
+    };
+    track_highest_severity(highest_severity, &alert);
+    let is_new = state.is_new(&key);
+    if is_new {
+        new_alerts.push(alert.clone());
+    }
+    if is_new && notify {
+        notify_user(&alert);
+        state.record(key, now());
+    }
+    if !only_new || is_new {
+        alerts.push(alert);
     }
 }
 
@@ -822,6 +1062,8 @@ fn review(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut expected_tree = None;
     let mut expected_digest = None;
     let mut restore_to = None;
+    let mut rule = None;
+    let mut suppression_path = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -857,6 +1099,15 @@ fn review(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 restore_to = Some(next_value(args, index, "restore target")?.to_owned());
                 index += 2;
             }
+            "--rule" => {
+                rule = Some(next_value(args, index, "suppression rule id")?.to_owned());
+                index += 2;
+            }
+            "--path" => {
+                suppression_path =
+                    Some(next_value(args, index, "suppression path scope")?.to_owned());
+                index += 2;
+            }
             value => return Err(format!("unknown review argument: {value}").into()),
         }
     }
@@ -868,6 +1119,18 @@ fn review(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         value => value.to_owned(),
     };
     let reason = reason.ok_or("--reason is required")?;
+    // Suppression decisions live outside the trust-history flow entirely:
+    // they are scoped analysis-acceptance records in XDG config, never
+    // overloads of the source-drift/missing-plugin/lost-coverage enum.
+    if matches!(action.as_str(), "suppress" | "reinstate") {
+        return suppression_review(
+            id,
+            &action,
+            rule.as_deref(),
+            suppression_path.as_deref(),
+            &reason,
+        );
+    }
     let scope = scope.unwrap_or_else(|| {
         if action == "acknowledge" {
             "source-drift".into()
@@ -956,6 +1219,67 @@ fn review(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     history.write_atomic_locked(&path)?;
     println!("Review decision recorded in {}", path.display());
+    Ok(())
+}
+
+/// `plugins review ID --action suppress|reinstate`: scoped analysis
+/// suppressions in XDG config. Records are plugin-targeted (created here)
+/// with an optional path scope inside the plugin; the store itself also
+/// supports global path-only records for plugin-less contexts.
+fn suppression_review(
+    plugin_id: &str,
+    action: &str,
+    rule_id: Option<&str>,
+    path_scope: Option<&str>,
+    reason: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let rule_id = rule_id.ok_or("suppress/reinstate requires --rule RULE_ID")?;
+    if action == "suppress"
+        && !omasafe_analyzer::catalog()
+            .iter()
+            .any(|definition| definition.id == rule_id)
+    {
+        return Err(format!(
+            "unknown rule id: {rule_id}; see `omasafe-cli rules list` for the catalog"
+        )
+        .into());
+    }
+    omasafe_core::suppress::validate_new(rule_id, reason, path_scope)?;
+    let paths = XdgPaths::discover()?;
+    paths.ensure()?;
+    let path = paths.config.join("suppressions.json");
+    let _lock = omasafe_core::suppress::acquire_lock(&path)?;
+    let mut state = omasafe_core::suppress::SuppressionState::load(&path)?;
+    match action {
+        "suppress" => {
+            state.add(omasafe_core::suppress::SuppressionRecord {
+                rule_id: rule_id.to_owned(),
+                plugin_id: Some(plugin_id.to_owned()),
+                path_scope: path_scope.map(str::to_owned),
+                reason: reason.to_owned(),
+                created_at: now(),
+                active: true,
+                reinstated_at: None,
+            });
+            state.write_atomic_locked(&path)?;
+            println!("Suppression recorded in {}", path.display());
+        }
+        "reinstate" => {
+            let flipped = state.reinstate(rule_id, Some(plugin_id), path_scope);
+            if flipped == 0 {
+                return Err(format!(
+                    "no active suppression matches rule {rule_id} for {plugin_id} at that scope"
+                )
+                .into());
+            }
+            state.write_atomic_locked(&path)?;
+            println!(
+                "Reinstated {flipped} suppression record(s) in {}; audit trail preserved",
+                path.display()
+            );
+        }
+        _ => unreachable!("action filtered by caller"),
+    }
     Ok(())
 }
 
@@ -1496,6 +1820,81 @@ fn rules_list(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn rules_explain(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut format = "text";
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--format" => {
+                format = next_value(args, index, "explain format")?;
+                index += 2;
+            }
+            value => return Err(format!("unknown rules explain argument: {value}").into()),
+        }
+    }
+    if !matches!(format, "text" | "json") {
+        return Err("rules explain format must be text or json".into());
+    }
+    let definition = omasafe_analyzer::catalog()
+        .iter()
+        .find(|definition| definition.id == id)
+        .ok_or_else(|| {
+            format!("unknown rule id: {id}; see `omasafe-cli rules list` for the catalog")
+        })?;
+    let map = omasafe_analyzer::EquivalenceMap::embedded();
+    let external_ids = map.external_ids_for_rule(definition.id);
+    if format == "json" {
+        let result = serde_json::json!({
+            "policy_identity": omasafe_analyzer::policy_identity(),
+            "rule": definition,
+            "external_equivalences": external_ids
+                .iter()
+                .map(|external_id| {
+                    map.entries
+                        .iter()
+                        .find(|entry| {
+                            entry.oma_rule_id.as_deref() == Some(definition.id)
+                                && entry.external_id == *external_id
+                        })
+                        .expect("listed external id comes from a map entry")
+                })
+                .collect::<Vec<_>>(),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&Report::new(TOOL_VERSION, now(), result))?
+        );
+    } else {
+        println!(
+            "{}  [{}] {}",
+            definition.id, definition.language, definition.title
+        );
+        println!(
+            "severity:{}  capability:{}",
+            definition.default_severity, definition.capability
+        );
+        println!("{}", definition.summary);
+        println!("Surface anchor: {}", definition.surface_anchor);
+        println!("Guidance: {}", definition.review_guidance);
+        if external_ids.is_empty() {
+            println!("Marketplace baseline: no direct equivalence recorded");
+        } else {
+            println!("Marketplace baseline coverage:");
+            for entry in map
+                .entries
+                .iter()
+                .filter(|entry| entry.oma_rule_id.as_deref() == Some(definition.id))
+            {
+                println!(
+                    "  {} {} — {}",
+                    entry.relation, entry.external_id, entry.note
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn plugins_analyze(id: &str, args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     let mut format = "text";
     let mut fail_on = None;
@@ -1544,6 +1943,7 @@ fn plugins_analyze(id: &str, args: &[String]) -> Result<i32, Box<dyn std::error:
         format,
         fail_on,
         ContentSource::Filesystem(PathBuf::from(&record.path)),
+        Some(id),
     )
 }
 
@@ -1600,6 +2000,7 @@ fn scan_plugin(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
                     format,
                     fail_on,
                     ContentSource::Filesystem(PathBuf::from(&path)),
+                    None,
                 ),
                 Err(omasafe_analyzer::IngestError::NotADirectory) => {
                     Err("scan-plugin target is not a directory".into())
@@ -1628,6 +2029,7 @@ fn scan_plugin(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
                         format,
                         fail_on,
                         ContentSource::GitRepository(repository_dir.clone()),
+                        None,
                     )
                 }
                 Err(omasafe_analyzer::IngestError::InvalidRevision) => {
@@ -1664,6 +2066,9 @@ enum ContentSource {
     Filesystem(PathBuf),
     GitRepository(PathBuf),
 }
+
+/// Digest-bound content readers, boxed per source at the emit boundary.
+type ContentReader = Box<dyn Fn(&omasafe_analyzer::PayloadEntry) -> Option<Vec<u8>>>;
 
 /// Most-common `verificationBaselineVersion` across the locally cached frozen
 /// catalog snapshot, used only for equivalence staleness marking. `None` when
@@ -1712,12 +2117,93 @@ fn read_capped(file: &std::fs::File, expected: u64) -> Option<Vec<u8>> {
     Some(buffer)
 }
 
+/// Digest-bound filesystem content reader: bounded by the recorded size,
+/// never following symlinks, and verified against the ingested sample digest.
+/// Sampled entries have no full digest to verify against and read as `None`.
+fn pinned_filesystem_reader(
+    root: PathBuf,
+) -> impl Fn(&omasafe_analyzer::PayloadEntry) -> Option<Vec<u8>> {
+    move |entry: &omasafe_analyzer::PayloadEntry| -> Option<Vec<u8>> {
+        if entry.sampled_digest || entry.sha256_sampled.is_none() {
+            return None;
+        }
+        let bytes = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                // O_NOFOLLOW rejects a swapped-in symlink; O_NONBLOCK stops a
+                // swapped-in FIFO from blocking the open. The fstat afterwards
+                // must confirm a regular file, closing the device/socket/FIFO
+                // window; anything else fails into a disclosed limitation.
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                    .open(root.join(&entry.relative_path))
+                    .ok()?;
+                if !file.metadata().ok()?.is_file() {
+                    return None;
+                }
+                read_capped(&file, entry.size)
+            }
+            #[cfg(not(unix))]
+            {
+                let file = std::fs::File::open(root.join(&entry.relative_path)).ok()?;
+                if !file.metadata().ok()?.is_file() {
+                    return None;
+                }
+                read_capped(&file, entry.size)
+            }
+        }?;
+        verify_entry_bytes(entry, bytes)
+    }
+}
+
+/// Digest-bound git content reader: bounded cat-file by object id with
+/// truncation/status checks against the ingested inventory record.
+fn pinned_git_reader(
+    repository_dir: PathBuf,
+) -> impl Fn(&omasafe_analyzer::PayloadEntry) -> Option<Vec<u8>> {
+    move |entry: &omasafe_analyzer::PayloadEntry| -> Option<Vec<u8>> {
+        if entry.sampled_digest || entry.object_id.is_none() || entry.sha256_sampled.is_none() {
+            return None;
+        }
+        let oid = entry.object_id.as_deref()?;
+        let mut command = std::process::Command::new("git");
+        command.current_dir(&repository_dir);
+        command.args(["cat-file", "blob", oid]);
+        command.env("GIT_CONFIG_GLOBAL", "/dev/null");
+        command.env("GIT_CONFIG_SYSTEM", "/dev/null");
+        let captured = omasafe_core::bounds::run_bounded_capped(
+            &mut command,
+            omasafe_core::bounds::GIT_PROCESS_BUDGET,
+            entry.size as usize + 1,
+        )
+        .ok()??;
+        if captured.truncated || !captured.status.success() {
+            return None;
+        }
+        verify_entry_bytes(entry, captured.stdout)
+    }
+}
+
+fn verify_entry_bytes(entry: &omasafe_analyzer::PayloadEntry, bytes: Vec<u8>) -> Option<Vec<u8>> {
+    if bytes.len() as u64 != entry.size {
+        return None;
+    }
+    use sha2::Digest as _;
+    let expected_digest = entry.sha256_sampled.as_deref()?;
+    let digest = sha2::Sha256::digest(&bytes);
+    let hex_digest: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    (hex_digest == expected_digest).then_some(bytes)
+}
+
 fn emit_analysis_report(
     target: serde_json::Value,
     ingest_result: Result<omasafe_analyzer::PayloadInventory, Box<dyn std::error::Error>>,
     format: &str,
     fail_on: Option<omasafe_analyzer::Severity>,
     source: ContentSource,
+    plugin_context: Option<&str>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
     // Ingestion failures are command failures; only per-file degradation is
     // reported inside a successful inventory.
@@ -1727,78 +2213,61 @@ fn emit_analysis_report(
     // by the recorded size, never following symlinks (filesystem source), and
     // verified against the ingested digest so a race or drift degrades into a
     // disclosed limitation instead of analyzing different content.
-    let read_content = |entry: &omasafe_analyzer::PayloadEntry| -> Option<Vec<u8>> {
-        if entry.sampled_digest || entry.sha256_sampled.is_none() {
-            // Sampled inventories have no full digest to verify against.
-            return None;
+    let read_content: ContentReader = match &source {
+        ContentSource::Filesystem(root) => Box::new(pinned_filesystem_reader(root.clone())),
+        ContentSource::GitRepository(repository_dir) => {
+            Box::new(pinned_git_reader(repository_dir.clone()))
         }
-        let expected_digest = entry.sha256_sampled.as_deref()?;
-        let bytes = match &source {
-            ContentSource::Filesystem(root) => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    // O_NOFOLLOW rejects a swapped-in symlink; O_NONBLOCK
-                    // stops a swapped-in FIFO from blocking the open. The
-                    // fstat afterwards must confirm a regular file, closing
-                    // the device/socket/FIFO window; anything else fails
-                    // into a disclosed limitation.
-                    let file = std::fs::OpenOptions::new()
-                        .read(true)
-                        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                        .open(root.join(&entry.relative_path))
-                        .ok()?;
-                    if !file.metadata().ok()?.is_file() {
-                        return None;
-                    }
-                    read_capped(&file, entry.size)
-                }
-                #[cfg(not(unix))]
-                {
-                    let file = std::fs::File::open(root.join(&entry.relative_path)).ok()?;
-                    if !file.metadata().ok()?.is_file() {
-                        return None;
-                    }
-                    read_capped(&file, entry.size)
-                }
-            }
-            ContentSource::GitRepository(repository_dir) => {
-                let oid = entry.object_id.as_deref()?;
-                let mut command = std::process::Command::new("git");
-                command.current_dir(repository_dir);
-                command.args(["cat-file", "blob", oid]);
-                command.env("GIT_CONFIG_GLOBAL", "/dev/null");
-                command.env("GIT_CONFIG_SYSTEM", "/dev/null");
-                let captured = omasafe_core::bounds::run_bounded_capped(
-                    &mut command,
-                    omasafe_core::bounds::GIT_PROCESS_BUDGET,
-                    entry.size as usize + 1,
-                )
-                .ok()??;
-                if captured.truncated || !captured.status.success() {
-                    return None;
-                }
-                Some(captured.stdout)
-            }
-        }?;
-        if bytes.len() as u64 != entry.size {
-            return None;
-        }
-        use sha2::Digest as _;
-        let digest = sha2::Sha256::digest(&bytes);
-        let hex_digest: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-        (hex_digest == expected_digest).then_some(bytes)
     };
 
     let budget = omasafe_core::bounds::TimeBudget::default();
     let artifacts = omasafe_analyzer::analyze_inventory(&mut inventory, &read_content, &budget);
-    let findings = artifacts.rendered_findings();
+    let rendered = artifacts.rendered_findings();
+
+    // Suppressions are presentation/enforcement filters over the RENDERED
+    // findings only. Stored results, capabilities, invocation edges, and the
+    // analysis fingerprint were computed before this point and never change;
+    // a suppression hides and de-enforces a finding but leaves every stored
+    // artifact byte-identical. An unreadable suppressions file fails open
+    // toward MORE visibility and is disclosed as a limitation.
+    let suppressions_path = XdgPaths::discover()
+        .ok()
+        .map(|paths| paths.config.join("suppressions.json"));
+    let (suppressions, suppressions_limitation) = match suppressions_path
+        .as_deref()
+        .map(omasafe_core::suppress::SuppressionState::load)
+    {
+        Some(Ok(state)) => (state, None),
+        Some(Err(error)) => (
+            omasafe_core::suppress::SuppressionState::default(),
+            Some(format!("suppressions-unreadable:{error}")),
+        ),
+        None => (omasafe_core::suppress::SuppressionState::default(), None),
+    };
+    let mut applied_suppressions: Vec<serde_json::Value> = Vec::new();
+    let findings: Vec<_> = rendered
+        .into_iter()
+        .filter(|finding| {
+            let hit =
+                suppressions.matches(&finding.rule_id, plugin_context, &finding.relative_path);
+            if hit {
+                applied_suppressions.push(serde_json::json!({
+                    "rule_id": finding.rule_id,
+                    "relative_path": finding.relative_path,
+                }));
+            }
+            !hit
+        })
+        .collect();
 
     let policy_identity = omasafe_analyzer::policy_identity();
     let fingerprint =
         omasafe_analyzer::fingerprint_analysis(&artifacts.results, &artifacts.capabilities);
     let mut coverage_limitations = inventory.limitations.clone();
     coverage_limitations.extend(artifacts.limitations.clone());
+    if let Some(limitation) = suppressions_limitation {
+        coverage_limitations.push(limitation);
+    }
 
     // Equivalence summary + staleness against the locally cached snapshot's
     // recorded baseline version (most common value across entries).
@@ -1830,11 +2299,20 @@ fn emit_analysis_report(
     );
 
     // --fail-on: findings are success; CI opts into a failure threshold.
-    // Exit code 4 (documented separately from scan's actionable-result 3).
+    // Suppressed findings are de-enforced, so the threshold only sees
+    // visible findings. Exit code 4 (documented separately from scan's 3).
+    let severity_of = |value: &str| match value {
+        "info" => Some(omasafe_analyzer::Severity::Info),
+        "low" => Some(omasafe_analyzer::Severity::Low),
+        "medium" => Some(omasafe_analyzer::Severity::Medium),
+        "high" => Some(omasafe_analyzer::Severity::High),
+        "critical" => Some(omasafe_analyzer::Severity::Critical),
+        _ => None,
+    };
     let threshold_breached = fail_on.is_some_and(|threshold| {
-        artifacts
-            .max_severity()
-            .is_some_and(|severity| severity >= threshold)
+        findings.iter().any(|finding| {
+            severity_of(&finding.severity).is_some_and(|severity| severity >= threshold)
+        })
     });
 
     let states = serde_json::json!({
@@ -1850,6 +2328,10 @@ fn emit_analysis_report(
         let result = serde_json::json!({
             "target": target,
             "analysis": analysis,
+            "suppressions": {
+                "applied": applied_suppressions,
+                "active_records": suppressions.active().count(),
+            },
             "payload_inventory": {
                 "totals": {
                     "files_seen": inventory.total_files_seen,
@@ -1908,6 +2390,16 @@ fn emit_analysis_report(
         }
         for limitation in &coverage_limitations {
             println!("Coverage limitation: {}", safe_text(limitation));
+        }
+        if !applied_suppressions.is_empty() {
+            println!("Suppressions applied: {}", applied_suppressions.len());
+            for applied in &applied_suppressions {
+                println!(
+                    "  suppressed\t{}\t{}",
+                    applied["rule_id"].as_str().unwrap_or("?"),
+                    applied["relative_path"].as_str().unwrap_or("?")
+                );
+            }
         }
         println!("Findings: {}", findings.len());
         const TEXT_FINDING_CAP: usize = 100;

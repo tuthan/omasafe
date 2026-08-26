@@ -67,6 +67,25 @@ pub struct ScanState {
     pub schema_version: u64,
     #[serde(default)]
     pub alerts: BTreeMap<String, String>,
+    /// Per-plugin last-analysis snapshot for S5 event separation
+    /// (additive; older state files load without it).
+    #[serde(default)]
+    pub analysis_events: BTreeMap<String, AnalysisEventRecord>,
+}
+
+/// What the last opted-in analysis of a plugin observed. Source identity,
+/// policy identity, and fingerprint together drive the distinct-event
+/// classification: source changed = drift, policy changed = re-evaluation,
+/// both unchanged but fingerprint moved = nondeterminism error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnalysisEventRecord {
+    pub source_identity: String,
+    pub policy_identity: String,
+    pub fingerprint: String,
+    #[serde(default)]
+    pub finding_rule_ids: Vec<String>,
+    #[serde(default)]
+    pub capability_kinds: Vec<String>,
 }
 
 impl Default for TrustHistory {
@@ -85,6 +104,7 @@ impl Default for ScanState {
         Self {
             schema_version: HISTORY_SCHEMA_VERSION,
             alerts: BTreeMap::new(),
+            analysis_events: BTreeMap::new(),
         }
     }
 }
@@ -172,6 +192,7 @@ impl ScanState {
             return Ok(Self {
                 schema_version: HISTORY_SCHEMA_VERSION,
                 alerts: BTreeMap::new(),
+                analysis_events: BTreeMap::new(),
             });
         }
         let state: Self =

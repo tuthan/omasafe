@@ -1283,3 +1283,500 @@ fn plugins_analyze_fail_on_returns_threshold_exit_code() {
         "medium"
     );
 }
+
+#[test]
+fn suppression_hides_finding_and_de_enforces_without_touching_stored_analysis() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.plugin.join("main.qml"),
+        "Process { command: [\"sh\", \"-c\", \"ls\"] }\n",
+    )
+    .unwrap();
+
+    // Baseline: the medium finding trips a low threshold (exit 4).
+    let output = fixture
+        .command()
+        .args([
+            "plugins",
+            "analyze",
+            "io.example.cli",
+            "--format",
+            "json",
+            "--fail-on",
+            "low",
+        ])
+        .assert()
+        .code(4)
+        .get_output()
+        .stdout
+        .clone();
+    let baseline: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(
+        baseline["result"]["analysis"]["findings"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let baseline_fingerprint = baseline["result"]["analysis"]["analysis_fingerprint"].clone();
+
+    // Suppress the rule for this plugin.
+    fixture
+        .command()
+        .args([
+            "plugins",
+            "review",
+            "io.example.cli",
+            "--action",
+            "suppress",
+            "--rule",
+            "oma.qml.process-execution",
+            "--reason",
+            "reviewed: launcher pattern is expected here",
+            "--yes",
+        ])
+        .assert()
+        .success();
+
+    // The finding is hidden AND de-enforced, while every stored analysis
+    // artifact stays byte-identical.
+    let output = fixture
+        .command()
+        .args([
+            "plugins",
+            "analyze",
+            "io.example.cli",
+            "--format",
+            "json",
+            "--fail-on",
+            "low",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let suppressed: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(
+        suppressed["result"]["analysis"]["findings"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        suppressed["result"]["analysis"]["analysis_fingerprint"], baseline_fingerprint,
+        "suppressions never alter stored findings"
+    );
+    assert_eq!(
+        suppressed["result"]["analysis"]["capabilities"],
+        baseline["result"]["analysis"]["capabilities"]
+    );
+    let applied = suppressed["result"]["suppressions"]["applied"]
+        .as_array()
+        .unwrap();
+    assert_eq!(applied.len(), 1);
+    assert_eq!(applied[0]["rule_id"], "oma.qml.process-execution");
+    assert_eq!(suppressed["result"]["suppressions"]["active_records"], 1);
+
+    // Plugin-scoped suppressions do not apply in plugin-less contexts.
+    fixture
+        .command()
+        .args([
+            "scan-plugin",
+            "--path",
+            fixture.plugin.to_str().unwrap(),
+            "--format",
+            "json",
+            "--fail-on",
+            "low",
+        ])
+        .assert()
+        .code(4);
+}
+
+#[test]
+fn suppression_path_scope_and_reinstate_flow_is_auditable() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.plugin.join("main.qml"),
+        "Process { command: [\"sh\", \"-c\", \"ls\"] }\n",
+    )
+    .unwrap();
+
+    // A path scope that does not cover main.qml leaves the finding enforced.
+    fixture
+        .command()
+        .args([
+            "plugins",
+            "review",
+            "io.example.cli",
+            "--action",
+            "suppress",
+            "--rule",
+            "oma.qml.process-execution",
+            "--path",
+            "docs",
+            "--reason",
+            "scoped elsewhere",
+            "--yes",
+        ])
+        .assert()
+        .success();
+    fixture
+        .command()
+        .args(["plugins", "analyze", "io.example.cli", "--fail-on", "low"])
+        .assert()
+        .code(4);
+
+    // Whole-target suppression hides it.
+    fixture
+        .command()
+        .args([
+            "plugins",
+            "review",
+            "io.example.cli",
+            "--action",
+            "suppress",
+            "--rule",
+            "oma.qml.process-execution",
+            "--reason",
+            "accepted after review",
+            "--yes",
+        ])
+        .assert()
+        .success();
+    fixture
+        .command()
+        .args(["plugins", "analyze", "io.example.cli", "--fail-on", "low"])
+        .assert()
+        .success();
+
+    // Reinstating the docs scope flips exactly that record; the
+    // whole-target suppression still enforces.
+    fixture
+        .command()
+        .args([
+            "plugins",
+            "review",
+            "io.example.cli",
+            "--action",
+            "reinstate",
+            "--rule",
+            "oma.qml.process-execution",
+            "--path",
+            "docs",
+            "--reason",
+            "scope changed",
+            "--yes",
+        ])
+        .assert()
+        .success();
+    fixture
+        .command()
+        .args(["plugins", "analyze", "io.example.cli", "--fail-on", "low"])
+        .assert()
+        .success();
+
+    // A rule with no active suppression anywhere fails loudly.
+    fixture
+        .command()
+        .args([
+            "plugins",
+            "review",
+            "io.example.cli",
+            "--action",
+            "reinstate",
+            "--rule",
+            "oma.qml.session-lock",
+            "--reason",
+            "nothing to reinstate",
+            "--yes",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("no active suppression matches"));
+
+    // Exact reinstate restores enforcement; both records remain auditable.
+    fixture
+        .command()
+        .args([
+            "plugins",
+            "review",
+            "io.example.cli",
+            "--action",
+            "reinstate",
+            "--rule",
+            "oma.qml.process-execution",
+            "--reason",
+            "acceptance withdrawn",
+            "--yes",
+        ])
+        .assert()
+        .success();
+    fixture
+        .command()
+        .args(["plugins", "analyze", "io.example.cli", "--fail-on", "low"])
+        .assert()
+        .code(4);
+
+    let raw = fs::read(fixture.config.path().join("omasafe/suppressions.json")).unwrap();
+    let state: Value = serde_json::from_slice(&raw).unwrap();
+    let records = state["suppressions"].as_array().unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["active"], false);
+    assert!(!records[0]["reinstated_at"].is_null());
+    assert_eq!(records[1]["active"], false);
+    assert!(!records[1]["reinstated_at"].is_null());
+}
+
+#[test]
+fn rules_explain_reports_definition_and_baseline_equivalences() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .command()
+        .args([
+            "rules",
+            "explain",
+            "oma.script.download-execute",
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(
+        report["result"]["rule"]["id"],
+        "oma.script.download-execute"
+    );
+    assert!(
+        report["result"]["external_equivalences"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["externalId"] == "curl-pipe-shell"),
+        "{report}"
+    );
+
+    let text = fixture
+        .command()
+        .args(["rules", "explain", "oma.script.download-execute"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(text).unwrap();
+    assert!(text.contains("Marketplace baseline coverage"), "{text}");
+    assert!(text.contains("curl-pipe-shell"), "{text}");
+
+    fixture
+        .command()
+        .args(["rules", "explain", "oma.does-not-exist"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("unknown rule id"));
+}
+
+fn seed_analysis_event(
+    fixture: &Fixture,
+    plugin_id: &str,
+    source_identity: &str,
+    policy_identity: &str,
+    fingerprint: &str,
+    finding_rule_ids: &[&str],
+    capability_kinds: &[&str],
+) {
+    let path = fixture.state.path().join("omasafe/scan-state.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let state = serde_json::json!({
+        "schema_version": 1,
+        "alerts": {},
+        "analysis_events": {
+            plugin_id: {
+                "source_identity": source_identity,
+                "policy_identity": policy_identity,
+                "fingerprint": fingerprint,
+                "finding_rule_ids": finding_rule_ids,
+                "capability_kinds": capability_kinds,
+            }
+        }
+    });
+    fs::write(path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+}
+
+fn stored_analysis_event(fixture: &Fixture, plugin_id: &str) -> Value {
+    let path = fixture.state.path().join("omasafe/scan-state.json");
+    let raw = fs::read(path).unwrap();
+    let state: Value = serde_json::from_slice(&raw).unwrap();
+    state["analysis_events"][plugin_id].clone()
+}
+
+fn scan_alert_kinds(fixture: &Fixture, args: &[&str]) -> (i32, Vec<String>) {
+    let output = fixture.command().args(args).output().expect("scan runs");
+    let code = output.status.code().unwrap_or(-1);
+    if code != 0 && code != 3 {
+        panic!(
+            "scan failed unexpectedly: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let kinds = report["result"]["alerts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|alert| alert["kind"].as_str().unwrap().to_owned())
+        .collect();
+    (code, kinds)
+}
+
+fn current_policy_identity_string(fixture: &Fixture) -> String {
+    let output = fixture
+        .command()
+        .args(["rules", "list", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    serde_json::to_string(&report["result"]["policy_identity"]).unwrap()
+}
+
+#[test]
+fn include_analysis_distinguishes_policy_update_from_drift_and_stays_quiet_by_default() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.plugin.join("main.qml"),
+        "Process { command: [\"sh\", \"-c\", \"ls\"] }\n",
+    )
+    .unwrap();
+    let inventory = fixture.inventory();
+    let digest = inventory["result"]["plugins"][0]["content_digest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // A recorded policy that no longer matches means the analyzer changed:
+    // a re-evaluation notice, distinct from drift and from nondeterminism.
+    // Default scans never emit analysis events.
+    seed_analysis_event(
+        &fixture,
+        "io.example.cli",
+        &digest,
+        "\"stale-policy\"",
+        "any-fingerprint",
+        &["oma.qml.process-execution"],
+        &["process-execution"],
+    );
+    let (_, kinds) = scan_alert_kinds(&fixture, &["scan", "--format", "json"]);
+    assert!(
+        !kinds.iter().any(|kind| kind.starts_with("analysis-"))
+            && !kinds.contains(&"analyzer-policy-update".to_owned()),
+        "{kinds:?}"
+    );
+
+    let (_, kinds) = scan_alert_kinds(
+        &fixture,
+        &["scan", "--include-analysis", "--format", "json"],
+    );
+    assert!(
+        kinds.contains(&"analyzer-policy-update".to_owned()),
+        "{kinds:?}"
+    );
+    assert!(
+        !kinds.contains(&"fingerprint-instability".to_owned()),
+        "{kinds:?}"
+    );
+    assert!(
+        !kinds.contains(&"finding-regression".to_owned()),
+        "{kinds:?}"
+    );
+    assert!(!kinds.contains(&"new-capability".to_owned()), "{kinds:?}");
+}
+
+#[test]
+fn identical_source_and_policy_with_moved_fingerprint_is_instability() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.plugin.join("main.qml"),
+        "Process { command: [\"sh\", \"-c\", \"ls\"] }\n",
+    )
+    .unwrap();
+    let inventory = fixture.inventory();
+    let digest = inventory["result"]["plugins"][0]["content_digest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let policy = current_policy_identity_string(&fixture);
+
+    seed_analysis_event(
+        &fixture,
+        "io.example.cli",
+        &digest,
+        &policy,
+        "seed-mismatched-fingerprint",
+        &["oma.qml.process-execution"],
+        &["process-execution"],
+    );
+    let (_, kinds) = scan_alert_kinds(
+        &fixture,
+        &["scan", "--include-analysis", "--format", "json"],
+    );
+    assert!(
+        kinds.contains(&"fingerprint-instability".to_owned()),
+        "{kinds:?}"
+    );
+    assert!(
+        !kinds.contains(&"analyzer-policy-update".to_owned()),
+        "{kinds:?}"
+    );
+}
+
+#[test]
+fn include_analysis_emits_new_capability_and_finding_regression_alerts() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.plugin.join("main.qml"),
+        "Process { command: [\"sh\", \"-c\", \"ls\"] }\n",
+    )
+    .unwrap();
+
+    // First opted-in run is a quiet baseline.
+    let (_, kinds) = scan_alert_kinds(
+        &fixture,
+        &["scan", "--include-analysis", "--format", "json"],
+    );
+    assert!(!kinds.contains(&"new-capability".to_owned()), "{kinds:?}");
+    assert!(
+        !kinds.contains(&"finding-regression".to_owned()),
+        "{kinds:?}"
+    );
+
+    // Trim the stored snapshot's observed sets while keeping identity and
+    // fingerprint intact: the next clean round must report exactly the
+    // growth.
+    let mut record = stored_analysis_event(&fixture, "io.example.cli");
+    record["capability_kinds"] = serde_json::json!(["clipboard-access"]);
+    record["finding_rule_ids"] = serde_json::json!(["oma.qml.session-lock"]);
+    let path = fixture.state.path().join("omasafe/scan-state.json");
+    let mut state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    state["analysis_events"]["io.example.cli"] = record;
+    fs::write(&path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+    let (_, kinds) = scan_alert_kinds(
+        &fixture,
+        &["scan", "--include-analysis", "--format", "json"],
+    );
+    assert!(kinds.contains(&"new-capability".to_owned()), "{kinds:?}");
+    assert!(
+        kinds.contains(&"finding-regression".to_owned()),
+        "{kinds:?}"
+    );
+    assert!(
+        !kinds.contains(&"fingerprint-instability".to_owned()),
+        "{kinds:?}"
+    );
+}

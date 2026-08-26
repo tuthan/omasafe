@@ -611,4 +611,70 @@ import-unqualified; AST persistence detection covers static paths only
 findings and via the lexical path); remote-build/cargo-pinning/
 shared-temp-PID baseline families are explicitly not-covered in the map.
 
-Next: **v0.2 S5 — Suppressions, event separation, determinism canary**.
+## v0.2 S5 — Suppressions, Event Separation, Determinism Canary
+
+Status: **complete**
+
+Implemented:
+
+- **Scoped suppressions** (`omasafe-core::suppress` + XDG config): records
+  carry `{rule_id, plugin_id?, path_scope?, reason, created_at, active,
+  reinstated_at?}` in `~/.config/omasafe/suppressions.json` behind flock +
+  atomic-write. Reinstate flags records inactive instead of deleting — the
+  audit trail survives; re-suppression appends. Matching is rule-exact,
+  plugin-context-aware (plugin-scoped records never match plugin-less
+  `scan-plugin` contexts), and segment-exact on path scopes (`assets`
+  never matches `assets_backup/…`). Creation validates non-empty reason and
+  traversal-free relative scope.
+- **Presentation/enforcement only**: `emit_analysis_report` filters rendered
+  findings AFTER fingerprinting; stored results, capabilities, edges, and
+  `analysis_fingerprint` are byte-identical under suppression (pinned by
+  test). Suppressed findings are excluded from both report views AND
+  `--fail-on` enforcement; reports disclose an additive `suppressions`
+  summary (`applied` list + active count). An unreadable suppressions file
+  fails open toward more visibility via a `suppressions-unreadable:`
+  limitation.
+- **CLI surface**: `plugins review ID --action suppress|reinstate --rule
+  RULE_ID [--path SCOPE] --reason TEXT --yes` (separate validation path from
+  the source-drift/missing-plugin/lost-coverage enum); `rules explain
+  RULE_ID [--format]` prints definition + marketplace equivalence entries;
+  man page/completions/cli-surface regenerated.
+- **Event separation**: `ScanState` gains additive per-plugin
+  `analysis_events` `{source_identity, policy_identity, fingerprint,
+  finding_rule_ids, capability_kinds}`. Opt-in `scan --include-analysis`
+  classifies against the stored snapshot with distinct wording: source
+  changed → drift alert only (baseline refreshed silently); policy changed →
+  `analyzer-policy-update` re-evaluation notice; both unchanged but
+  fingerprint moved → `fingerprint-instability` error. Clean rounds report
+  `new-capability` / `finding-regression` growth alerts. Policy identity
+  compares canonically (Value-normalized JSON). Default scans never touch
+  analysis events; registry/correlation claims cannot clear any of them by
+  construction. All events flow the standard dedup/notify/only-new machinery.
+- **Determinism canary**: `fixtures/canary/` pinned inputs +
+  `scripts/determinism-canary.sh` — builds, runs `scan-plugin` twice into
+  isolated HOMEs, diffs full `result.analysis`; mismatch preserves a repro
+  bundle (`determinism-canary-failure/`). CI runs it with artifact upload on
+  failure, plus the previously-missing lexical-config test run
+  (`cargo test --workspace --no-default-features`).
+
+Verification:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings          # both configs
+cargo test --workspace                     # 167 tests (parser-backed)
+cargo test --workspace --no-default-features               # 157 tests (lexical)
+./scripts/generate-cli-assets.sh --check
+./scripts/determinism-canary.sh
+```
+
+Known limitations: CLI-created suppressions are always plugin-scoped (the
+store supports global path-only records for plugin-less contexts, but no
+creation path exists yet); fingerprint instability is detected only for
+plugins analyzed twice under identical identity, so first observations are
+quiet baselines by definition; the canary compares run-vs-run within one
+build rather than across tool versions (golden pins cover cross-version
+stability, and `fingerprint_analysis` takes no version input by
+construction).
+
+Next: **v0.2 S6 — Pinned corpus, FP budget, validator parity**.

@@ -1,3 +1,3 @@
 #compdef omasafe-cli
 # zsh completion for omasafe-cli; generated from docs/cli-surface.txt
-_arguments '1:command:(marketplace paths plugins provenance rules scan scan-plugin schedule)' '*:option:(--format --notify --only-new --yes --expected-head --expected-tree --expected-digest --action --reason --commit --latest --path --git --revision --fail-on)'
+_arguments '1:command:(marketplace paths plugins provenance rules scan scan-plugin schedule)' '*:option:(--format --notify --only-new --include-analysis --yes --expected-head --expected-tree --expected-digest --action --reason --rule --path --commit --latest --git --revision --fail-on)'

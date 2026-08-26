@@ -59,9 +59,11 @@ Print the XDG configuration, state, and cache paths used by OmaSafe.
 Print the deterministic build self-inventory, source revision, toolchain,
 lockfile identity, supported runtime versions, and coverage limitations.
 .TP
-.B scan [--format text|json] [--notify] [--only-new]
+.B scan [--format text|json] [--notify] [--only-new] [--include-analysis]
 Inventory plugins and report new or outstanding findings. Exit status 3 means
-actionable findings remain.
+actionable findings remain. \fB--include-analysis\fR opts in to per-plugin
+analysis events (new capabilities, finding regressions, analyzer-policy
+updates, fingerprint instability); default scans stay quiet.
 .TP
 .B plugins inventory
 Print the installed plugin inventory and marketplace correlation.
@@ -79,11 +81,20 @@ Show the file-level differences from the trusted baseline.
 .B plugins review PLUGIN_ID
 Acknowledge findings, change review decisions, rebaseline, restore, or untrust a
 plugin. Untrust revokes the active baseline while preserving its history.
+Suppress/reinstate manage scoped analysis suppressions
+(\fB--rule RULE_ID\fR, optional \fB--path SCOPE\fR inside the plugin) recorded
+with a reason in XDG config; they hide and de-enforce findings without ever
+altering stored analysis results, and reinstating preserves the audit trail.
 .TP
 .B rules list [--format text|json]
 Print the OmaSafe-owned capability rule catalog with severities, capabilities,
 and review guidance. The catalog is static and versioned through the analyzer
 policy identity.
+.TP
+.B rules explain RULE_ID [--format text|json]
+Print one rule's full definition: severity, capability, verified surface
+anchor, summary, review guidance, and any recorded marketplace-baseline
+equivalence entries.
 .TP
 .B plugins analyze PLUGIN_ID [--format text|json] [--fail-on SEVERITY]
 Inventory every shipped payload file of an installed plugin with type, mode,
@@ -143,7 +154,7 @@ _omasafe_cli() {
     fi
     case "\${COMP_WORDS[1]}" in
         scan|provenance|plugins|marketplace|rules|scan-plugin)
-            COMPREPLY=(\$(compgen -W "--format --notify --only-new --yes --expected-head --expected-tree --expected-digest --action --reason --commit --latest --path --git --revision --fail-on" -- "\${cur}"))
+            COMPREPLY=(\$(compgen -W "--format --notify --only-new --include-analysis --yes --expected-head --expected-tree --expected-digest --action --reason --rule --path --commit --latest --git --revision --fail-on" -- "\${cur}"))
             ;;
         paths|schedule)
             COMPREPLY=()
@@ -157,7 +168,7 @@ EOF
 write_asset docs/completions/_omasafe-cli "$(cat <<EOF
 #compdef omasafe-cli
 # zsh completion for omasafe-cli; generated from docs/cli-surface.txt
-_arguments '1:command:($top_level)' '*:option:(--format --notify --only-new --yes --expected-head --expected-tree --expected-digest --action --reason --commit --latest --path --git --revision --fail-on)'
+_arguments '1:command:($top_level)' '*:option:(--format --notify --only-new --include-analysis --yes --expected-head --expected-tree --expected-digest --action --reason --rule --path --commit --latest --git --revision --fail-on)'
 EOF
 )"
 
@@ -167,12 +178,14 @@ complete -c omasafe-cli -f -n "__fish_use_subcommand" -a "$top_level"
 complete -c omasafe-cli -l format -r -a "text json"
 complete -c omasafe-cli -l notify
 complete -c omasafe-cli -l only-new
+complete -c omasafe-cli -l include-analysis
 complete -c omasafe-cli -l yes
 complete -c omasafe-cli -l expected-head -r
 complete -c omasafe-cli -l expected-tree -r
 complete -c omasafe-cli -l expected-digest -r
-complete -c omasafe-cli -l action -r -a "acknowledge exclude rebaseline restore untrust revoke"
+complete -c omasafe-cli -l action -r -a "acknowledge exclude rebaseline restore untrust revoke suppress reinstate"
 complete -c omasafe-cli -l reason -r
+complete -c omasafe-cli -l rule -r
 complete -c omasafe-cli -l commit -r
 complete -c omasafe-cli -l path -r
 complete -c omasafe-cli -l git -r

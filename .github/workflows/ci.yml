@@ -19,3 +19,16 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      # The shipped CLI enables the qml-parser feature by default, so this
+      # plain workspace run is parser-backed. The no-default-features run
+      # exercises the documented lexical-fallback configuration (ADR 0001).
+      - run: cargo test --workspace --no-default-features
+      - name: Determinism canary (S5)
+        run: ./scripts/determinism-canary.sh
+      - name: Preserve determinism canary reproduction inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: determinism-canary-repro
+          path: determinism-canary-failure/
+          if-no-files-found: ignore
