@@ -797,4 +797,58 @@ dispositions.
 
 Next: **v0.2 S7 — Reviewed update workflow**.
 
+## S7 — Reviewed update workflow (2026-08-26)
+
+`plugins review-update ID [--expected-commit SHA] [--yes]` implements the
+reviewed update flow end to end. Pre-flight refusals happen before any
+mutation: dirty installed worktrees (and unknown git state) are rejected,
+a trusted baseline is required, and the plugin origin must be HTTPS. The
+candidate commit comes either from `--expected-commit` or from the pinned
+registry claim in the cached catalog snapshot (`listed`/`installed-differs`
+correlations only); an already-pinned HEAD short-circuits as a no-op.
+
+The exact candidate is fetched into the bounded analysis cache
+(`ensure_pinned_repository`, quota + lock inherited), materialized into a
+temp checkout, and evaluated before anything touches the live tree: native-
+parity manifest validation (S6 mirror) must pass, and the full analysis
+pipeline produces findings/capabilities for the delta presentation — added
+and resolved rule ids, capability changes versus the last recorded analysis
+event, content-digest movement, a capped source diff trusted..candidate,
+coverage limitations, and registry context. Approval mirrors the v0.1 rule:
+interactive confirmation requires a terminal; `--yes` is accepted only
+together with `--expected-commit` matching the candidate exactly.
+
+Mutation is delegated to the native updater (`omarchy plugin update ID
+--yes`; fetch/fast-forward, validation with ORIG_HEAD rollback, rescan) via
+new bounded wrappers in omasafe-plugin-trust — OmaSafe never forks that
+lifecycle logic. Active full-bar plugins are switched back to the default
+bar first; enabled plugins are disabled first; both actions are recorded in
+an interrupted-state record (`state/review-update.json`) written before the
+first mutation and removed at terminal states. A stale record prints manual
+recovery guidance and an unreadable one refuses to run.
+
+Postconditions gate everything: fresh inventory must show HEAD equal to the
+reviewed commit and a readable shell rescan before re-enabling; trust
+advances only after that. Raced candidates (native updater has no expected-
+SHA guard yet) leave the plugin disabled with explicit recovery guidance —
+including the reset command to restore the reviewed commit — and never
+advance trust. Native failures keep the rollback result, stay disabled, and
+keep the record for recovery.
+
+Test matrix covers all nine plan rows against real git repositories through
+a fake omarchy shim driven by per-invocation environment variables: dirty
+refusal, missing baseline, `--yes` without pin fail-fast, happy path
+(disable→update→enable ordering, trust advance, record cleanup), invalid
+manifest abort, native failure guidance, raced commit detection (trust
+proven untouched), rescan failure, interrupted-record guidance, full-bar
+switch ordering, and registry-claim resolution feeding the preview.
+
+Gates green in both configurations; 193 parser-backed / 183 lexical tests.
+Known limitation carried deliberately: the race window between evaluation
+and native mutation exists because the upstream updater lacks an expected-
+commit option — the flow detects it post-hoc instead of preventing it;
+the upstream proposal is tracked in docs/plans/later.md.
+
+Next: **v0.2 S8 — UI, packaging, release**.
+
 

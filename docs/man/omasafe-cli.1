@@ -45,6 +45,14 @@ Suppress/reinstate manage scoped analysis suppressions
 with a reason in XDG config; they hide and de-enforce findings without ever
 altering stored analysis results, and reinstating preserves the audit trail.
 .TP
+.B plugins review-update PLUGIN_ID [--expected-commit SHA] [--yes]
+Review an exact candidate commit before updating: refuses on a dirty installed
+worktree, fetches the pinned candidate into the bounded cache, validates it,
+presents the delta versus the trusted baseline, then delegates the mutation to
+the native updater. Unattended use requires --expected-commit with --yes;
+postconditions (exact HEAD, rescan) must pass before the plugin is re-enabled
+or trusted.
+.TP
 .B rules list [--format text|json]
 Print the OmaSafe-owned capability rule catalog with severities, capabilities,
 and review guidance. The catalog is static and versioned through the analyzer

@@ -62,6 +62,49 @@ pub struct ReviewDecision {
     pub created_at: String,
 }
 
+/// Interrupted-state record for a reviewed update in flight. Written before
+/// the first mutation and removed only when the flow reaches a terminal
+/// state; a leftover file means the process died mid-flow and manual checks
+/// are required before trusting the plugin again.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateFlowRecord {
+    pub schema_version: u64,
+    pub plugin_id: String,
+    pub candidate_commit: String,
+    pub started_at: String,
+    /// Flow phase at last write: delegating | verifying | finished.
+    pub phase: String,
+    /// Quiescing actions taken before mutation: "bar-switched", "disabled".
+    #[serde(default)]
+    pub quiesced: Vec<String>,
+}
+
+impl UpdateFlowRecord {
+    pub fn load(path: &Path) -> Result<Option<Self>, Error> {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let record: UpdateFlowRecord =
+            serde_json::from_slice(&bytes).map_err(|source| Error::Json {
+                path: path.display().to_string(),
+                source,
+            })?;
+        Ok(Some(record))
+    }
+
+    pub fn store(&self, path: &Path) -> Result<(), Error> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut bytes = serde_json::to_vec_pretty(self)?;
+        bytes.push(b'\n');
+        fs::write(path, bytes)?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ScanState {
     pub schema_version: u64,

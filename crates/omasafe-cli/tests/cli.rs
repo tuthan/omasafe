@@ -3,7 +3,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 struct Fixture {
@@ -1872,4 +1872,775 @@ fn default_scans_never_clear_analysis_event_dedup_state() {
         persisted["alerts"]["analysis:io.example.cli:fingerprint-instability"] == "earlier",
         "default scan cleared analysis dedup state: {persisted}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// S7: plugins review-update — reviewed update workflow
+// ---------------------------------------------------------------------------
+
+/// Fake `omarchy` shim driven by a JSON state file. Emulates the native
+/// plugin lifecycle surface OmaSafe delegates to (list/disable/enable/update/
+/// bar use) against REAL git repositories so postcondition checks observe
+/// actual HEAD movement, including the raced-commit scenario. All fake state
+/// reaches the shim through per-invocation environment variables, never the
+/// test process globals.
+struct FakeOmarchy {
+    state_path: PathBuf,
+    log_path: PathBuf,
+}
+
+impl FakeOmarchy {
+    fn install(bin: &Path, state_dir: &Path) -> Self {
+        let state_path = state_dir.join("omarchy-fake.json");
+        let log_path = state_dir.join("omarchy-fake.log");
+        let script = r#"#!/bin/bash
+STATE="$OMASAFE_FAKE_STATE"
+ORIGIN="$OMASAFE_FAKE_ORIGIN"
+RACE_ORIGIN="$OMASAFE_FAKE_RACE_ORIGIN"
+PLUGIN_DIR="$OMASAFE_FAKE_PLUGIN_DIR"
+LOG="$OMASAFE_FAKE_LOG"
+echo "$*" >> "$LOG"
+get() { jq -r "$1" "$STATE"; }
+# Only bash builtins and jq are guaranteed on the restricted fixture PATH.
+set() { jq "$1" "$STATE" > "$STATE.new" && mapfile -t lines < "$STATE.new" && printf '%s\n' "${lines[@]}" > "$STATE"; return 0; }
+case "$*" in
+  "plugin list --json")
+    calls=$(get '.listCalls // 0')
+    set ".listCalls = ($calls + 1)" > /dev/null
+    if [[ $(get '.listFails // false') == "true" && $calls -ge 1 ]]; then
+      echo "simulated shell failure" >&2; exit 1
+    fi
+    jq -c '[.plugin]' "$STATE"
+    ;;
+  "plugin update io.example.cli --yes")
+    mode=$(get '.updateMode // "ok"')
+    if [[ $mode == "fail" ]]; then
+      echo "omarchy-plugin-update: update of 'io.example.cli' failed validation; rolled back" >&2
+      exit 1
+    fi
+    source="$ORIGIN"
+    [[ $mode == "race" ]] && source="$RACE_ORIGIN"
+    git -C "$PLUGIN_DIR" fetch -q "$source" HEAD
+    git -C "$PLUGIN_DIR" merge -q --ff-only FETCH_HEAD
+    echo "Updated io.example.cli."
+    ;;
+  "plugin disable io.example.cli")
+    set '.plugin.enabled = false'; echo "Disabled io.example.cli"
+    ;;
+  "plugin enable io.example.cli")
+    set '.plugin.enabled = true'; echo "Enabled io.example.cli"
+    ;;
+  "bar use omarchy.bar")
+    echo "Using omarchy.bar"
+    ;;
+  *)
+    echo "fake omarchy: unexpected invocation: $*" >&2
+    exit 64
+    ;;
+esac
+"#;
+        let shim = bin.join("omarchy");
+        fs::write(&shim, script).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _ = fs::remove_file(&log_path);
+        Self {
+            state_path,
+            log_path,
+        }
+    }
+
+    fn write_state(&self, kinds: &[&str], active: bool) {
+        fs::write(
+            &self.state_path,
+            serde_json::json!({
+                "plugin": {
+                    "id": "io.example.cli",
+                    "enabled": true,
+                    "active": active,
+                    "firstParty": false,
+                    "clonedFrom": "https://plugins.test/cli.git",
+                    "kinds": kinds,
+                },
+                "updateMode": "ok",
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    fn set_mode(&self, mode: &str) {
+        let mut state: Value =
+            serde_json::from_str(&fs::read_to_string(&self.state_path).unwrap()).unwrap();
+        state["updateMode"] = Value::String(mode.into());
+        fs::write(&self.state_path, state.to_string()).unwrap();
+    }
+
+    fn enabled(&self) -> bool {
+        let state: Value =
+            serde_json::from_str(&fs::read_to_string(&self.state_path).unwrap()).unwrap();
+        state["plugin"]["enabled"] == Value::Bool(true)
+    }
+
+    fn log_contains(&self, needle: &str) -> bool {
+        fs::read_to_string(&self.log_path)
+            .map(|log| log.contains(needle))
+            .unwrap_or(false)
+    }
+}
+
+fn run_git(dir: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("/usr/bin/git")
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn git_commit_all(dir: &Path, message: &str) -> String {
+    run_git(dir, &["add", "-A"]);
+    run_git(dir, &["commit", "--quiet", "--allow-empty", "-m", message]);
+    run_git(dir, &["rev-parse", "HEAD"])
+}
+
+fn init_repo(dir: &Path, bare: bool) {
+    let mut args = vec!["init", "--quiet"];
+    if bare {
+        args.push("--bare");
+    }
+    args.push(".");
+    run_git(dir, &args);
+    run_git(dir, &["config", "user.name", "test"]);
+    run_git(dir, &["config", "user.email", "test@example.invalid"]);
+}
+
+struct UpdateFixture {
+    fixture: Fixture,
+    origin: TempDir,
+    race_origin: TempDir,
+    candidate: String,
+    raced: String,
+    fake: FakeOmarchy,
+}
+
+impl UpdateFixture {
+    /// Installed repo at commit A with HTTPS-shaped origin; bare origin holds
+    /// A then candidate B; a second bare origin adds raced tip C. The bounded
+    /// analysis cache is pre-seeded so ensure_pinned_repository fetches from
+    /// local transport only.
+    fn new() -> Self {
+        Self::build(&["bar-widget"], false)
+    }
+
+    fn build(kinds: &[&str], active: bool) -> Self {
+        let fixture = Fixture::new();
+        std::os::unix::fs::symlink("/usr/bin/git", fixture.bin.path().join("git")).unwrap();
+        // The fake omarchy shim needs jq; PATH is restricted to bin/.
+        std::os::unix::fs::symlink("/usr/bin/jq", fixture.bin.path().join("jq")).unwrap();
+
+        // Working clone that feeds the bare origin.
+        let work = TempDir::new().unwrap();
+        init_repo(work.path(), false);
+        fs::write(
+            work.path().join("manifest.json"),
+            r#"{"schemaVersion":1,"id":"io.example.cli","name":"n","version":"1","kinds":["bar-widget"],"entryPoints":{"barWidget":"main.qml"}}"#,
+        )
+        .unwrap();
+        fs::write(work.path().join("main.qml"), "Item {}\n").unwrap();
+        let base = git_commit_all(work.path(), "A");
+
+        let origin = TempDir::new().unwrap();
+        init_repo(origin.path(), true);
+        run_git(
+            origin.path(),
+            &[
+                "fetch",
+                "--quiet",
+                work.path().to_string_lossy().as_ref(),
+                "HEAD:refs/heads/main",
+            ],
+        );
+        run_git(origin.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+
+        // Candidate B on top of A.
+        fs::write(
+            work.path().join("main.qml"),
+            "Item { property string x: \"candidate\" }\n",
+        )
+        .unwrap();
+        let candidate = git_commit_all(work.path(), "B");
+        run_git(
+            work.path(),
+            &[
+                "push",
+                "--quiet",
+                origin.path().to_string_lossy().as_ref(),
+                "HEAD:refs/heads/main",
+            ],
+        );
+
+        // Raced origin: same history plus different tip C.
+        let race_origin = TempDir::new().unwrap();
+        init_repo(race_origin.path(), true);
+        run_git(
+            race_origin.path(),
+            &[
+                "fetch",
+                "--quiet",
+                origin.path().to_string_lossy().as_ref(),
+                "refs/heads/main:refs/heads/main",
+            ],
+        );
+        run_git(
+            race_origin.path(),
+            &["symbolic-ref", "HEAD", "refs/heads/main"],
+        );
+        let raced_work = TempDir::new().unwrap();
+        init_repo(raced_work.path(), false);
+        run_git(
+            raced_work.path(),
+            &[
+                "pull",
+                "--quiet",
+                origin.path().to_string_lossy().as_ref(),
+                "main",
+            ],
+        );
+        fs::write(
+            raced_work.path().join("main.qml"),
+            "Item { property string x: \"raced\" }\n",
+        )
+        .unwrap();
+        let raced = git_commit_all(raced_work.path(), "C");
+        run_git(
+            raced_work.path(),
+            &[
+                "push",
+                "--quiet",
+                race_origin.path().to_string_lossy().as_ref(),
+                "HEAD:refs/heads/main",
+            ],
+        );
+
+        // Installed checkout at exactly A whose origin is an HTTPS URL
+        // (identity and correlation see production-shaped data).
+        init_repo(&fixture.plugin, false);
+        // Fixture::new() seeded placeholder files; the exact A checkout
+        // replaces them.
+        fs::remove_file(fixture.plugin.join("manifest.json")).unwrap();
+        fs::remove_file(fixture.plugin.join("main.qml")).unwrap();
+        run_git(
+            &fixture.plugin,
+            &[
+                "fetch",
+                "--quiet",
+                work.path().to_string_lossy().as_ref(),
+                &base,
+            ],
+        );
+        run_git(
+            &fixture.plugin,
+            &["checkout", "--quiet", "--detach", "FETCH_HEAD"],
+        );
+        assert_eq!(run_git(&fixture.plugin, &["rev-parse", "HEAD"]), base);
+        run_git(
+            &fixture.plugin,
+            &["remote", "add", "origin", "https://plugins.test/cli.git"],
+        );
+
+        // Pre-seed the analysis cache: slug must equal sha256(url)[..8] hex.
+        let url = "https://plugins.test/cli.git";
+        let digest = Sha256::digest(url.as_bytes());
+        let slug: String = digest
+            .iter()
+            .take(8)
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let analysis_cache = fixture.cache.path().join("omasafe/analysis");
+        fs::create_dir_all(&analysis_cache).unwrap();
+        let cache_repo = analysis_cache.join(format!("{slug}.git"));
+        fs::create_dir_all(&cache_repo).unwrap();
+        init_repo(&cache_repo, true);
+        run_git(
+            &cache_repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                origin.path().to_string_lossy().as_ref(),
+            ],
+        );
+
+        let fake = FakeOmarchy::install(fixture.bin.path(), fixture.state.path());
+        fake.write_state(kinds, active);
+
+        Self {
+            fixture,
+            origin,
+            race_origin,
+            candidate,
+            raced,
+            fake,
+        }
+    }
+
+    fn seed_trust(&self) {
+        self.fixture.trust_current();
+    }
+
+    fn review_update(&self, extra_args: &[&str]) -> (Vec<u8>, Vec<u8>, Option<i32>) {
+        let output = self
+            .fixture
+            .command()
+            .env("OMASAFE_FAKE_STATE", &self.fake.state_path)
+            .env("OMASAFE_FAKE_LOG", &self.fake.log_path)
+            .env(
+                "OMASAFE_FAKE_ORIGIN",
+                self.origin.path().to_string_lossy().as_ref(),
+            )
+            .env(
+                "OMASAFE_FAKE_RACE_ORIGIN",
+                self.race_origin.path().to_string_lossy().as_ref(),
+            )
+            .env(
+                "OMASAFE_FAKE_PLUGIN_DIR",
+                self.fixture.plugin.to_string_lossy().as_ref(),
+            )
+            .env("OMASAFE_DEBUG_REVIEW", "1")
+            .args(["plugins", "review-update", "io.example.cli"])
+            .args(extra_args)
+            .output()
+            .expect("review-update runs");
+        (output.stdout, output.stderr, output.status.code())
+    }
+}
+
+fn flow_record(fixture: &Fixture) -> Option<Value> {
+    let path = fixture.state.path().join("omasafe/review-update.json");
+    fs::read_to_string(path)
+        .ok()
+        .map(|text| serde_json::from_str(&text).unwrap())
+}
+
+#[test]
+#[cfg(unix)]
+fn review_update_refuses_dirty_worktree_before_any_mutation() {
+    let update = UpdateFixture::new();
+    update.seed_trust();
+    fs::write(update.fixture.plugin.join("local.txt"), "uncommitted\n").unwrap();
+
+    let (stdout, stderr, code) =
+        update.review_update(&["--yes", "--expected-commit", &update.candidate]);
+    assert_eq!(code, Some(1), "{stdout:?} {stderr:?}");
+    let text = String::from_utf8_lossy(&stderr);
+    assert!(text.contains("dirty"), "{text}");
+    assert!(
+        !update.fake.log_contains("plugin update"),
+        "mutation attempted"
+    );
+    assert!(
+        !update.fake.log_contains("plugin disable"),
+        "quiesce attempted"
+    );
+    assert_eq!(
+        run_git(&update.fixture.plugin, &["rev-parse", "HEAD"]),
+        installed_head_of(&update),
+        "live tree moved"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn review_update_requires_a_trusted_baseline() {
+    let update = UpdateFixture::new();
+    let (_stdout, stderr, code) =
+        update.review_update(&["--yes", "--expected-commit", &update.candidate]);
+    assert_eq!(code, Some(1));
+    assert!(
+        String::from_utf8_lossy(&stderr).contains("no trusted baseline"),
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(!update.fake.log_contains("plugin update"));
+}
+
+#[test]
+#[cfg(unix)]
+fn review_update_yes_requires_expected_commit() {
+    let update = UpdateFixture::new();
+    update.seed_trust();
+    let (_stdout, stderr, code) = update.review_update(&["--yes"]);
+    assert_eq!(code, Some(1), "usage failure expected");
+    let text = String::from_utf8_lossy(&stderr);
+    assert!(text.contains("--expected-commit"), "{text}");
+    // Fail-fast: no fetch, no evaluation, no mutation.
+    assert!(!update.fake.log_contains("plugin update"));
+}
+
+#[test]
+#[cfg(unix)]
+fn review_update_happy_path_updates_enables_and_advances_trust() {
+    let update = UpdateFixture::new();
+    update.seed_trust();
+
+    let (stdout, stderr, code) =
+        update.review_update(&["--yes", "--expected-commit", &update.candidate]);
+    assert_eq!(
+        code,
+        Some(0),
+        "{} {}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    let text = String::from_utf8_lossy(&stdout);
+    assert!(text.contains("Reviewed update preview"), "{text}");
+    assert!(text.contains("Reviewed update complete"), "{text}");
+
+    // Postconditions: exact reviewed commit installed and enabled again.
+    assert_eq!(
+        run_git(&update.fixture.plugin, &["rev-parse", "HEAD"]),
+        update.candidate
+    );
+    assert!(update.fake.enabled(), "plugin must be re-enabled");
+
+    // Quiesce happened before the delegated mutation.
+    let log = fs::read_to_string(&update.fake.log_path).unwrap();
+    let disable = log.find("plugin disable").unwrap();
+    let mutation = log.find("plugin update").expect(log.as_str());
+    let enable = log.find("plugin enable").expect(log.as_str());
+    assert!(disable < mutation && mutation < enable);
+
+    // Trust baseline advanced to the candidate; interrupted record removed.
+    let history: Value = serde_json::from_slice(
+        &fs::read(
+            update
+                .fixture
+                .state
+                .path()
+                .join("omasafe/trust-history.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        history["records"].as_array().unwrap().last().unwrap()["accepted"]["head"],
+        Value::String(update.candidate.clone())
+    );
+    assert!(
+        !flow_record(&update.fixture).is_some(),
+        "flow record left behind"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn review_update_aborts_on_invalid_manifest_candidate() {
+    let update = UpdateFixture::new();
+    update.seed_trust();
+    // Build a candidate that violates the native manifest rules: strip the
+    // required name field by rewriting history is heavy; instead point the
+    // cache at a repo whose tip has an empty kinds array via a third push.
+    let work = TempDir::new().unwrap();
+    init_repo(work.path(), false);
+    run_git(
+        work.path(),
+        &[
+            "pull",
+            "--quiet",
+            update.origin.path().to_string_lossy().as_ref(),
+            "main",
+        ],
+    );
+    fs::write(
+        work.path().join("manifest.json"),
+        r#"{"schemaVersion":1,"id":"io.example.cli","name":"n","version":"1","kinds":[],"entryPoints":{}}"#,
+    )
+    .unwrap();
+    git_commit_all(work.path(), "bad kinds");
+    run_git(
+        work.path(),
+        &[
+            "push",
+            "--quiet",
+            update.origin.path().to_string_lossy().as_ref(),
+            "HEAD:refs/heads/main",
+        ],
+    );
+    let invalid = run_git(work.path(), &["rev-parse", "HEAD"]);
+
+    let (stdout, stderr, code) = update.review_update(&["--yes", "--expected-commit", &invalid]);
+    assert_eq!(code, Some(1));
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(text.contains("native manifest validation"), "{text}");
+    assert!(!update.fake.log_contains("plugin update"));
+    assert_eq!(
+        run_git(&update.fixture.plugin, &["rev-parse", "HEAD"]),
+        installed_head_of(&update)
+    );
+    assert!(!flow_record(&update.fixture).is_some());
+}
+
+#[test]
+#[cfg(unix)]
+fn review_update_native_failure_leaves_disabled_with_guidance() {
+    let update = UpdateFixture::new();
+    update.seed_trust();
+    update.fake.set_mode("fail");
+
+    let (stdout, stderr, code) =
+        update.review_update(&["--yes", "--expected-commit", &update.candidate]);
+    assert_eq!(code, Some(1));
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(text.contains("left disabled"), "{text}");
+    assert!(text.contains("manual recovery"), "{text}");
+    assert!(
+        !update.fake.enabled(),
+        "must not auto re-enable after native failure"
+    );
+    assert_eq!(
+        run_git(&update.fixture.plugin, &["rev-parse", "HEAD"]),
+        installed_head_of(&update),
+        "content changed despite native rollback"
+    );
+    let record = flow_record(&update.fixture).expect("recovery record kept");
+    assert_eq!(record["phase"], Value::String("failed".into()));
+}
+
+#[test]
+#[cfg(unix)]
+fn review_update_raced_commit_is_detected_and_plugin_stays_disabled() {
+    let update = UpdateFixture::new();
+    update.seed_trust();
+    update.fake.set_mode("race");
+
+    let (stdout, stderr, code) =
+        update.review_update(&["--yes", "--expected-commit", &update.candidate]);
+    assert_eq!(code, Some(1));
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(text.contains("raced candidate"), "{text}");
+    assert!(
+        text.contains(&update.raced),
+        "guidance names the foreign HEAD"
+    );
+    assert!(!update.fake.enabled());
+    assert_eq!(
+        run_git(&update.fixture.plugin, &["rev-parse", "HEAD"]),
+        update.raced,
+        "raced content stays put for manual inspection"
+    );
+    let history: Value = serde_json::from_slice(
+        &fs::read(
+            update
+                .fixture
+                .state
+                .path()
+                .join("omasafe/trust-history.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_ne!(
+        history["records"].as_array().unwrap().last().unwrap()["accepted"]["head"],
+        Value::String(update.raced.clone()),
+        "trust must never advance to an unreviewed commit"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn review_update_rescan_failure_after_mutation_reports_guidance() {
+    let update = UpdateFixture::new();
+    update.seed_trust();
+    let mut state: Value =
+        serde_json::from_str(&fs::read_to_string(&update.fake.state_path).unwrap()).unwrap();
+    state["listFails"] = Value::Bool(true);
+    state["updateMode"] = Value::String("ok".into());
+    fs::write(&update.fake.state_path, state.to_string()).unwrap();
+
+    let (stdout, stderr, code) =
+        update.review_update(&["--yes", "--expected-commit", &update.candidate]);
+    assert_eq!(code, Some(1));
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(text.contains("rescan verification failed"), "{text}");
+    assert!(!update.fake.enabled());
+    assert_eq!(
+        flow_record(&update.fixture).unwrap()["phase"],
+        Value::String("failed".into())
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn review_update_full_bar_switches_default_bar_back_before_mutation() {
+    let update = UpdateFixture::build(&["bar"], true);
+    update.seed_trust();
+
+    let (stdout, stderr, code) =
+        update.review_update(&["--yes", "--expected-commit", &update.candidate]);
+    assert_eq!(
+        code,
+        Some(0),
+        "{} {}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    let log = fs::read_to_string(&update.fake.log_path).unwrap();
+    let bar_switch = log.find("bar use omarchy.bar").expect("bar switched back");
+    let mutation = log.find("plugin update").unwrap();
+    assert!(bar_switch < mutation, "{log}");
+    assert!(
+        log.contains("plugin enable"),
+        "bar plugin re-enabled after success"
+    );
+    assert!(update.fake.enabled());
+}
+
+#[test]
+#[cfg(unix)]
+fn review_update_interrupted_record_prints_recovery_guidance() {
+    let update = UpdateFixture::new();
+    update.seed_trust();
+    fs::create_dir_all(update.fixture.state.path().join("omasafe")).unwrap();
+    fs::write(
+        update
+            .fixture
+            .state
+            .path()
+            .join("omasafe/review-update.json"),
+        serde_json::json!({
+            "schema_version": 1,
+            "plugin_id": "io.example.cli",
+            "candidate_commit": "a".repeat(40),
+            "started_at": "2026-01-01T00:00:00Z",
+            "phase": "delegating",
+            "quiesced": ["disabled"],
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // A refusal still refuses — but the operator first learns about the
+    // interrupted attempt and how to recover it manually.
+    fs::write(update.fixture.plugin.join("local.txt"), "dirty\n").unwrap();
+    let (_stdout, stderr, _code) =
+        update.review_update(&["--yes", "--expected-commit", &update.candidate]);
+    let text = String::from_utf8_lossy(&stderr);
+    assert!(text.contains("interrupted reviewed update"), "{text}");
+    assert!(text.contains("manual checks"), "{text}");
+    assert!(text.contains("omarchy plugin list --json"), "{text}");
+}
+
+#[test]
+#[cfg(unix)]
+fn review_update_resolves_candidate_from_registry_claim_for_preview() {
+    let update = UpdateFixture::new();
+    update.seed_trust();
+    install_verified_catalog(&update.fixture, &update.candidate);
+
+    // No --expected-commit and no terminal: the gate must refuse AFTER the
+    // registry-resolved preview was produced (proves claim resolution works).
+    let output = update
+        .fixture
+        .command()
+        .env("OMASAFE_FAKE_STATE", &update.fake.state_path)
+        .env("OMASAFE_FAKE_LOG", &update.fake.log_path)
+        .env(
+            "OMASAFE_FAKE_ORIGIN",
+            update.origin.path().to_string_lossy().as_ref(),
+        )
+        .env(
+            "OMASAFE_FAKE_RACE_ORIGIN",
+            update.race_origin.path().to_string_lossy().as_ref(),
+        )
+        .env(
+            "OMASAFE_FAKE_PLUGIN_DIR",
+            update.fixture.plugin.to_string_lossy().as_ref(),
+        )
+        .args(["plugins", "review-update", "io.example.cli"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("registry claim from catalog commit"),
+        "{stdout}"
+    );
+    assert!(stdout.contains(&update.candidate), "{stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("requires a terminal"), "{stderr}");
+    assert!(!update.fake.log_contains("plugin update"));
+}
+
+/// Installs a verified cached snapshot whose single entry pins `candidate`
+/// as the upstream observed commit for io.example.cli.
+fn install_verified_catalog(fixture: &Fixture, candidate: &str) {
+    use sha2::Digest as _;
+    let source = TempDir::new().unwrap();
+    let entry = serde_json::json!({
+        "id": "io.example.cli",
+        "sourceType": "community",
+        "repo": "https://plugins.test/cli.git",
+        "upstreamObservedCommit": candidate,
+        "verificationStatus": "verified"
+    });
+    let catalog = format!("{}\n", serde_json::to_string(&[entry]).unwrap());
+    fs::create_dir_all(source.path().join("site")).unwrap();
+    fs::write(source.path().join("site/catalog.json"), &catalog).unwrap();
+    init_repo(&source.path().join("site"), false);
+    let revision = git_commit_all(&source.path().join("site"), "catalog fixture");
+
+    let cache = fixture.cache.path().join("omasafe");
+    fs::create_dir_all(&cache).unwrap();
+    run_git(
+        &cache,
+        &[
+            "clone",
+            "--bare",
+            "--quiet",
+            source.path().join("site").to_string_lossy().as_ref(),
+            "catalog.git",
+        ],
+    );
+    fs::write(cache.join("catalog.json"), &catalog).unwrap();
+    fs::write(
+        cache.join("catalog.meta.json"),
+        serde_json::json!({
+            "repository_commit": revision,
+            "repository_url": "https://github.com/HANCORE-linux/omarchy-plugin-marketplace",
+            "retrieved_at": "2026-08-22T00:00:00Z",
+            "file_digest": format!("{:x}", Sha256::digest(catalog.as_bytes()))
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+fn installed_head_of(update: &UpdateFixture) -> String {
+    run_git(&update.fixture.plugin, &["rev-parse", "HEAD"])
 }

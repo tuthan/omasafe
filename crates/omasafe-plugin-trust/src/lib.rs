@@ -803,6 +803,75 @@ fn file_mode(metadata: &fs::Metadata) -> u32 {
     u32::from(metadata.permissions().readonly())
 }
 
+/// Outcome of a bounded native `omarchy` invocation. `output` carries the
+/// trimmed combined stdout for operator-facing messages; failures never
+/// abort the caller's cleanup logic.
+#[derive(Debug, Clone)]
+pub struct NativeCommand {
+    pub success: bool,
+    pub output: String,
+}
+
+const NATIVE_OUTPUT_CAP: usize = 64 * 1024;
+
+fn run_omarchy(args: &[&str]) -> NativeCommand {
+    let mut command = Command::new("omarchy");
+    command.args(args.to_vec());
+    // The native updater itself exports this; setting it here keeps direct
+    // git children inside wrapper scripts from ever prompting.
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    let fallback = |message: String| NativeCommand {
+        success: false,
+        output: message,
+    };
+    match omasafe_core::bounds::run_bounded_capped(
+        &mut command,
+        omasafe_core::bounds::GIT_PROCESS_BUDGET,
+        NATIVE_OUTPUT_CAP,
+    ) {
+        Ok(Some(captured)) => {
+            let mut text = String::from_utf8_lossy(&captured.stdout).into_owned();
+            if !captured.stderr.is_empty() {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&String::from_utf8_lossy(&captured.stderr));
+            }
+            NativeCommand {
+                success: captured.status.success() && !captured.truncated,
+                output: text.trim().to_owned(),
+            }
+        }
+        Ok(None) => fallback(format!(
+            "omarchy {} did not produce a result within its time budget",
+            args.join(" ")
+        )),
+        Err(error) => fallback(format!("omarchy {} unavailable: {error}", args.join(" "))),
+    }
+}
+
+/// Delegates the mutation to the native updater (`omarchy plugin update ID
+/// --yes`): fetch/fast-forward, native validation with rollback via
+/// `git reset --hard ORIG_HEAD`, and rescanPlugins. OmaSafe never forks
+/// that lifecycle logic.
+pub fn omarchy_plugin_update(id: &str) -> NativeCommand {
+    run_omarchy(&["plugin", "update", id, "--yes"])
+}
+
+pub fn omarchy_plugin_disable(id: &str) -> NativeCommand {
+    run_omarchy(&["plugin", "disable", id])
+}
+
+pub fn omarchy_plugin_enable(id: &str) -> NativeCommand {
+    run_omarchy(&["plugin", "enable", id])
+}
+
+/// Switches an active full-bar replacement back to the default bar before
+/// any mutation touches it.
+pub fn omarchy_bar_use_default() -> NativeCommand {
+    run_omarchy(&["bar", "use", "omarchy.bar"])
+}
+
 #[cfg(test)]
 mod tests {
     use super::{collect, git_diff, git_metadata, source_identity};

@@ -10,8 +10,11 @@ use omasafe_marketplace::{
 };
 use omasafe_plugin_trust::{
     DiffResult, SourceIdentity,
-    baseline::{ReviewDecision, ScanState, TrustHistory, TrustRecord, lock as lock_state},
-    collect, collect_one, git_diff, query_shell,
+    baseline::{
+        ReviewDecision, ScanState, TrustHistory, TrustRecord, UpdateFlowRecord, lock as lock_state,
+    },
+    collect, collect_one, git_diff, omarchy_bar_use_default, omarchy_plugin_disable,
+    omarchy_plugin_enable, omarchy_plugin_update, query_shell, source_identity,
 };
 use omasafe_report::Report;
 use sha2::{Digest, Sha256};
@@ -64,6 +67,12 @@ fn run(args: Vec<String>) -> Result<i32, Box<dyn std::error::Error>> {
             diff(id, rest)?;
             0
         }
+        [command, subcommand, id, rest @ ..]
+            if command == "plugins" && subcommand == "review-update" =>
+        {
+            review_update(id, rest)?;
+            0
+        }
         [command, subcommand, id, rest @ ..] if command == "plugins" && subcommand == "review" => {
             review(id, rest)?;
             0
@@ -104,7 +113,7 @@ fn run(args: Vec<String>) -> Result<i32, Box<dyn std::error::Error>> {
         [command, rest @ ..] if command == "scan-plugin" => scan_plugin(rest)?,
         _ => {
             eprintln!(
-                "usage: omasafe-cli plugins ... | scan [--format text|json] [--notify] [--only-new] | marketplace refresh [--commit COMMIT|--latest] | rules list [--format text|json] | rules explain RULE_ID [--format text|json] | plugins analyze PLUGIN_ID [--format text|json] [--fail-on SEVERITY] | scan-plugin (--path DIR|--git URL --revision COMMIT) [--format text|json] | schedule install | paths | provenance [--format text|json]"
+                "usage: omasafe-cli plugins ... | scan [--format text|json] [--notify] [--only-new] | marketplace refresh [--commit COMMIT|--latest] | rules list [--format text|json] | rules explain RULE_ID [--format text|json] | plugins analyze PLUGIN_ID [--format text|json] [--fail-on SEVERITY] | plugins review-update PLUGIN_ID [--expected-commit SHA] [--yes] | scan-plugin (--path DIR|--git URL --revision COMMIT) [--format text|json] | schedule install | paths | provenance [--format text|json]"
             );
             std::process::exit(2);
         }
@@ -275,6 +284,552 @@ fn expected_component(current: Option<&str>, expected: Option<&str>) -> bool {
         (Some(current), Some(expected)) => current == expected,
         (None, None) => true,
         _ => false,
+    }
+}
+
+/// Removes its directory when dropped so every exit path of the reviewed
+/// update leaves no candidate checkout behind.
+struct TempCandidate(PathBuf);
+
+impl Drop for TempCandidate {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// `plugins review-update ID [--expected-commit SHA] [--yes]`: evaluate an
+/// exact candidate commit, present the delta versus the trusted baseline,
+/// gate approval explicitly, delegate the mutation to the native updater,
+/// and verify postconditions before re-enabling or trusting. Rejected
+/// candidates never touch the live tree.
+fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut yes = false;
+    let mut expected_commit: Option<String> = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--yes" => {
+                yes = true;
+                index += 1;
+            }
+            "--expected-commit" => {
+                let value = next_value(args, index, "expected commit")?;
+                if !valid_commit(value) {
+                    return Err(format!(
+                        "--expected-commit must be a full hex commit SHA, got: {value}"
+                    )
+                    .into());
+                }
+                expected_commit = Some(value.to_owned());
+                index += 2;
+            }
+            value => return Err(format!("unknown review-update argument: {value}").into()),
+        }
+    }
+    if yes && expected_commit.is_none() {
+        // v0.1 unattended-trust rule: --yes alone never decides WHAT to trust.
+        return Err(
+            "--yes requires --expected-commit SHA: unattended updates must pin the exact reviewed commit"
+                .into(),
+        );
+    }
+
+    let paths = XdgPaths::discover()?;
+    paths.ensure()?;
+    let flow_path = paths.state.join("review-update.json");
+    match UpdateFlowRecord::load(&flow_path) {
+        Ok(Some(record)) => {
+            eprintln!(
+                "WARNING: an interrupted reviewed update for '{}' was found\n  candidate commit: {}\n  phase at interruption: {} (started {})\n  quiescing actions taken before it stopped: {}",
+                record.plugin_id,
+                record.candidate_commit,
+                record.phase,
+                record.started_at,
+                if record.quiesced.is_empty() {
+                    "none".to_owned()
+                } else {
+                    record.quiesced.join(", ")
+                },
+            );
+            eprintln!(
+                "  manual checks before trusting this plugin again:\n    - omarchy plugin list --json   (is the plugin enabled? which HEAD?)\n    - git -C ~/.config/omarchy/plugins/{0} log --oneline -3\n    - omarchy plugin validate ~/.config/omarchy/plugins/{0}\n  restore service only after HEAD matches a reviewed commit:\n    - omarchy plugin enable {0}   (or: omarchy bar use {0})",
+                record.plugin_id
+            );
+            eprintln!("  proceeding with a fresh attempt; the stale record is replaced on success");
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return Err(format!(
+                "interrupted-update record at {} is unreadable ({error}); inspect and remove it manually before running a reviewed update",
+                flow_path.display()
+            )
+            .into());
+        }
+    }
+
+    // --- Pre-flight: refuse before anything mutates ---
+    let plugin_root = plugin_root()?;
+    let (shell_json, _shell_error) = query_shell();
+    let inventory = collect_one(&plugin_root, id, shell_json.as_deref());
+    let record = inventory
+        .plugins
+        .iter()
+        .find(|plugin| plugin.id == id)
+        .ok_or_else(|| format!("plugin not found: {id}"))?;
+
+    if record.dirty == Some(true) {
+        return Err(
+            "refusing: installed worktree is dirty; commit or clean local changes before a reviewed update"
+                .into(),
+        );
+    }
+    if record.dirty.is_none() {
+        return Err(
+            "refusing: installed worktree git status is unavailable, so a safe update cannot be guaranteed"
+                .into(),
+        );
+    }
+
+    let history_path = paths.state.join("trust-history.json");
+    let _history_lock = lock_state(&history_path)?;
+    let mut history = TrustHistory::load(&history_path)?;
+    let baseline = history
+        .latest(id)
+        .ok_or_else(|| format!("no trusted baseline for {id}; run plugins trust first"))?
+        .accepted
+        .clone();
+
+    let full_bar_active = record.active == Some(true)
+        && record.kinds.iter().any(|kind| kind == "bar")
+        || inventory.active_full_bars.iter().any(|bar| bar == id);
+    let was_enabled = record.enabled.unwrap_or(false);
+
+    // --- Candidate resolution: exact commit or explicit pin, never HEAD-text ---
+    let url = record
+        .repository
+        .clone()
+        .filter(|value| value.starts_with("https://"))
+        .ok_or("refusing: plugin origin is missing or not an HTTPS repository")?;
+    let registry_note;
+    let candidate = match &expected_commit {
+        Some(commit) => {
+            registry_note = format!("candidate pinned via --expected-commit ({commit})");
+            commit.clone()
+        }
+        None => {
+            let snapshot = load_cached_catalog(&paths.cache)?.ok_or(
+                "no cached catalog snapshot; run marketplace refresh or pass --expected-commit",
+            )?;
+            let correlation = correlate(
+                id,
+                record.repository.as_deref(),
+                record.head.as_deref(),
+                &snapshot,
+            );
+            let claim = correlation
+                .registry_claim
+                .as_ref()
+                .and_then(|claim| claim.upstream_observed_commit.clone());
+            match claim {
+                Some(commit)
+                    if matches!(correlation.status.as_str(), "listed" | "installed-differs") =>
+                {
+                    registry_note = format!(
+                        "registry claim from catalog commit {} (correlation: {})",
+                        snapshot.repository_commit, correlation.status
+                    );
+                    commit
+                }
+                _ => {
+                    return Err(format!(
+                        "no pinned registry claim available (correlation status: {}); pass --expected-commit to pin the candidate explicitly",
+                        correlation.status
+                    )
+                    .into());
+                }
+            }
+        }
+    };
+    if Some(candidate.as_str()) == record.head.as_deref() {
+        println!("Already at pinned commit {candidate}; nothing to update.");
+        return Ok(());
+    }
+
+    // --- Fetch the exact candidate into the bounded analysis cache ---
+    let cache_root = paths.cache.join("analysis");
+    let bare = omasafe_analyzer::ensure_pinned_repository(&cache_root, &url, &candidate)
+        .map_err(|error| format!("candidate fetch failed: {error}"))?;
+    let baseline_head_available = baseline
+        .head
+        .as_deref()
+        .filter(|head| *head != candidate)
+        .map(|head| omasafe_analyzer::ensure_pinned_repository(&cache_root, &url, head).is_ok())
+        .unwrap_or(false);
+
+    // Materialize a working tree for validation + filesystem analysis.
+    let checkout = TempCandidate(std::env::temp_dir().join(format!(
+        "omasafe-review-update-{}-{}",
+        id.replace(['/', ':', ' '], "_"),
+        std::process::id()
+    )));
+    let _ = std::fs::remove_dir_all(&checkout.0);
+    bounded_git(
+        None,
+        &["init", "--quiet", checkout.0.to_string_lossy().as_ref()],
+    )
+    .map_err(|error| format!("candidate checkout failed: {error}"))?;
+    bounded_git(
+        Some(&checkout.0),
+        &[
+            "fetch",
+            "--quiet",
+            bare.to_string_lossy().as_ref(),
+            &candidate,
+        ],
+    )
+    .map_err(|error| format!("candidate checkout failed: {error}"))?;
+    bounded_git(
+        Some(&checkout.0),
+        &["checkout", "--quiet", "--detach", "FETCH_HEAD"],
+    )
+    .map_err(|error| format!("candidate checkout failed: {error}"))?;
+    if baseline_head_available && let Some(head) = baseline.head.as_deref() {
+        let _ = bounded_git(
+            Some(&checkout.0),
+            &["fetch", "--quiet", bare.to_string_lossy().as_ref(), head],
+        );
+    }
+
+    // Native-parity manifest validation on the candidate BEFORE any mutation.
+    let issues = omasafe_marketplace::manifest::validate_plugin_folder(&checkout.0);
+    if !issues.is_empty() {
+        for issue in &issues {
+            eprintln!("manifest issue: {}: {}", issue.code, issue.message);
+        }
+        return Err(format!(
+            "refusing before mutation: candidate {candidate} fails native manifest validation ({} issue(s))",
+            issues.len()
+        )
+        .into());
+    }
+
+    // Candidate analysis (same pipeline as scan --include-analysis).
+    let ingest = omasafe_analyzer::ingest_filesystem(
+        &checkout.0,
+        omasafe_analyzer::Limits::default(),
+        omasafe_core::bounds::TimeBudget::default(),
+    );
+    let mut candidate_inventory =
+        ingest.map_err(|error| format!("candidate analysis failed: {error}"))?;
+    let reader = pinned_filesystem_reader(checkout.0.clone());
+    let budget = omasafe_core::bounds::TimeBudget::default();
+    let artifacts = omasafe_analyzer::analyze_inventory(&mut candidate_inventory, &reader, &budget);
+    let finding_rule_ids: Vec<String> = artifacts
+        .rendered_findings()
+        .into_iter()
+        .map(|finding| finding.rule_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let capability_kinds: Vec<String> = artifacts
+        .capabilities
+        .iter()
+        .map(|capability| capability.capability.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    let tree = bounded_git(
+        Some(&bare),
+        &["rev-parse", &format!("{candidate}^{{tree}}")],
+    )
+    .ok();
+    let candidate_identity = source_identity(
+        id,
+        &checkout.0,
+        Some(url.clone()),
+        Some(candidate.clone()),
+        tree,
+    );
+
+    // --- Delta versus the trusted baseline ---
+    let previous_event = ScanState::load(&paths.state.join("scan-state.json"))
+        .ok()
+        .and_then(|state| state.analysis_events.get(id).cloned());
+    let set_delta = |candidate_set: &[String], previous_set: &[String]| {
+        (
+            candidate_set
+                .iter()
+                .filter(|item| !previous_set.contains(item))
+                .cloned()
+                .collect::<Vec<_>>(),
+            previous_set
+                .iter()
+                .filter(|item| !candidate_set.contains(item))
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+    };
+    let empty: Vec<String> = Vec::new();
+    let (previous_rules, previous_caps) = match &previous_event {
+        Some(event) => (&event.finding_rule_ids, &event.capability_kinds),
+        None => (&empty, &empty),
+    };
+    let (added_rules, removed_rules) = set_delta(&finding_rule_ids, previous_rules);
+    let (added_capabilities, removed_capabilities) = set_delta(&capability_kinds, previous_caps);
+
+    let diff = if baseline_head_available {
+        let head = baseline.head.clone().unwrap_or_default();
+        git_diff(&checkout.0, &head, &candidate)
+    } else {
+        DiffResult {
+            available: false,
+            text: None,
+            truncated: false,
+            limitation: Some("trusted HEAD could not be fetched into the cache".to_owned()),
+        }
+    };
+
+    // --- Preview ---
+    println!("Reviewed update preview for {id}");
+    println!("  {registry_note}");
+    println!(
+        "  trusted baseline: HEAD {}",
+        baseline.head.as_deref().unwrap_or("(unknown)")
+    );
+    println!("  candidate:        HEAD {candidate}");
+    match (&baseline.content_digest, &candidate_identity.content_digest) {
+        (Some(old), Some(new)) if old != new => {
+            println!("  content digest changes: {old} -> {new}");
+        }
+        (Some(_), Some(_)) => println!("  content digest unchanged"),
+        _ => {}
+    }
+    if added_rules.is_empty() && removed_rules.is_empty() {
+        println!("  findings: no rule-id delta versus the last recorded analysis");
+    } else {
+        if !added_rules.is_empty() {
+            println!("  NEW findings since last recorded analysis:");
+            for rule in &added_rules {
+                println!("    + {rule}");
+            }
+        }
+        if !removed_rules.is_empty() {
+            println!("  resolved findings:");
+            for rule in &removed_rules {
+                println!("    - {rule}");
+            }
+        }
+    }
+    if !added_capabilities.is_empty() {
+        println!("  new capabilities: {}", added_capabilities.join(", "));
+    }
+    if !removed_capabilities.is_empty() {
+        println!(
+            "  capabilities no longer observed: {}",
+            removed_capabilities.join(", ")
+        );
+    }
+    if previous_event.is_none() {
+        println!(
+            "  note: no prior recorded analysis event for this plugin; deltas compare against an empty baseline"
+        );
+    }
+    if diff.available {
+        let text = diff.text.as_deref().unwrap_or("");
+        println!(
+            "  source diff (trusted..candidate): {} bytes{}",
+            text.len(),
+            if diff.truncated { ", TRUNCATED" } else { "" }
+        );
+        println!("{text}");
+    } else {
+        println!("  source diff unavailable: trusted HEAD could not be fetched into the cache");
+    }
+    for limitation in candidate_inventory
+        .limitations
+        .iter()
+        .chain(artifacts.limitations.iter())
+    {
+        println!("  coverage limitation: {limitation}");
+    }
+
+    // --- Approval gate: unattended updates must pin the exact commit ---
+    if yes {
+        let expected = expected_commit.as_deref().ok_or(
+            "--yes requires --expected-commit SHA: unattended updates must pin the exact reviewed commit",
+        )?;
+        if expected != candidate {
+            return Err(format!(
+                "--expected-commit {expected} does not match the evaluated candidate {candidate}"
+            )
+            .into());
+        }
+    } else {
+        if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+            return Err(
+                "interactive review-update requires a terminal; use --yes with --expected-commit"
+                    .into(),
+            );
+        }
+        eprint!("Type 'update' to apply exactly commit {candidate}: ");
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if answer.trim() != "update" {
+            return Err("update rejected; nothing was modified".into());
+        }
+    }
+
+    // --- Interrupted-state record goes live right before the first mutation ---
+    let mut flow = UpdateFlowRecord {
+        schema_version: 1,
+        plugin_id: id.to_owned(),
+        candidate_commit: candidate.clone(),
+        started_at: now(),
+        phase: "delegating".into(),
+        quiesced: Vec::new(),
+    };
+
+    // Quiesce: switch an active full-bar replacement back to the default bar,
+    // disable ordinary enabled plugins, so native rollback can never leave
+    // new code live without a completed review.
+    if full_bar_active {
+        let outcome = omarchy_bar_use_default();
+        if !outcome.success {
+            let _ = std::fs::remove_file(&flow_path);
+            return Err(format!(
+                "refusing before mutation: switching back to the default bar failed: {}",
+                outcome.output
+            )
+            .into());
+        }
+        flow.quiesced.push("bar-switched".into());
+    } else if was_enabled {
+        let outcome = omarchy_plugin_disable(id);
+        if !outcome.success {
+            let _ = std::fs::remove_file(&flow_path);
+            return Err(format!(
+                "refusing before mutation: disabling the plugin failed: {}",
+                outcome.output
+            )
+            .into());
+        }
+        flow.quiesced.push("disabled".into());
+    }
+    flow.store(&flow_path)?;
+
+    // --- Delegate the mutation; never fork native lifecycle logic ---
+    let outcome = omarchy_plugin_update(id);
+    if !outcome.success {
+        flow.phase = "failed".into();
+        flow.store(&flow_path)?;
+        eprintln!("native updater failed:\n{}", outcome.output);
+        eprintln!(
+            "the plugin is left disabled on purpose; the native updater rolled back via\n\
+             'git reset --hard ORIG_HEAD' if validation failed.\n\
+             manual recovery:\n\
+               git -C ~/.config/omarchy/plugins/{id} log --oneline -3\n\
+               omarchy plugin validate ~/.config/omarchy/plugins/{id}\n\
+             then re-enable once you have verified the content yourself:\n\
+               omarchy plugin enable {id}"
+        );
+        return Err(format!("native update of {id} failed").into());
+    }
+
+    // --- Postconditions: exact HEAD + fresh rescan before anything goes live ---
+    flow.phase = "verifying".into();
+    flow.store(&flow_path)?;
+    let (fresh_shell_json, fresh_shell_error) = query_shell();
+    let fresh_json = match fresh_shell_json {
+        Some(json) => json,
+        None => {
+            flow.phase = "failed".into();
+            flow.store(&flow_path)?;
+            eprintln!(
+                "post-update rescan could not be read ({}); the plugin stays disabled",
+                fresh_shell_error.unwrap_or_else(|| "unknown error".into())
+            );
+            return Err("rescan verification failed after update".into());
+        }
+    };
+    let updated = collect_one(&plugin_root, id, Some(fresh_json.as_str()));
+    let updated_record = updated.plugins.iter().find(|plugin| plugin.id == id);
+    let Some(updated_record) = updated_record else {
+        flow.phase = "failed".into();
+        flow.store(&flow_path)?;
+        eprintln!(
+            "postcondition failed: plugin vanished from the inventory after update; \
+             inspect 'omarchy plugin list --json' and the plugin folder manually"
+        );
+        return Err("rescan verification failed after update".into());
+    };
+    if updated_record.head.as_deref() != Some(candidate.as_str()) {
+        flow.phase = "failed".into();
+        flow.store(&flow_path)?;
+        eprintln!(
+            "raced candidate detected: installed HEAD is {:?}, not the reviewed commit {candidate}.\
+             \nThe native updater has no expected-SHA guard yet, so another push won the race;\
+             \nthe plugin stays disabled. Inspect the new HEAD manually and either re-run\n\
+             'plugins review-update' against it or restore the reviewed state with\n\
+             'git -C ~/.config/omarchy/plugins/{id} reset --hard {candidate}'",
+            updated_record.head
+        );
+        return Err("installed HEAD does not match the reviewed commit".into());
+    }
+    if updated_record.dirty == Some(true) {
+        flow.phase = "failed".into();
+        flow.store(&flow_path)?;
+        eprintln!("postcondition warning: worktree reports dirty after fast-forward merge");
+    }
+
+    // --- Restore availability, then trust the verified identity ---
+    if full_bar_active || was_enabled {
+        let enable_outcome = omarchy_plugin_enable(id);
+        if !enable_outcome.success {
+            eprintln!(
+                "warning: re-enabling failed ({}); the reviewed commit is installed but the plugin stays disabled.\nmanual step: omarchy plugin enable {id}",
+                enable_outcome.output
+            );
+        }
+    }
+
+    history.accept(TrustRecord {
+        plugin_id: id.to_owned(),
+        accepted: candidate_identity,
+        accepted_at: now(),
+        note: format!("reviewed update to {candidate}"),
+    });
+    history.write_atomic_locked(&history_path)?;
+
+    let _ = std::fs::remove_file(&flow_path);
+    println!(
+        "Reviewed update complete: {id} is at reviewed commit {candidate}; trust baseline advanced."
+    );
+    Ok(())
+}
+
+/// Bounded argv-only local git invocation with scrubbed config, returning
+/// trimmed stdout on success.
+fn bounded_git(dir: Option<&Path>, args: &[&str]) -> Result<String, String> {
+    let mut command = omasafe_core::git::command();
+    command.args(args.to_vec());
+    if let Some(dir) = dir {
+        command.current_dir(dir);
+    }
+    match omasafe_core::bounds::run_bounded_capped(
+        &mut command,
+        omasafe_core::bounds::GIT_PROCESS_BUDGET,
+        omasafe_core::bounds::MAX_PROCESS_OUTPUT_BYTES_PER_STREAM,
+    ) {
+        Ok(Some(captured)) if captured.status.success() && !captured.truncated => {
+            Ok(String::from_utf8_lossy(&captured.stdout).trim().to_owned())
+        }
+        Ok(Some(captured)) => Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&captured.stderr).trim()
+        )),
+        _ => Err(format!("git {} did not complete", args.join(" "))),
     }
 }
 
