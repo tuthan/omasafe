@@ -65,17 +65,23 @@ pub struct SuppressionState {
 
 impl SuppressionState {
     pub fn load(path: &Path) -> Result<Self, Error> {
-        if !path.exists() {
-            return Ok(Self {
-                schema_version: SUPPRESSION_SCHEMA_VERSION,
-                suppressions: Vec::new(),
-            });
-        }
-        let state: Self =
-            serde_json::from_slice(&fs::read(path)?).map_err(|source| Error::Json {
-                path: path.display().to_string(),
-                source,
-            })?;
+        // Read first and special-case only NotFound: `Path::exists` maps
+        // metadata/access failures to `false`, which would silently discard
+        // active suppressions without the caller's unreadable disclosure.
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self {
+                    schema_version: SUPPRESSION_SCHEMA_VERSION,
+                    suppressions: Vec::new(),
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let state: Self = serde_json::from_slice(&bytes).map_err(|source| Error::Json {
+            path: path.display().to_string(),
+            source,
+        })?;
         if state.schema_version != SUPPRESSION_SCHEMA_VERSION {
             return Err(Error::Schema {
                 version: state.schema_version,
@@ -201,11 +207,17 @@ fn validate_path_scope(scope: &str) -> Result<(), String> {
 /// Segment-exact prefix containment: `assets` matches `assets/x.qml` but
 /// never `assets_backup/x.qml`.
 fn path_matches_scope(path: &str, scope: &str) -> bool {
-    let scope = scope.trim_end_matches('/');
+    let scope = canonical_scope(scope);
     if scope.is_empty() {
         return true;
     }
     path == scope || path.starts_with(&format!("{scope}/"))
+}
+
+/// Canonical scope form used for storage AND reinstate comparison, so
+/// semantically identical scopes (`assets`, `assets/`) always agree.
+pub fn canonical_scope(scope: &str) -> String {
+    scope.trim_end_matches('/').to_owned()
 }
 
 fn now_stamp() -> String {

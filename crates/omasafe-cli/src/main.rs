@@ -692,7 +692,33 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
         // identities compare stably regardless of struct field order.
         let policy_string =
             serde_json::to_string(&serde_json::to_value(omasafe_analyzer::policy_identity())?)?;
+        let mut classified_ids: BTreeSet<String> = BTreeSet::new();
         for plugin in &inventory.plugins {
+            if !classified_ids.insert(plugin.id.clone()) {
+                // Duplicate manifests claiming one id would alias each
+                // other's event snapshot and make classification depend on
+                // walk order; disclose instead of guessing.
+                emit_scan_alert(
+                    format!("analysis:{}:duplicate-id", plugin.id),
+                    plugin.id.clone(),
+                    "lost-coverage",
+                    "warning",
+                    format!(
+                        "multiple installed directories claim plugin id {}; \
+                         analysis events are tracked for the first only",
+                        plugin.id
+                    ),
+                    false,
+                    notify,
+                    only_new,
+                    &mut live_keys,
+                    &mut alerts,
+                    &mut new_alerts,
+                    &mut state,
+                    &mut highest_severity,
+                );
+                continue;
+            }
             let source_identity = plugin
                 .content_digest
                 .clone()
@@ -746,42 +772,45 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
                 .collect();
 
             let previous = state.analysis_events.get(&plugin.id).cloned();
-            let class_event: Option<(&str, &str, String)> = match &previous {
-                // First observation is a quiet baseline.
-                None => None,
+            // Explicit classification: drift rounds refresh silently and are
+            // NEVER eligible for growth alerts (the baseline they would
+            // compare against describes pre-drift content).
+            enum EventClass {
+                Baseline,
+                DriftRefresh,
+                PolicyUpdate,
+                Instability,
+                Clean,
+            }
+            let class = match &previous {
+                None => EventClass::Baseline,
                 Some(previous) if previous.source_identity != source_identity => {
-                    // Source drift is already alerted by the source-drift
-                    // section; refresh the baseline so policy/fingerprint
-                    // classes never mask or double-report drift.
-                    None
+                    EventClass::DriftRefresh
                 }
-                Some(previous) if previous.policy_identity != policy_string => Some((
-                    "analyzer-policy-update",
-                    "warning",
-                    "analyzer policy changed since the last evaluation; findings \
-                     and capabilities were re-evaluated under the new policy"
-                        .to_owned(),
-                )),
-                Some(previous) if previous.fingerprint != fingerprint => Some((
-                    "fingerprint-instability",
-                    "error",
-                    "analysis fingerprint changed while source identity and policy \
-                     identity stayed identical; nondeterminism is suspected and \
-                     review is required"
-                        .to_owned(),
-                )),
-                Some(_) => None,
+                Some(previous) if previous.policy_identity != policy_string => {
+                    EventClass::PolicyUpdate
+                }
+                Some(previous) if previous.fingerprint != fingerprint => EventClass::Instability,
+                Some(_) => EventClass::Clean,
             };
 
-            if let (Some(previous), None) = (&previous, &class_event) {
-                // Identity-clean comparison round: report capability/rule
-                // growth against the stored snapshot.
+            // Growth comparison runs whenever a previous snapshot exists for
+            // unchanged source — INCLUDING policy-update and instability
+            // rounds, where analyzer improvement or nondeterminism most often
+            // manifests. First transitions from empty sets alert like any
+            // other growth.
+            if let Some(previous) = &previous
+                && matches!(
+                    class,
+                    EventClass::PolicyUpdate | EventClass::Instability | EventClass::Clean
+                )
+            {
                 let added_capabilities: Vec<String> = capability_kinds
                     .iter()
                     .filter(|kind| !previous.capability_kinds.contains(kind))
                     .cloned()
                     .collect();
-                if !added_capabilities.is_empty() && !previous.capability_kinds.is_empty() {
+                if !added_capabilities.is_empty() {
                     emit_scan_alert(
                         format!(
                             "analysis:{}:new-capability:{}",
@@ -793,7 +822,7 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
                         "warning",
                         format!(
                             "analysis observed new capabilities since the last \
-                             evaluation: {}",
+                                 evaluation: {}",
                             added_capabilities.join(", ")
                         ),
                         false,
@@ -811,7 +840,7 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
                     .filter(|rule| !previous.finding_rule_ids.contains(rule))
                     .cloned()
                     .collect();
-                if !added_rules.is_empty() && !previous.finding_rule_ids.is_empty() {
+                if !added_rules.is_empty() {
                     emit_scan_alert(
                         format!(
                             "analysis:{}:finding-regression:{}",
@@ -823,7 +852,7 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
                         "warning",
                         format!(
                             "analysis produced new findings since the last \
-                             evaluation: {}",
+                                 evaluation: {}",
                             added_rules.join(", ")
                         ),
                         false,
@@ -837,17 +866,15 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
                     );
                 }
             }
-            if let Some((kind, severity, message)) = class_event {
-                emit_scan_alert(
-                    format!(
-                        "analysis:{plugin_id}:{kind}",
-                        plugin_id = plugin.id,
-                        kind = kind
-                    ),
+            match class {
+                EventClass::PolicyUpdate => emit_scan_alert(
+                    format!("analysis:{}:analyzer-policy-update", plugin.id),
                     plugin.id.clone(),
-                    kind,
-                    severity,
-                    message,
+                    "analyzer-policy-update",
+                    "warning",
+                    "analyzer policy changed since the last evaluation; findings \
+                     and capabilities were re-evaluated under the new policy"
+                        .to_owned(),
                     false,
                     notify,
                     only_new,
@@ -856,7 +883,26 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
                     &mut new_alerts,
                     &mut state,
                     &mut highest_severity,
-                );
+                ),
+                EventClass::Instability => emit_scan_alert(
+                    format!("analysis:{}:fingerprint-instability", plugin.id),
+                    plugin.id.clone(),
+                    "fingerprint-instability",
+                    "error",
+                    "analysis fingerprint changed while source identity and policy \
+                     identity stayed identical; nondeterminism is suspected and \
+                     review is required"
+                        .to_owned(),
+                    false,
+                    notify,
+                    only_new,
+                    &mut live_keys,
+                    &mut alerts,
+                    &mut new_alerts,
+                    &mut state,
+                    &mut highest_severity,
+                ),
+                _ => {}
             }
 
             state.analysis_events.insert(
@@ -872,7 +918,22 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
             analysis_events_dirty = true;
         }
     }
-    state.alerts.retain(|key, _| live_keys.contains(key));
+    // Retention is namespace-aware: default scans never hold `analysis:*`
+    // keys in live_keys, so a plain retain would silently clear analysis-event
+    // dedup state (and --notify would persist that clearing). Analysis keys
+    // survive any scan that did not run the opted-in pass.
+    state.alerts.retain(|key, _| {
+        if key.starts_with("analysis:") {
+            // Only a run that actually performed the opted-in classification
+            // may retire its own stale keys; default scans leave them be.
+            return if include_analysis {
+                live_keys.contains(key)
+            } else {
+                true
+            };
+        }
+        live_keys.contains(key)
+    });
     if notify || analysis_events_dirty {
         state.write_atomic_locked(&state_path)?;
     }
@@ -1245,6 +1306,9 @@ fn suppression_review(
         .into());
     }
     omasafe_core::suppress::validate_new(rule_id, reason, path_scope)?;
+    // Store and compare canonical scope forms so `assets` and `assets/`
+    // are the same suppression everywhere.
+    let canonical_path_scope = path_scope.map(omasafe_core::suppress::canonical_scope);
     let paths = XdgPaths::discover()?;
     paths.ensure()?;
     let path = paths.config.join("suppressions.json");
@@ -1255,7 +1319,7 @@ fn suppression_review(
             state.add(omasafe_core::suppress::SuppressionRecord {
                 rule_id: rule_id.to_owned(),
                 plugin_id: Some(plugin_id.to_owned()),
-                path_scope: path_scope.map(str::to_owned),
+                path_scope: canonical_path_scope,
                 reason: reason.to_owned(),
                 created_at: now(),
                 active: true,
@@ -1265,7 +1329,8 @@ fn suppression_review(
             println!("Suppression recorded in {}", path.display());
         }
         "reinstate" => {
-            let flipped = state.reinstate(rule_id, Some(plugin_id), path_scope);
+            let flipped =
+                state.reinstate(rule_id, Some(plugin_id), canonical_path_scope.as_deref());
             if flipped == 0 {
                 return Err(format!(
                     "no active suppression matches rule {rule_id} for {plugin_id} at that scope"
@@ -2590,4 +2655,107 @@ fn now_nanos() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod s5_reader_tests {
+    use super::*;
+    use omasafe_analyzer::{CoverageState, PayloadEntry, PayloadKind};
+    use std::fs;
+
+    fn record(path: &str, size: u64, digest_hex: Option<&str>) -> PayloadEntry {
+        PayloadEntry {
+            relative_path: path.to_owned(),
+            kind: PayloadKind::TextFile,
+            mode: 0o644,
+            size,
+            sha256_sampled: digest_hex.map(str::to_owned),
+            sampled_digest: false,
+            executable: false,
+            coverage_state: CoverageState::Analyzed,
+            link_target: None,
+            invocation_target: false,
+            object_id: None,
+        }
+    }
+
+    fn digest_hex(bytes: &[u8]) -> String {
+        use sha2::Digest as _;
+        let digest = sha2::Sha256::digest(bytes);
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn filesystem_reader_enforces_digest_size_and_file_type() {
+        let temp = tempfile::tempdir().unwrap();
+        let content = b"stable payload bytes\n".to_vec();
+        fs::write(temp.path().join("data.txt"), &content).unwrap();
+        let reader = pinned_filesystem_reader(temp.path().to_path_buf());
+        let matching = record(
+            "data.txt",
+            content.len() as u64,
+            Some(&digest_hex(&content)),
+        );
+        assert_eq!(reader(&matching).as_deref(), Some(content.as_slice()));
+
+        // Size drift fails even with a matching digest.
+        let short_entry = record(
+            "data.txt",
+            content.len() as u64 - 1,
+            Some(&digest_hex(&content)),
+        );
+        assert!(reader(&short_entry).is_none());
+
+        // Content drift under the recorded size fails the digest check.
+        let tampered = b"tampered payload byte\n".to_vec();
+        fs::write(temp.path().join("data.txt"), &tampered).unwrap();
+        assert!(reader(&matching).is_none());
+
+        // A swapped-in symlink is never followed.
+        fs::write(temp.path().join("evil.txt"), b"evil\n").unwrap();
+        fs::remove_file(temp.path().join("data.txt")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(temp.path().join("evil.txt"), temp.path().join("data.txt"))
+            .unwrap();
+        assert!(reader(&matching).is_none());
+
+        // Sampled entries carry no full digest to verify against.
+        let mut sampled = record("data.txt", 0, None);
+        sampled.sampled_digest = true;
+        assert!(reader(&sampled).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_reader_rejects_swapped_in_special_files() {
+        use std::ffi::CString;
+
+        let temp = tempfile::tempdir().unwrap();
+        let content = b"expected\n";
+        fs::write(temp.path().join("data.txt"), content).unwrap();
+        let reader = pinned_filesystem_reader(temp.path().to_path_buf());
+        let record = record("data.txt", content.len() as u64, Some(&digest_hex(content)));
+
+        let fifo = CString::new(temp.path().join("data.txt").to_str().unwrap().as_bytes()).unwrap();
+        fs::remove_file(temp.path().join("data.txt")).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        // O_NONBLOCK keeps the open from hanging; the fstat check rejects it.
+        assert!(reader(&record).is_none());
+    }
+
+    #[test]
+    fn git_reader_rejects_missing_objects_and_bad_digests() {
+        let temp = tempfile::tempdir().unwrap();
+        let reader = pinned_git_reader(temp.path().to_path_buf());
+        let mut record = record("blob", 4, Some(&digest_hex(b"body")));
+        record.object_id = Some("0000000000000000000000000000000000000000".to_owned());
+        assert!(reader(&record).is_none());
+
+        // Missing object id or missing sample digest read as None.
+        record.object_id = None;
+        assert!(reader(&record).is_none());
+        record.object_id = Some("abc".to_owned());
+        record.sha256_sampled = None;
+        assert!(reader(&record).is_none());
+    }
 }

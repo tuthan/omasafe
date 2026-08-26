@@ -44,9 +44,18 @@ EOF
 then
     repro="$root/determinism-canary-failure"
     mkdir -p "$repro"
+    # Preserve everything needed to reproduce: both outputs, the exact
+    # fixture tree, and the binary/build identity that produced them.
     cp "$work/report-1.json" "$repro/report-1.json"
     cp "$work/report-2.json" "$repro/report-2.json"
-    sha256sum "$fixture"/[!.]* >"$repro/input-hashes.txt" || true
+    rm -rf "${repro:?}/fixture"
+    cp -r "$fixture" "$repro/fixture"
+    {
+        printf 'commit: '
+        git -C "$root" rev-parse HEAD 2>/dev/null || echo unknown
+        printf 'binary_sha256: '
+        sha256sum "$bin" | awk '{print $1}'
+    } >"$repro/tool-identity.txt"
     echo "DETERMINISM CANARY FAILED: repeated analysis diverged." >&2
     echo "Reproduction inputs preserved in $repro" >&2
     exit 1

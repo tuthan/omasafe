@@ -668,6 +668,23 @@ cargo test --workspace --no-default-features               # 157 tests (lexical)
 ./scripts/determinism-canary.sh
 ```
 
+Codex review returned CHANGES-REQUIRED; every blocker and concern was
+verified real and fixed in the follow-up hardening commit: growth alerts
+are classified explicitly (drift rounds can never emit them) and are no
+longer masked by policy-update/instability rounds — analyzer improvement
+usually IS the fingerprint change, so those rounds compare sets too, with
+empty→first transitions alerting like any growth (pinned by test); the
+alert-retention pass is namespace-aware so a notifying DEFAULT scan can
+never clear `analysis:*` dedup state (pinned by test); duplicate plugin ids
+are disclosed instead of aliasing event snapshots; suppression path scopes
+are canonicalized for storage AND reinstate comparison (`assets` ≡
+`assets/`); an unreadable suppressions file is detected via read-with-
+NotFound-special-case instead of `Path::exists`, so permission failures get
+the required disclosure; the canary repro bundle now copies the fixture
+tree plus binary hash and commit; digest-bound filesystem/git readers gain
+direct pinning tests (symlink swap, FIFO swap via O_NOFOLLOW/O_NONBLOCK +
+fstat, size/digest drift, missing objects).
+
 Known limitations: CLI-created suppressions are always plugin-scoped (the
 store supports global path-only records for plugin-less contexts, but no
 creation path exists yet); fingerprint instability is detected only for

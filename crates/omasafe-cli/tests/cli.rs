@@ -1780,3 +1780,96 @@ fn include_analysis_emits_new_capability_and_finding_regression_alerts() {
         "{kinds:?}"
     );
 }
+
+#[test]
+fn instability_rounds_do_not_mask_capability_and_finding_growth() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.plugin.join("main.qml"),
+        "Process { command: [\"sh\", \"-c\", \"ls\"] }\n",
+    )
+    .unwrap();
+    let inventory = fixture.inventory();
+    let digest = inventory["result"]["plugins"][0]["content_digest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let policy = current_policy_identity_string(&fixture);
+
+    // Fingerprint moved under identical identity AND the stored snapshot
+    // misses capabilities/findings the current analysis observes: the
+    // instability error must not mask the growth alerts (and vice versa).
+    seed_analysis_event(
+        &fixture,
+        "io.example.cli",
+        &digest,
+        &policy,
+        "stale-fingerprint",
+        &["oma.qml.session-lock"],
+        &["clipboard-access"],
+    );
+    let (_, kinds) = scan_alert_kinds(
+        &fixture,
+        &["scan", "--include-analysis", "--format", "json"],
+    );
+    assert!(
+        kinds.contains(&"fingerprint-instability".to_owned()),
+        "{kinds:?}"
+    );
+    assert!(kinds.contains(&"new-capability".to_owned()), "{kinds:?}");
+    assert!(
+        kinds.contains(&"finding-regression".to_owned()),
+        "{kinds:?}"
+    );
+}
+
+#[test]
+fn default_scans_never_clear_analysis_event_dedup_state() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.plugin.join("main.qml"),
+        "Process { command: [\"sh\", \"-c\", \"ls\"] }\n",
+    )
+    .unwrap();
+    let inventory = fixture.inventory();
+    let digest = inventory["result"]["plugins"][0]["content_digest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Record an analysis event as already notified.
+    let path = fixture.state.path().join("omasafe/scan-state.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let state = serde_json::json!({
+        "schema_version": 1,
+        "alerts": {"analysis:io.example.cli:fingerprint-instability": "earlier"},
+        "analysis_events": {
+            "io.example.cli": {
+                "source_identity": digest,
+                "policy_identity": "stale-policy",
+                "fingerprint": "x",
+                "finding_rule_ids": [],
+                "capability_kinds": []
+            }
+        }
+    });
+    fs::write(&path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+    // A notifying DEFAULT scan must leave the analysis key in place even
+    // though it holds no live analysis keys of its own.
+    let output = fixture
+        .command()
+        .args(["scan", "--notify", "--format", "json"])
+        .output()
+        .expect("default scan runs");
+    assert!(
+        output.status.success() || output.status.code() == Some(3),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let persisted: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(
+        persisted["alerts"]["analysis:io.example.cli:fingerprint-instability"] == "earlier",
+        "default scan cleared analysis dedup state: {persisted}"
+    );
+}
