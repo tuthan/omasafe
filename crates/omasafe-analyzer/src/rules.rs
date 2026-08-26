@@ -10,7 +10,7 @@ use serde::Serialize;
 
 /// Monotonic version of this catalog. Bump when rules are added, retired, or
 /// redefined; the policy identity changes with it.
-pub const RULE_CATALOG_VERSION: u32 = 2;
+pub const RULE_CATALOG_VERSION: u32 = 3;
 
 /// Monotonic version of the severity table. Severity or rule-meaning changes
 /// require a new version here.
@@ -19,9 +19,11 @@ pub const SEVERITY_TABLE_VERSION: u32 = 1;
 /// Version of the verified security-surface reference this catalog derives from.
 pub const SUPPORTED_SURFACE_VERSION: &str = "omarchy-security-surface.v1";
 
-/// External marketplace rule-equivalence map version; populated in S4 when the
-/// Baseline v4 mappings are verified. `None` until then.
-pub const EQUIVALENCE_MAP_VERSION: Option<&str> = None;
+/// External marketplace rule-equivalence map version. The marketplace's
+/// Automated Security Baseline is at V3 upstream (V4 is a separate future
+/// policy there), so the shipped map records V3 with its verification commit;
+/// staleness against newer external versions is part of the map API.
+pub const EQUIVALENCE_MAP_VERSION: Option<&str> = Some("omarchy-marketplace-baseline-v3/1");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -78,6 +80,7 @@ impl std::fmt::Display for Language {
 pub enum Capability {
     ProcessExecution,
     DetachedProcessExecution,
+    DynamicCodeExecution,
     FilesystemAccess,
     NetworkAccess,
     PersistenceScheduling,
@@ -95,6 +98,7 @@ impl std::fmt::Display for Capability {
         let rendered = match self {
             Capability::ProcessExecution => "process-execution",
             Capability::DetachedProcessExecution => "detached-process-execution",
+            Capability::DynamicCodeExecution => "dynamic-code-execution",
             Capability::FilesystemAccess => "filesystem-access",
             Capability::NetworkAccess => "network-access",
             Capability::PersistenceScheduling => "persistence-scheduling",
@@ -247,6 +251,64 @@ pub const CATALOG: &[RuleDefinition] = &[
         "Handles password/fingerprint authentication flow in third-party QML.",
         "Never infer password safety; audit credential handling paths directly.",
     ),
+    qml_rule(
+        "oma.qml.dynamic-code",
+        "QML constructs code at runtime",
+        Capability::DynamicCodeExecution,
+        Severity::Medium,
+        "no third-party import allowlist",
+        "QML/JS builds or evaluates code from strings at runtime (Qt.createQmlObject, eval, new Function, atob decode chains).",
+        "Trace the string provenance; runtime construction evades every static import review.",
+    ),
+    qml_rule(
+        "oma.qml.obfuscated-payload-indicator",
+        "Encoded payload indicator in QML/JS",
+        Capability::DynamicCodeExecution,
+        Severity::Low,
+        "no third-party import allowlist",
+        "Long base64-shaped literals suggest hidden payload material.",
+        "Indicator only: decode the material manually and judge the decoded content.",
+    ),
+    RuleDefinition {
+        id: "oma.script.download-execute",
+        title: "Script downloads and executes remote content",
+        language: Language::Shell,
+        capability: Capability::ProcessExecution,
+        default_severity: Severity::High,
+        surface_anchor: "arbitrary non-QML payloads",
+        summary: "A bundled script pipes downloaded content straight into a shell or interpreter.",
+        review_guidance: "Match of the marketplace baseline's selectively blocking curl-pipe-shell family; treat as blocking until the install path is fixed.",
+    },
+    RuleDefinition {
+        id: "oma.script.privilege-escalation",
+        title: "Script escalates privileges or edits sudoers",
+        language: Language::Shell,
+        capability: Capability::ProcessExecution,
+        default_severity: Severity::High,
+        surface_anchor: "arbitrary non-QML payloads",
+        summary: "A bundled script grants itself passwordless root or writes sudoers policy.",
+        review_guidance: "Near-zero ordinary plugin need; verify the exact root command surface and input validation manually.",
+    },
+    RuleDefinition {
+        id: "oma.python.download-execute",
+        title: "Python script downloads and executes remote content",
+        language: Language::Python,
+        capability: Capability::ProcessExecution,
+        default_severity: Severity::High,
+        surface_anchor: "arbitrary non-QML payloads",
+        summary: "Bundled Python fetches remote content and hands it straight to exec/system.",
+        review_guidance: "Same family as script download-and-execute; treat as blocking until the install path is fixed.",
+    },
+    RuleDefinition {
+        id: "oma.python.privilege-escalation",
+        title: "Python script escalates privileges or edits sudoers",
+        language: Language::Python,
+        capability: Capability::ProcessExecution,
+        default_severity: Severity::High,
+        surface_anchor: "arbitrary non-QML payloads",
+        summary: "Bundled Python invokes privilege wrappers or writes passwordless sudoers policy.",
+        review_guidance: "Verify the exact root command surface; never infer safety from a benign-looking wrapper name.",
+    },
     RuleDefinition {
         id: "oma.shell.ipc-injected-objects",
         title: "Shell IPC/injected object inventory",
@@ -341,6 +403,21 @@ mod tests {
             (
                 "oma.qml.dynamic-reference",
                 "safe relative entry-point paths",
+            ),
+            ("oma.qml.dynamic-code", "no third-party import allowlist"),
+            (
+                "oma.qml.obfuscated-payload-indicator",
+                "no third-party import allowlist",
+            ),
+            ("oma.script.download-execute", "arbitrary non-QML payloads"),
+            (
+                "oma.script.privilege-escalation",
+                "arbitrary non-QML payloads",
+            ),
+            ("oma.python.download-execute", "arbitrary non-QML payloads"),
+            (
+                "oma.python.privilege-escalation",
+                "arbitrary non-QML payloads",
             ),
             ("oma.qml.detached-execution", "Quickshell.execDetached"),
             ("oma.qml.filesystem-access", "FileView"),

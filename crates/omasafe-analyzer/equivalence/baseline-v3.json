@@ -1,0 +1,106 @@
+{
+  "mapVersion": "1",
+  "externalSystem": "omarchy-plugin-marketplace",
+  "externalRulesetName": "automated-security-baseline",
+  "externalRulesetVersion": "3",
+  "verifiedAtCommit": "964dc08df2a3450578727b665908272cd3a277e5",
+  "verifiedAtUtc": "2026-08-26T00:00:00Z",
+  "notes": [
+    "Upstream PLAN.md keeps Baseline V4 as a separate future policy; this map records the shipped V3 catalogs completely.",
+    "Equivalence is coverage-level, not verdict-level: OmaSafe findings and marketplace baseline outcomes are independent systems.",
+    "Every external finding and capability id appears exactly once below, with an explicit coverage relation."
+  ],
+  "entries": [
+    {
+      "omaRuleId": "oma.qml.process-execution",
+      "externalId": "curl-pipe-shell",
+      "relation": "partial-overlap",
+      "note": "OmaSafe flags runtime QML download-and-execute provenance; the baseline additionally scans install-time scripts."
+    },
+    {
+      "omaRuleId": "oma.script.download-execute",
+      "externalId": "curl-pipe-shell",
+      "relation": "partial-overlap",
+      "note": "Lexical shell detection covers the bundled-installer path the baseline scans deterministically."
+    },
+    {
+      "omaRuleId": "oma.python.download-execute",
+      "externalId": "curl-pipe-shell",
+      "relation": "partial-overlap",
+      "note": "Python fetch-to-exec variant of the same family."
+    },
+    {
+      "omaRuleId": "oma.script.privilege-escalation",
+      "externalId": "sudoers-dangerous-passwordless-command",
+      "relation": "partial-overlap",
+      "note": "Passwordless sudoers/NOPASSWD write detection matches the blocking family; wrapper-based privilege use stays capability-level in OmaSafe."
+    },
+    {
+      "omaRuleId": "oma.python.privilege-escalation",
+      "externalId": "sudoers-dangerous-passwordless-command",
+      "relation": "partial-overlap",
+      "note": "Python variant of the sudoers/passwordless-root family."
+    },
+    {
+      "omaRuleId": null,
+      "externalId": "cargo-git-unpinned",
+      "relation": "not-covered",
+      "note": "Pinned-dependency enforcement for Cargo git sources is not an OmaSafe v0.2 rule family."
+    },
+    {
+      "omaRuleId": null,
+      "externalId": "remote-git-execution-unpinned",
+      "relation": "not-covered",
+      "note": "Pinned-commit enforcement for remote git sources is not an OmaSafe v0.2 rule family yet."
+    },
+    {
+      "omaRuleId": null,
+      "externalId": "privileged-process-control-from-shared-temp",
+      "relation": "not-covered",
+      "note": "PID-from-shared-temp patterns require data-flow evidence OmaSafe does not model yet."
+    },
+    {
+      "omaCapability": "process-execution",
+      "externalId": "installer",
+      "relation": "partial-overlap",
+      "note": "Installer paths surface as process-execution capability context when scripts run package/service tooling."
+    },
+    {
+      "omaCapability": "process-execution",
+      "externalId": "package-manager",
+      "relation": "partial-overlap",
+      "note": "pacman/yay/apt/dnf invocations in bundled scripts are recorded as process-execution capabilities."
+    },
+    {
+      "omaCapability": "process-execution",
+      "externalId": "privilege",
+      "relation": "partial-overlap",
+      "note": "sudo/pkexec/doas invocations are recorded as process-execution capabilities without asserting misuse."
+    },
+    {
+      "omaCapability": null,
+      "externalId": "remote-build",
+      "relation": "not-covered",
+      "note": "Remote source builds are only visible to OmaSafe when their download-and-execute shape matches a script rule."
+    },
+    {
+      "omaCapability": null,
+      "externalId": "bundled-executable-binary",
+      "relation": "structural-equivalent",
+      "note": "OmaSafe's payload inventory structurally detects executable binaries with native-format classification; this maps to inventory facts, not a Capability enum member."
+    },
+    {
+      "omaCapability": "persistence-scheduling",
+      "externalId": "service-management",
+      "relation": "partial-overlap",
+      "note": "systemctl/systemd-run invocations and headless service plugin kinds map to persistence-scheduling context."
+    },
+    {
+      "omaRuleId": "oma.script.privilege-escalation",
+      "omaCapability": "process-execution",
+      "externalId": "sudoers-modification",
+      "relation": "partial-overlap",
+      "note": "Sudoers writes are findings under the script privilege rule; documentation-only mentions stay unscanned prose."
+    }
+  ]
+}

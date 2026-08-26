@@ -521,4 +521,70 @@ via scan-plugin tests; git-sourced CLI analysis is covered at the analyzer
 API level (production fetch is HTTPS-only, so local file:// URLs are rightly
 rejected end-to-end).
 
-Next: **v0.2 S4 — Full rule set and priority surfaces**.
+Next: **v0.2 S5 — Suppressions, event separation, determinism canary**.
+
+## v0.2 S4 — Full Rule Set and Priority Surfaces
+
+Status: **complete**
+
+Implemented:
+
+- **Priority surfaces**: third-party imports/usages of polkit
+  (`Quickshell.Services.Polkit`), PAM (`PamContext`, `Services.Pam`), and
+  session-lock (`WlSessionLock*`) APIs are immediate High findings per the
+  verified surface doc; clipboard and Hyprland/Wayland/Wlr tokens record
+  capability context only.
+- **Remaining capability rules**: `oma.qml.dynamic-code` (Medium) detects
+  eval/Qt.createQmlObject/new Function/atob construction; 
+  `oma.qml.obfuscated-payload-indicator` (Low) flags base64-shaped literals
+  with exact 63/64 boundary and letters+digits requirements; FileView paths
+  toward autostart/systemd-user locations surface persistence-location
+  context findings.
+- **Minimal script rules** (`oma.script.*` / `oma.python.*`
+  download-execute + privilege-escalation, High): bundled shell/Python
+  payloads are lexically scanned and always labelled `partial`; findings
+  require actual download-to-interpreter pipes or sudoers/NOPASSWD writes —
+  read-only inspection and bare sudo/pacman/systemctl stay capability-level.
+  Comment stripping is language-exact: scheme-guarded `//` for QML/JS,
+  any-position `#` for Python, word-boundary `#` for POSIX shell.
+- **Plugin-kind context**: manifest.json kinds feed the
+  `oma.context.replaces-bar` result and headless-service persistence
+  capability; malformed manifests disclose limitations instead of failing
+  silently.
+- **Marketplace Baseline V3 equivalence map** (`equivalence.rs` + embedded
+  JSON): all five upstream finding ids and seven capability ids recorded
+  with explicit coverage relations against verification commit `964dc08d…`;
+  staleness API marks maps stale when the cached snapshot records a newer
+  external baseline version (`equivalence-map-stale:...` limitation);
+  policy identity now carries
+  `equivalence_map_version = omarchy-marketplace-baseline-v3/1`. Reports add
+  an additive `equivalence` summary object.
+- **Priority ordering**: rendered findings sort severity-descending with
+  stable tie-breakers so High/Critical findings dominate report views.
+
+Verification:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace          # 144 tests (feature off)
+cargo test --workspace --features omasafe-analyzer/qml-parser   # 144 (on)
+./scripts/generate-cli-assets.sh --check
+```
+
+Codex review produced three blockers (missing new-Function detection;
+unsound NOPASSWD/comment handling; incomplete equivalence map) plus
+concerns/nits — every one fixed and pinned with tests before commit. Codex
+credits ran out before a final re-review round; the fixes are mechanically
+verified by the test suite above, including the exact regressions the
+review demanded (base64 boundaries, read-only NOPASSWD negative,
+language-exact comments, map completeness, CLI staleness e2e,
+severity-first ordering).
+
+Known limitations: Process/FileView type matching remains
+import-unqualified; AST persistence detection covers static paths only
+(dynamic Quickshell.env concatenations surface as dynamic-reference
+findings and via the lexical path); remote-build/cargo-pinning/
+shared-temp-PID baseline families are explicitly not-covered in the map.
+
+Next: **v0.2 S5 — Suppressions, event separation, determinism canary**.

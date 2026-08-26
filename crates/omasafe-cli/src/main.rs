@@ -1665,6 +1665,36 @@ enum ContentSource {
     GitRepository(PathBuf),
 }
 
+/// Most-common `verificationBaselineVersion` across the locally cached frozen
+/// catalog snapshot, used only for equivalence staleness marking. `None` when
+/// no snapshot is available or it carries no version information.
+fn observed_marketplace_baseline() -> Option<String> {
+    let cache_dir = XdgPaths::discover().ok()?.cache;
+    let raw = std::fs::read_to_string(cache_dir.join("catalog.json")).ok()?;
+    let document: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let entries = match &document {
+        // Both frozen-snapshot shapes: bare entry arrays and wrapped objects.
+        serde_json::Value::Array(entries) => entries,
+        wrapped => wrapped
+            .get("entries")
+            .or_else(|| wrapped.get("plugins"))
+            .and_then(serde_json::Value::as_array)?,
+    };
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for entry in entries {
+        if let Some(version) = entry
+            .get("verificationBaselineVersion")
+            .and_then(serde_json::Value::as_str)
+        {
+            *counts.entry(version).or_insert(0) += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(version, _)| version.to_owned())
+}
+
 /// Read at most `expected`+1 bytes so an overgrown file is detectable.
 fn read_capped(file: &std::fs::File, expected: u64) -> Option<Vec<u8>> {
     use std::io::Read;
@@ -1762,14 +1792,34 @@ fn emit_analysis_report(
         omasafe_analyzer::fingerprint_analysis(&artifacts.results, &artifacts.capabilities);
     let mut coverage_limitations = inventory.limitations.clone();
     coverage_limitations.extend(artifacts.limitations.clone());
+
+    // Equivalence summary + staleness against the locally cached snapshot's
+    // recorded baseline version (most common value across entries).
+    let equivalence_map = omasafe_analyzer::EquivalenceMap::embedded();
+    let observed_baseline = observed_marketplace_baseline();
+    if let Some(observed) = &observed_baseline
+        && equivalence_map.is_stale_against(observed)
+    {
+        coverage_limitations.push(format!(
+            "equivalence-map-stale:map-v{}-observed-v{observed}",
+            equivalence_map.external_ruleset_version
+        ));
+    }
+    let equivalence_summary = omasafe_report::analysis::EquivalenceSummary {
+        map_version: equivalence_map.map_version.clone(),
+        external_system: equivalence_map.external_system.clone(),
+        external_ruleset_name: equivalence_map.external_ruleset_name.clone(),
+        external_ruleset_version: equivalence_map.external_ruleset_version.clone(),
+    };
     let analysis = omasafe_report::analysis::AnalysisSection::new(
         policy_identity.clone(),
         fingerprint,
-        coverage_limitations,
+        coverage_limitations.clone(),
         findings.clone(),
         artifacts.capabilities.clone(),
         artifacts.edges.clone(),
         omasafe_analyzer::parser_metadata(),
+        Some(equivalence_summary),
     );
 
     // --fail-on: findings are success; CI opts into a failure threshold.
@@ -1849,7 +1899,7 @@ fn emit_analysis_report(
                 omitted
             );
         }
-        for limitation in &inventory.limitations {
+        for limitation in &coverage_limitations {
             println!("Coverage limitation: {}", safe_text(limitation));
         }
         println!("Findings: {}", findings.len());

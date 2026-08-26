@@ -618,7 +618,11 @@ fn rules_list_reports_catalog_and_policy_identity() {
         report["result"]["policy_identity"]["parser_versions"]["qml"],
         "tree-sitter-qmljs/0.3.1"
     );
-    assert!(report["result"]["equivalence_map_version"].is_null());
+    // S4 ships the marketplace baseline equivalence map.
+    assert_eq!(
+        report["result"]["equivalence_map_version"],
+        "omarchy-marketplace-baseline-v3/1"
+    );
     let rules = report["result"]["rules"].as_array().unwrap();
     assert!(!rules.is_empty());
     let ids: BTreeSet<_> = rules
@@ -658,7 +662,7 @@ fn rules_list_text_is_deterministic() {
         .clone();
     assert_eq!(first, second);
     let rendered = String::from_utf8(first).unwrap();
-    assert!(rendered.contains("rule catalog v2"));
+    assert!(rendered.contains("rule catalog v3"));
     assert!(rendered.contains("oma.qml.session-lock"));
 }
 
@@ -723,11 +727,14 @@ fn analyze_reports_full_payload_inventory_end_to_end() {
     assert_eq!(report["result"]["target"]["source"], "installed-plugin");
     let analysis = &report["result"]["analysis"];
     assert_eq!(analysis["schema"], "omasafe.analysis.v1");
-    assert_eq!(analysis["policy_identity"]["rule_catalog_version"], 2);
+    assert_eq!(analysis["policy_identity"]["rule_catalog_version"], 3);
     let inventory = &report["result"]["payload_inventory"];
     let states = &inventory["coverage_states"];
+    // S3+S4: analyzable files land in analyzed/unreferenced/partial; only
+    // non-analyzable payloads stay unsupported.
     let unsupported = states["unsupported"].as_u64().unwrap();
-    assert!(unsupported >= 5, "states: {states}");
+    let partial = states["partial"].as_u64().unwrap();
+    assert!(unsupported + partial >= 5, "states: {states}");
     let entries = inventory["entries"].as_array().unwrap();
     let kinds: Vec<&str> = entries
         .iter()
@@ -930,7 +937,9 @@ Item {
         .find(|entry| entry["relative_path"] == "tool.sh")
         .unwrap();
     assert_eq!(tool["invocation_target"], true);
-    assert_eq!(tool["coverage_state"], "unsupported");
+    // Shell payloads are lexically scanned and labelled `partial` (S4):
+    // no-match never implies clean behavior.
+    assert_eq!(tool["coverage_state"], "partial");
     let panel = entries
         .iter()
         .find(|entry| entry["relative_path"] == "Panel.qml")
@@ -1092,4 +1101,62 @@ fn scan_plugin_negative_provenance_stays_clean() {
     let analysis = &report["result"]["analysis"];
     assert_eq!(analysis["findings"].as_array().unwrap().len(), 0);
     assert_eq!(analysis["invocation_edges"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn equivalence_staleness_is_disclosed_when_cached_snapshot_moves() {
+    let temp = tempfile::TempDir::new().unwrap();
+    fs::write(temp.path().join("Main.qml"), "Text {}\n").unwrap();
+
+    let fixture = Fixture::new();
+    // The fixture's isolated HOME has no cached catalog: no staleness.
+    let output = fixture
+        .command()
+        .args([
+            "scan-plugin",
+            "--path",
+            temp.path().to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(
+        report["result"]["analysis"]["equivalence"]["external_ruleset_version"],
+        "3"
+    );
+
+    // A cached snapshot recording a NEWER external baseline marks the map
+    // stale in the report limitations. The fixture wires XDG_CACHE_HOME to an
+    // isolated tempdir.
+    let omasafe_cache = fixture.cache.path().join("omasafe");
+    fs::create_dir_all(&omasafe_cache).unwrap();
+    fs::write(
+        omasafe_cache.join("catalog.json"),
+        r#"[{"id":"x","verificationBaselineVersion":"9"}]"#,
+    )
+    .unwrap();
+    let output_stale = fixture
+        .command()
+        .args([
+            "scan-plugin",
+            "--path",
+            temp.path().to_str().unwrap(),
+            "--format",
+            "text",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output_stale).unwrap();
+    assert!(
+        text.contains("equivalence-map-stale:map-v3-observed-v9"),
+        "{text}"
+    );
 }

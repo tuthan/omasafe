@@ -8,6 +8,7 @@
 //! Nothing here executes, sources, or renders scanned content.
 
 pub mod detect;
+pub mod equivalence;
 pub mod fingerprint;
 pub mod ingest;
 pub mod payload;
@@ -18,6 +19,7 @@ pub mod rules;
 pub mod qml;
 
 pub use detect::{AnalysisArtifacts, analyze_inventory, parser_metadata};
+pub use equivalence::EquivalenceMap;
 pub use fingerprint::{Confidence, NormalizedResult, fingerprint_analysis, fingerprint_results};
 pub use ingest::{
     IngestError, Limits, TargetSource, ensure_pinned_repository, ingest_filesystem,

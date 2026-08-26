@@ -100,6 +100,16 @@ pub struct InvocationEdge {
     pub target_path: String,
 }
 
+/// Which external baseline vocabulary this analysis's rule set was mapped
+/// against, recorded so staleness is visible to consumers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EquivalenceSummary {
+    pub map_version: String,
+    pub external_system: String,
+    pub external_ruleset_name: String,
+    pub external_ruleset_version: String,
+}
+
 /// The additive per-report analysis object.
 #[derive(Debug, Clone, Serialize)]
 pub struct AnalysisSection {
@@ -116,6 +126,8 @@ pub struct AnalysisSection {
     pub invocation_edges: Vec<InvocationEdge>,
     /// Parser build metadata; `None` in lexical-fallback builds (ADR 0001).
     pub parser: Option<ParserMetadata>,
+    /// External baseline mapping summary; `None` when no map ships.
+    pub equivalence: Option<EquivalenceSummary>,
 }
 
 impl AnalysisSection {
@@ -128,6 +140,7 @@ impl AnalysisSection {
         capabilities: Vec<CapabilityOccurrence>,
         invocation_edges: Vec<InvocationEdge>,
         parser: Option<ParserMetadata>,
+        equivalence: Option<EquivalenceSummary>,
     ) -> Self {
         Self {
             schema: ANALYSIS_SCHEMA_VERSION,
@@ -138,6 +151,7 @@ impl AnalysisSection {
             capabilities,
             invocation_edges,
             parser,
+            equivalence,
         }
     }
 }
