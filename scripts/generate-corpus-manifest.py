@@ -52,6 +52,17 @@ def main():
     with open(meta_path, encoding="utf-8") as handle:
         meta = json.load(handle)
 
+    # Provenance must be internally consistent: the recorded file digest
+    # describes exactly this catalog file, and a source commit is required
+    # for reproducibility claims to mean anything.
+    if meta.get("file_digest") and meta["file_digest"] != digest:
+        raise SystemExit(
+            "catalog.meta.json file_digest does not match the catalog file "
+            f"({meta['file_digest']} != {digest})"
+        )
+    if not meta.get("repository_commit"):
+        raise SystemExit("catalog.meta.json is missing repository_commit")
+
     picked = []
     for entry in entries:
         if entry.get("sourceType") not in (None, "community"):
@@ -74,6 +85,19 @@ def main():
             }
         )
     picked.sort(key=lambda item: item["pluginId"])
+
+    picked.sort(key=lambda item: (item["pluginId"], item["repository"]))
+    # Catalog snapshots can carry the same plugin id from more than one
+    # repository row; a corpus pin must be unique, so keep one deterministic
+    # representative (lowest repository URL) per id.
+    unique = []
+    seen_ids = set()
+    for item in picked:
+        if item["pluginId"] in seen_ids:
+            continue
+        seen_ids.add(item["pluginId"])
+        unique.append(item)
+    picked = unique
 
     manifest = {
         "manifestVersion": 1,

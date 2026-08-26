@@ -9,9 +9,10 @@ name: Corpus nightly
 #   stays bounded to a sample of 12.
 # - Unavailable repositories are counted incomplete and never clean; they do
 #   not fail the informational nightly. The release gate
-#   (`run-corpus.py --gate-high`) is wired at release time once dispositions
-#   have accrued — a fresh corpus would be permanently red on untriaged
-#   high-severity results, which is exactly what the ledger exists to fix.
+#   (`run-corpus.py --gate-high`) is NOT wired here: with a fresh ledger it
+#   would be permanently red on untriaged high-severity results. The release
+#   pipeline invokes the gate explicitly once dispositions accrued enough to
+#   make it meaningful (S8 wires that call).
 #
 # Validator parity runs against the recorded Omarchy version. GitHub-hosted
 # runners have no omarchy runtime, so parity degrades visibly there by

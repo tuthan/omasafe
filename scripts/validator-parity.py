@@ -2,15 +2,18 @@
 """Validator parity canary (S6 / M5): OmaSafe manifest checks vs native.
 
 Runs both `omarchy plugin validate` and OmaSafe's mirror over the pinned
-corpus clones and fails the build on verdict disagreement for the recorded
-Omarchy version. A missing or newer/unverified runtime Omarchy degrades
-validator coverage VISIBLY — the report says so — instead of silently
-passing. Repositories without a discoverable manifest count incomplete,
-never as agreement.
+corpus clones and compares verdicts. Verdicts are three-state — `valid`,
+`invalid`, `error` — and only identical valid/invalid labels count as
+agreement: timeouts, spawn failures, and unexpected exits are errors, and
+any error is a disagreement (never silent agreement). Disagreement fails
+the build for the recorded Omarchy version. A missing or newer/unverified
+runtime degrades validator coverage VISIBLY instead of silently passing.
+Repositories without a discoverable manifest, or whose cache does not
+verify against the pin, are incomplete.
 
 Usage:
   scripts/validator-parity.py --manifest fixtures/corpus/manifest.json \
-      --cache DIR [--output report.json] [--limit N]
+      --cache DIR (--sample N | --full) [--output report.json]
 """
 
 import argparse
@@ -21,16 +24,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-
-def sample_plugins(plugins, count):
-    """Identical deterministic sampling to run-corpus.py so both runners
-    always evaluate the same PR subset."""
-    ordered = sorted(plugins, key=lambda item: item["pluginId"])
-    total = len(ordered)
-    count = min(count, total)
-    if count == 0:
-        return []
-    return [ordered[(index * total) // count] for index in range(count)]
+sys.path.insert(0, str(Path(__file__).parent))
+from corpus_common import resolve_plugin_dir, run_git, sample_plugins  # noqa: E402
 
 
 def log(message):
@@ -74,36 +69,46 @@ def ensure_validator_bin():
 
 
 def verdict(command):
+    """Three-state verdict: valid / invalid / error. Only the first two are
+    evaluation results; anything else (timeout, spawn failure, unexpected
+    exit code or signal) is an error and can never count as agreement."""
+    label = "error"
+    detail = ""
     try:
         result = subprocess.run(command, capture_output=True, text=True, timeout=120)
     except (OSError, subprocess.TimeoutExpired) as error:
-        return ("error", str(error)[:200])
-    return ("pass" if result.returncode == 0 else "fail", result.stderr.strip()[:200])
+        detail = str(error)[:200]
+        return (label, detail)
+    if result.returncode == 0:
+        label = "valid"
+    elif result.returncode == 1:
+        label = "invalid"
+    else:
+        detail = f"exit {result.returncode}: {result.stderr.strip()[:180]}"
+    return (label, detail)
 
 
-def discover_manifest_dir(repo_dir, plugin_id):
-    """Depth<=2 directory whose manifest.json declares this plugin id."""
-    candidates = [repo_dir, *sorted(repo_dir.glob("*/")), *sorted(repo_dir.glob("*/*/"))]
-    for candidate in candidates:
-        manifest = candidate / "manifest.json"
-        if not manifest.is_file():
-            continue
-        try:
-            document = json.loads(manifest.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if document.get("id") == plugin_id:
-            return candidate
-    return None
+def cache_verifies(repo_dir, commit):
+    """Independent pin verification for reused cache entries."""
+    try:
+        head = run_git(["rev-parse", "HEAD"], cwd=repo_dir)
+        dirty = run_git(["status", "--porcelain"], cwd=repo_dir)
+    except RuntimeError:
+        return False
+    return head == commit and not dirty
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", required=True)
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--sample", type=int)
+    group.add_argument("--full", action="store_true")
     parser.add_argument("--cache", required=True)
     parser.add_argument("--output")
-    parser.add_argument("--sample", type=int)
     arguments = parser.parse_args()
+    if arguments.sample is not None and arguments.sample <= 0:
+        parser.error("--sample must be a positive count")
 
     with open(arguments.manifest, encoding="utf-8") as handle:
         manifest = json.load(handle)
@@ -141,27 +146,23 @@ def main():
         incomplete = 0
         compared = 0
         plugins = manifest["plugins"]
-        if arguments.sample:
+        if arguments.sample is not None:
             plugins = sample_plugins(plugins, arguments.sample)
         for plugin in plugins:
             plugin_id = plugin["pluginId"]
             digest = hashlib.sha256(plugin_id.encode()).hexdigest()
             repo_dir = Path(arguments.cache) / digest
-            if not repo_dir.exists():
-                # The corpus runner owns cloning; missing clone = incomplete.
+            if not repo_dir.exists() or not cache_verifies(repo_dir, plugin["upstreamObservedCommit"]):
                 incomplete += 1
                 continue
-            target = repo_dir
-            if plugin["manifestPath"] is None:
-                discovered = discover_manifest_dir(repo_dir, plugin_id)
-                if discovered is None:
-                    incomplete += 1
-                    continue
-                target = discovered
+            target = resolve_plugin_dir(repo_dir, plugin)
+            if target is None:
+                incomplete += 1
+                continue
             native = verdict(["omarchy", "plugin", "validate", str(target)])
             mirror = verdict([str(ours), str(target)])
             compared += 1
-            if native[0] != mirror[0]:
+            if native[0] == "error" or mirror[0] == "error" or native[0] != mirror[0]:
                 disagreements.append(
                     {
                         "pluginId": plugin_id,

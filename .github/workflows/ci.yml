@@ -34,8 +34,11 @@ jobs:
           if-no-files-found: ignore
 
   # S6: bounded deterministic pinned-corpus subset on every PR. The full
-  # corpus and release gating live in the scheduled corpus-nightly workflow;
-  # live-catalog refresh is never an input here.
+  # corpus run lives in the scheduled corpus-nightly workflow; the release
+  # gate (run-corpus.py --gate-high) is invoked by the release pipeline once
+  # ledger dispositions have accrued — until then high-severity results are
+  # expected to be untriaged and a gate here would be permanently red.
+  # Live-catalog refresh is never an input here.
   corpus-subset:
     runs-on: ubuntu-latest
     timeout-minutes: 30

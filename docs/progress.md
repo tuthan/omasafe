@@ -762,6 +762,32 @@ run-corpus.py --sample 12   # 12 scanned, 8 untriaged, 0 incomplete
 validator-parity.py         # 12 compared, 0 disagreements; degraded path exercised
 ```
 
+Codex review returned CHANGES-REQUIRED with reproduced cases; all blockers
+and concerns were fixed in the follow-up hardening commit. Both runners now
+share `scripts/corpus_common.py` (one sampler, one plugin-directory
+resolver, one bounded-git runner, one ledger parser) so they can never
+evaluate different targets; the runner resolves recorded manifest paths and
+discovers depth-2 manifests by id (verified live on a monorepo entry).
+Cache entries are trusted only when HEAD matches the pin AND the worktree
+is pristine — a poisoned tracked file forces a fresh clone (verified live);
+parity independently re-verifies pins before comparing. Inventory coverage
+limitations outside a benign set, truncated/skipped entries, and analysis
+failures count INCOMPLETE instead of passing gates as clean scans. The
+manifest mirror was corrected to native jq/find semantics with a live-
+derived edge matrix: numeric schemaVersion equality (1.0 passes), jq `-r`
+scalar coercion for ids and entry-point values (123 → "123"), multi-line
+array/object rendering rejected as newlines, no mirror-only size cap,
+`.git` pruned by name before the type test, symlinked roots refused, and no
+symlink-walk depth limit — each case cross-checked against the installed
+4.0.1 binary. Parity verdicts are three-state (valid/invalid/error) where
+errors always disagree; git fetches are time-bounded; CLI arguments reject
+empty/negative samples and combined modes; the ledger parser validates
+40/64-hex commits, disposition vocabulary, and required notes; the
+generator verifies meta file-digest consistency, dedupes duplicate catalog
+ids deterministically, and reproduces the committed manifest byte-
+identically from the frozen snapshot (`scripts/test_corpus_tooling.py`
+pins all of it).
+
 Known limitations: parity verdicts compare pass/fail only (not per-issue
 prose); monorepo/suite discovery accepts any depth≤2 directory declaring the
 plugin id; the nightly runner variable must be provisioned before release

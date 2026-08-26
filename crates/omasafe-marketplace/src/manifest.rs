@@ -52,6 +52,24 @@ fn issue(code: &'static str, message: impl Into<String>) -> ManifestIssue {
 /// Structural problems (missing folder/manifest) yield a single issue so the
 /// parity canary can compare verdicts, not prose.
 pub fn validate_plugin_folder(folder: &Path) -> Vec<ManifestIssue> {
+    // The native validator's `find "$PLUGIN_DIR"` prints a symlinked START
+    // point itself, so a symlinked plugin root is refused exactly like an
+    // interior link. Check before any is_dir() follow.
+    #[cfg(unix)]
+    {
+        if fs::symlink_metadata(folder)
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return vec![issue(
+                "symlink-present",
+                format!(
+                    "symlinks are not allowed inside a plugin folder: {}",
+                    folder.display()
+                ),
+            )];
+        }
+    }
     let manifest_path = folder.join("manifest.json");
     if !folder.is_dir() {
         return vec![issue("plugin-folder-missing", "plugin folder not found")];
@@ -71,10 +89,6 @@ pub fn validate_plugin_folder(folder: &Path) -> Vec<ManifestIssue> {
             )];
         }
     };
-    // Size bound first: manifests are small configuration files, never data.
-    if raw.len() > 1024 * 1024 {
-        return vec![issue("manifest-oversized", "manifest.json exceeds 1 MiB")];
-    }
     let manifest: serde_json::Value = match serde_json::from_slice(&raw) {
         Ok(value) => value,
         Err(error) => {
@@ -86,13 +100,13 @@ pub fn validate_plugin_folder(folder: &Path) -> Vec<ManifestIssue> {
     };
     let mut issues = Vec::new();
 
-    // schemaVersion must be exactly the JSON number 1; the string "1" is
-    // rejected just like the registry's type-aware comparison.
-    if manifest
-        .get("schemaVersion")
-        .and_then(serde_json::Value::as_i64)
-        != Some(1)
-    {
+    // Native semantics: jq's `.schemaVersion == 1` is NUMERIC equality, so
+    // 1.0 passes while the string "1" is rejected.
+    let schema_ok = match manifest.get("schemaVersion") {
+        Some(serde_json::Value::Number(number)) => number.as_f64() == Some(1.0),
+        _ => false,
+    };
+    if !schema_ok {
         issues.push(issue(
             "schema-version",
             "unsupported or missing schemaVersion (expected 1)",
@@ -108,17 +122,21 @@ pub fn validate_plugin_folder(folder: &Path) -> Vec<ManifestIssue> {
         }
     }
 
-    let id = manifest
-        .get("id")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
+    // Native semantics: `jq -r '.id // ""'` coerces scalars to their printed
+    // form, so a numeric id like 123 becomes "123" and passes the charset
+    // regex. Only strings and numbers can produce an id here.
+    let id = match manifest.get("id") {
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(serde_json::Value::Number(number)) => number.to_string(),
+        _ => String::new(),
+    };
     if id.is_empty() {
         issues.push(issue("empty-id", "manifest 'id' is empty"));
     } else {
         // The native check rejects ".." anywhere and enforces the character
         // set; both matter independently (dots are legal, runs of them are
         // not).
-        if !valid_plugin_id(id) || id.contains("..") {
+        if !valid_plugin_id(&id) || id.contains("..") {
             issues.push(issue("invalid-id", format!("invalid plugin id '{id}'")));
         }
         if id.starts_with("omarchy.") {
@@ -167,10 +185,14 @@ pub fn validate_plugin_folder(folder: &Path) -> Vec<ManifestIssue> {
         .and_then(serde_json::Value::as_object)
     {
         for (key, value) in entry_points {
-            let Some(path) = value.as_str() else {
+            // Native semantics: each value flows through `jq -c` then
+            // `jq -r`. Scalars print as single lines (numbers and booleans
+            // coerce to their printed form); arrays/objects print as
+            // multi-line JSON, which the newline check rejects.
+            let Some(path) = jq_r_scalar(value) else {
                 issues.push(issue(
-                    "entry-point-type",
-                    format!("entry point '{key}' must be a string path"),
+                    "entry-point-newline",
+                    format!("entry point '{key}' may not contain a newline"),
                 ));
                 continue;
             };
@@ -199,7 +221,7 @@ pub fn validate_plugin_folder(folder: &Path) -> Vec<ManifestIssue> {
                 ));
                 continue;
             }
-            if !folder.join(path).is_file() {
+            if !folder.join(&path).is_file() {
                 issues.push(issue(
                     "entry-point-missing",
                     format!("entry point file not found: '{path}'"),
@@ -255,11 +277,25 @@ fn valid_plugin_id(id: &str) -> bool {
         && chars.all(|char| char.is_ascii_alphanumeric() || matches!(char, '.' | '_' | '-'))
 }
 
+/// `jq -r` rendering for scalar JSON values: `None` for arrays/objects,
+/// whose pretty-printed form spans multiple lines.
+fn jq_r_scalar(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        serde_json::Value::Bool(true) => Some("true".to_owned()),
+        serde_json::Value::Bool(false) => Some("false".to_owned()),
+        serde_json::Value::Null => Some("null".to_owned()),
+        _ => None,
+    }
+}
+
 fn first_symlink(folder: &Path) -> Option<std::path::PathBuf> {
-    fn walk(dir: &Path, depth: usize) -> Option<std::path::PathBuf> {
-        if depth > 16 {
-            return None;
-        }
+    // Mirrors native `find "$PLUGIN_DIR" -name .git -prune -o -type l -print`:
+    // the .git NAME is pruned before any type test (a symlink named .git is
+    // never reported), symlinks are never followed into, and there is no
+    // depth limit.
+    fn walk(dir: &Path) -> Option<std::path::PathBuf> {
         let mut entries: Vec<_> = fs::read_dir(dir)
             .ok()?
             .collect::<Result<Vec<_>, _>>()
@@ -267,22 +303,22 @@ fn first_symlink(folder: &Path) -> Option<std::path::PathBuf> {
         entries.sort_by_key(|entry| entry.file_name());
         for entry in entries {
             let path = entry.path();
+            if path.file_name().is_some_and(|name| name == ".git") {
+                continue;
+            }
             let file_type = entry.file_type().ok()?;
             if file_type.is_symlink() {
                 return Some(path);
             }
-            if file_type.is_dir() {
-                if path.file_name().is_some_and(|name| name == ".git") {
-                    continue;
-                }
-                if let Some(found) = walk(&path, depth + 1) {
-                    return Some(found);
-                }
+            if file_type.is_dir()
+                && let Some(found) = walk(&path)
+            {
+                return Some(found);
             }
         }
         None
     }
-    walk(folder, 0)
+    walk(folder)
 }
 
 #[cfg(test)]
@@ -409,5 +445,105 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         assert_eq!(validate_plugin_folder(&dir)[0].code, "manifest-missing");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // Edge matrix derived from the installed native validator's actual
+    // behavior (jq coercion and find semantics), not from intuition.
+    #[test]
+    fn schema_version_one_float_passes_and_string_fails() {
+        for (schema, valid) in [("1.0", "true"), ("\"1\"", "false"), ("2", "false")] {
+            let dir = std::env::temp_dir().join(format!(
+                "omasafe-manifest-schema-{}-{}",
+                valid,
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            write_manifest(
+                &dir,
+                &format!(
+                    r#"{{"schemaVersion":{schema},"id":"a.b","name":"x","version":"1","kinds":[],"entryPoints":{{}}}}"#
+                ),
+            );
+            let codes: Vec<&str> = validate_plugin_folder(&dir)
+                .iter()
+                .map(|issue| issue.code)
+                .collect();
+            assert_eq!(
+                codes.contains(&"schema-version"),
+                valid == "false",
+                "{codes:?}"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn numeric_scalars_coerce_like_jq_r() {
+        let dir = std::env::temp_dir().join(format!("omasafe-manifest-jq-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        write_manifest(
+            &dir,
+            r#"{"schemaVersion":1,"id":123,"name":"x","version":"1","kinds":[],"entryPoints":{"one":456,"two":[1],"three":{"a":1}}}"#,
+        );
+        fs::write(dir.join("456"), "x").unwrap();
+        let issues = validate_plugin_folder(&dir);
+        let codes: Vec<&str> = issues.iter().map(|issue| issue.code).collect();
+        // id 123 coerces to "123" and passes the charset; entry point 456
+        // coerces to "456" and finds its file; array/object values render
+        // multi-line and are rejected as newlines.
+        assert!(!codes.contains(&"invalid-id"), "{issues:?}");
+        assert!(!codes.contains(&"entry-point-missing"), "{issues:?}");
+        assert_eq!(
+            codes
+                .iter()
+                .filter(|code| **code == "entry-point-newline")
+                .count(),
+            2
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_named_symlinks_are_pruned_but_others_are_not() {
+        let dir =
+            std::env::temp_dir().join(format!("omasafe-manifest-gitlink-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        write_manifest(&dir, VALID);
+        fs::write(dir.join("widget.qml"), "Item {}\n").unwrap();
+        std::os::unix::fs::symlink("/etc", dir.join(".git")).unwrap();
+        assert!(
+            validate_plugin_folder(&dir).is_empty(),
+            "native find prunes the .git name before the type test"
+        );
+        std::os::unix::fs::symlink("/etc", dir.join("link")).unwrap();
+        let codes: Vec<&str> = validate_plugin_folder(&dir)
+            .iter()
+            .map(|issue| issue.code)
+            .collect();
+        assert!(codes.contains(&"symlink-present"), "{codes:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_plugin_root_is_refused() {
+        let real =
+            std::env::temp_dir().join(format!("omasafe-manifest-real-{}", std::process::id()));
+        let link =
+            std::env::temp_dir().join(format!("omasafe-manifest-linkroot-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&real);
+        let _ = fs::remove_dir_all(&link);
+        write_manifest(&real, VALID);
+        fs::write(real.join("widget.qml"), "Item {}\n").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // Native `find` prints a symlinked start point itself.
+        let codes: Vec<&str> = validate_plugin_folder(&link)
+            .iter()
+            .map(|issue| issue.code)
+            .collect();
+        assert!(codes.contains(&"symlink-present"), "{codes:?}");
+        let _ = fs::remove_dir_all(&real);
+        let _ = fs::remove_dir_all(&link);
     }
 }
