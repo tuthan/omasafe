@@ -53,19 +53,42 @@ python3 scripts/test_corpus_tooling.py
 if [[ $skip_network == false ]]; then
   cache="${OMASAFE_RELEASE_CACHE:-$root_dir/release-reports/corpus-cache}"
   mkdir -p "$cache"
-  step "pinned-corpus sample (n=$sample)"
+  step "pinned-corpus sample with release gate (n=$sample)"
   python3 scripts/run-corpus.py \
     --manifest fixtures/corpus/manifest.json \
     --sample "$sample" \
     --cache "$cache" \
+    --gate-high \
     --output release-reports/corpus-sample.json
+  # The checklist demands zero incomplete repositories for a release; the
+  # runner counts them but does not fail on them, so enforce it here.
+  python3 - <<'PY'
+import json, sys
+report = json.load(open("release-reports/corpus-sample.json"))
+incomplete = report.get("incompleteRepositories", [])
+if incomplete:
+    sys.exit(f"incomplete repositories present, release blocked: {incomplete}")
+PY
 
-  step "native validator parity (n=$sample)"
+  step "native validator parity, strict (n=$sample)"
   python3 scripts/validator-parity.py \
     --manifest fixtures/corpus/manifest.json \
     --cache "$cache" \
     --sample "$sample" \
     --output release-reports/validator-parity.json
+  # Zero disagreements ON THE RECORDED version is mandatory; a degraded run
+  # (missing or newer omarchy) cannot verify anything and blocks the gate.
+  python3 - <<'PY'
+import json, sys
+report = json.load(open("release-reports/validator-parity.json"))
+if report.get("status") != "compared":
+    sys.exit(f"parity degraded ({report.get('status')}), release blocked")
+if report.get("disagreements"):
+    sys.exit(f"parity disagreements, release blocked: {report['disagreements']}")
+if not report.get("compared"):
+    sys.exit("parity compared nothing, release blocked")
+print(f"parity strict check passed: {report['compared']} compared on recorded version")
+PY
 else
   printf '\nSKIPPED network steps (--skip-network): corpus sample and parity.\n'
   printf 'A real release must run them; see scripts/run-corpus.py and scripts/validator-parity.py.\n'

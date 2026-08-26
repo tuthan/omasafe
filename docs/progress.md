@@ -897,6 +897,34 @@ review the self-scan findings, confirm the nightly full-corpus baseline is
 provisioned, sign the tag. The sibling panel repo ships its views
 separately with its own update cadence, as documented in the README.
 
-Next: **codex review round for S8**, then v0.2 tag.
+Codex review of the S8 slice returned CHANGES-REQUIRED with eight blockers,
+all fixed and re-verified. The recovery record is now durably stored before
+the first quiescing action, every quiesce failure keeps it (phase "failed")
+instead of deleting it, and an unresolved record for a DIFFERENT plugin
+blocks a new review outright — records can no longer be overwritten or
+dropped by unrelated operations. An interrupt during final re-enable is
+reported as a 130 exit with manual completion steps instead of a successful
+run; the shared analysis emitter gained an output-commitment checkpoint so
+`plugins analyze` / `scan-plugin` / `scan` honor interrupts that land during
+analysis rather than completing with exit 0; interrupt messages state the
+actual phase instead of claiming "no partial state". The stale-checkout
+sweeper replaced pid heuristics with kernel-owned ownership: each checkout
+carries a flock-held `.owner.lock`, so sweepers remove only checkouts whose
+owner provably died (pid reuse is irrelevant), verified by the updated test
+using unique per-run directory names. Non-Unix bounded loops now also honor
+the flag, signal registration uses libc constants, the SIGINT test helper
+drains pipes concurrently to rule out deadlocks, and the release workflow's
+reports job creates its output directory. The release gate became strict:
+corpus runs execute with --gate-high (unaccounted high severity fails the
+release), incomplete repositories block via an explicit report check, and
+parity must be status "compared" with zero disagreements on the recorded
+version — degraded parity blocks rather than passes. vm-lifecycle.sh was
+rewritten against the real installer URL (raw install-cli.sh at the tag),
+with correct remote-expansion quoting and an uninstall step plus post-
+uninstall persistence verification. Final strict gate run: exit 0 with
+--gate-high passed, zero incomplete, parity 12 compared / 0 disagreements.
+
+Next: **v0.2 tag** (signed) once the nightly full-corpus baseline is
+provisioned and the self-scan findings get their triage pass.
 
 

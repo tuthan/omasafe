@@ -199,7 +199,13 @@ fn spawn_bounded(
                 // The group was killed and the leader reaped inside the poll.
                 return Ok(None);
             }
-            Ok(PollExit::Exited) => {}
+            Ok(PollExit::Exited) => {
+                // Interrupt responsiveness on this path comes from pipe EOF:
+                // an interrupt kills the group before exit observation in
+                // practice, and any surviving descendants holding pipes are
+                // disclosed as truncation by the bounded drains rather than
+                // silently waited out.
+            }
             Err(error) => {
                 fail_child_cleanup(&mut child);
                 return Err(error);
@@ -340,7 +346,7 @@ fn non_unix_run_bounded(
                 }));
             }
             None => {
-                if Instant::now() >= deadline {
+                if Instant::now() >= deadline || crate::interrupt::raised() {
                     let _ = child.kill();
                     let _ = child.wait();
                     return Ok(None);

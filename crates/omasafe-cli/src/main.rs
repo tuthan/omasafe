@@ -34,11 +34,13 @@ fn main() {
 }
 
 /// Exit status for commands stopped by SIGINT/SIGTERM after cooperative
-/// cleanup (conventional 128+SIGINT).
+/// cleanup. Deliberately unified at 128+SIGINT for both signals so callers
+/// need not distinguish; the specific signal is not otherwise meaningful to
+/// OmaSafe's flows.
 const INTERRUPTED_EXIT_CODE: i32 = 130;
 
 fn interrupted(context: &str) -> Box<dyn std::error::Error> {
-    format!("interrupted: {context}; no partial state was committed").into()
+    format!("interrupted: {context}").into()
 }
 
 /// Phase-boundary stop for long-running commands: bounded children are
@@ -64,16 +66,32 @@ fn sweep_orphaned_review_checkouts() {
         if !name.starts_with(prefix) {
             continue;
         }
-        let Some(pid_text) = name.rsplit('-').next() else {
-            continue;
-        };
-        let Ok(pid) = pid_text.parse::<i32>() else {
-            continue;
-        };
-        if pid == std::process::id() as i32 || omasafe_core::interrupt::process_alive(pid) {
-            continue;
+        let dir = entry.path();
+        // A live owner holds LOCK_EX on .owner.lock for its entire run; the
+        // kernel drops that lock exactly when the owner dies. Acquiring it
+        // here therefore proves the checkout is orphaned regardless of pid
+        // reuse. Directories predating the lock scheme have no lock file and
+        // are treated as orphans.
+        let lock_path = dir.join(".owner.lock");
+        if lock_path.exists() {
+            let Ok(lock) = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+            else {
+                continue;
+            };
+            #[cfg(unix)]
+            {
+                use std::os::fd::AsRawFd;
+                let result =
+                    unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                if result != 0 {
+                    continue; // live owner
+                }
+            }
         }
-        let _ = std::fs::remove_dir_all(entry.path());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 
@@ -338,12 +356,39 @@ fn expected_component(current: Option<&str>, expected: Option<&str>) -> bool {
     }
 }
 
-/// Removes its directory when dropped so every exit path of the reviewed
-/// update leaves no candidate checkout behind.
-struct TempCandidate(PathBuf);
+/// Creates and owns a candidate checkout. The `.owner.lock` file inside is
+/// flock-held for the struct's whole lifetime, so the stale-checkout sweeper
+/// can distinguish a live run from an orphaned one without pid heuristics —
+/// the kernel releases the lock when (and only when) the owning process dies,
+/// which closes the pid-reuse race.
+struct TempCandidate(PathBuf, Option<std::fs::File>);
+
+impl TempCandidate {
+    fn create(path: PathBuf) -> Result<Self, std::io::Error> {
+        std::fs::create_dir_all(&path)?;
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .create(true)
+            .open(path.join(".owner.lock"))?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if result != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(Self(path, Some(lock)))
+    }
+}
 
 impl Drop for TempCandidate {
     fn drop(&mut self) {
+        // Release the ownership lock first so removal never races a sweeper
+        // that observed us as orphans mid-teardown.
+        self.1.take();
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
@@ -392,6 +437,20 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
     paths.ensure()?;
     let flow_path = paths.state.join("review-update.json");
     match UpdateFlowRecord::load(&flow_path) {
+        Ok(Some(record)) if record.plugin_id != id => {
+            // One in-flight update at a time: another plugin's unresolved
+            // record must never be overwritten or deleted by this run.
+            eprintln!(
+                "an interrupted reviewed update for '{}' (candidate {}, phase {}) is still unresolved;\n\
+                 resolve it first — see its manual checks below — before reviewing a different plugin.",
+                record.plugin_id, record.candidate_commit, record.phase
+            );
+            return Err(format!(
+                "unresolved interrupted update for {} blocks this operation",
+                record.plugin_id
+            )
+            .into());
+        }
         Ok(Some(record)) => {
             eprintln!(
                 "WARNING: an interrupted reviewed update for '{}' was found\n  candidate commit: {}\n  phase at interruption: {} (started {})\n  quiescing actions taken before it stopped: {}",
@@ -521,12 +580,13 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
         .unwrap_or(false);
 
     // Materialize a working tree for validation + filesystem analysis.
-    let checkout = TempCandidate(std::env::temp_dir().join(format!(
+    let checkout_path = std::env::temp_dir().join(format!(
         "omasafe-review-update-{}-{}",
         id.replace(['/', ':', ' '], "_"),
         std::process::id()
-    )));
-    let _ = std::fs::remove_dir_all(&checkout.0);
+    ));
+    let checkout = TempCandidate::create(checkout_path)
+        .map_err(|error| format!("candidate checkout failed: {error}"))?;
     bounded_git(
         None,
         &["init", "--quiet", checkout.0.to_string_lossy().as_ref()],
@@ -741,42 +801,57 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
 
     interruption_checkpoint("before approval was recorded")?;
 
-    // --- Interrupted-state record goes live right before the first mutation ---
+    // --- Recovery record is durably stored BEFORE any quiescing action ---
+    // From here until a terminal state, every exit keeps this file so an
+    // operator always finds actionable state, even after a hard death.
     let mut flow = UpdateFlowRecord {
         schema_version: 1,
         plugin_id: id.to_owned(),
         candidate_commit: candidate.clone(),
         started_at: now(),
-        phase: "delegating".into(),
+        phase: "quiescing".into(),
         quiesced: Vec::new(),
     };
+    flow.store(&flow_path)?;
 
     // Quiesce: switch an active full-bar replacement back to the default bar,
     // disable ordinary enabled plugins, so native rollback can never leave
     // new code live without a completed review.
     if full_bar_active {
         let outcome = omarchy_bar_use_default();
-        if !outcome.success {
-            let _ = std::fs::remove_file(&flow_path);
-            return Err(format!(
-                "refusing before mutation: switching back to the default bar failed: {}",
-                outcome.output
-            )
-            .into());
-        }
         flow.quiesced.push("bar-switched".into());
+        if !outcome.success {
+            flow.phase = "failed".into();
+            flow.store(&flow_path)?;
+            eprintln!(
+                "switching back to the default bar failed or was interrupted;\n\
+                 the bar state is uncertain. Check 'omarchy plugin list --json'\n\
+                 and restore your preferred bar manually before retrying."
+            );
+            return Err(interrupted(&format!(
+                "while switching back to the default bar: {}",
+                outcome.output
+            )));
+        }
+        flow.store(&flow_path)?;
     } else if was_enabled {
         let outcome = omarchy_plugin_disable(id);
-        if !outcome.success {
-            let _ = std::fs::remove_file(&flow_path);
-            return Err(format!(
-                "refusing before mutation: disabling the plugin failed: {}",
-                outcome.output
-            )
-            .into());
-        }
         flow.quiesced.push("disabled".into());
+        if !outcome.success {
+            flow.phase = "failed".into();
+            flow.store(&flow_path)?;
+            eprintln!(
+                "disabling failed or was interrupted; the enabled state is uncertain.\n\
+                 Check 'omarchy plugin list --json' before retrying."
+            );
+            return Err(interrupted(&format!(
+                "while disabling the plugin: {}",
+                outcome.output
+            )));
+        }
+        flow.store(&flow_path)?;
     }
+    flow.phase = "delegating".into();
     flow.store(&flow_path)?;
     interruption_checkpoint(
         "after quiescing; the plugin stays disabled and the recovery record is kept",
@@ -887,6 +962,17 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
     if full_bar_active || was_enabled {
         let enable_outcome = omarchy_plugin_enable(id);
         if !enable_outcome.success {
+            if omasafe_core::interrupt::raised() {
+                flow.phase = "verifying".into();
+                flow.store(&flow_path)?;
+                eprintln!(
+                    "interrupted while re-enabling; the reviewed commit {candidate} IS\n\
+                     installed and verified, but service restore did not complete.\n\
+                     Manual completion:\n\
+                       omarchy plugin enable {id}"
+                );
+                return Err(interrupted("during re-enable"));
+            }
             eprintln!(
                 "warning: re-enabling failed ({}); the reviewed commit is installed but the plugin stays disabled.\nmanual step: omarchy plugin enable {id}",
                 enable_outcome.output
@@ -2946,6 +3032,10 @@ fn emit_analysis_report(
 
     let budget = omasafe_core::bounds::TimeBudget::default();
     let artifacts = omasafe_analyzer::analyze_inventory(&mut inventory, &read_content, &budget);
+    // Output-commitment point for every analysis command: an interrupt that
+    // landed during analysis stops here, before any report text or JSON is
+    // emitted, and the caller unwinds to a 130 exit.
+    interruption_checkpoint("analysis finished; report not yet emitted")?;
     let rendered = artifacts.rendered_findings();
 
     // Suppressions are presentation/enforcement filters over the RENDERED

@@ -78,6 +78,7 @@ jobs:
 
       - name: Generate self-scan report
         run: |
+          mkdir -p release-reports
           ./target/release/omasafe-cli scan-plugin --path . --format json \
             > release-reports/self-scan.json
 

@@ -13,9 +13,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
-const SIGINT_NUMBER: i32 = 2;
-const SIGTERM_NUMBER: i32 = 15;
-
 extern "C" fn on_signal(_signal: i32) {
     INTERRUPTED.store(true, Ordering::SeqCst);
 }
@@ -23,12 +20,14 @@ extern "C" fn on_signal(_signal: i32) {
 /// Installs SIGINT/SIGTERM handlers. Idempotent; safe to call once at
 /// process start. Child processes reset caught signals to their defaults on
 /// exec, so bounded subprocesses keep terminating directly on terminal
-/// interrupts.
+/// interrupts. A failed registration leaves the default disposition in place
+/// (hard death on signal), which is always a safe fallback, so the result is
+/// deliberately not surfaced.
 pub fn install() {
     let handler = on_signal as extern "C" fn(i32) as usize;
     unsafe {
-        libc::signal(SIGINT_NUMBER, handler);
-        libc::signal(SIGTERM_NUMBER, handler);
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGTERM, handler);
     }
 }
 

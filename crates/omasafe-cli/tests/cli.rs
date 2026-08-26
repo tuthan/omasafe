@@ -2735,25 +2735,37 @@ fn review_update_sigint_during_native_update_fails_closed_with_exit_130() {
     );
 }
 
-use std::io::Read as _;
-
 trait ChildExt {
     fn wait_wait_with_output(self) -> std::process::Output;
 }
 
 impl ChildExt for std::process::Child {
+    /// Waits first and drains both pipes concurrently on threads so a chatty
+    /// child can never deadlock us on one full pipe while the other stays
+    /// open.
     fn wait_wait_with_output(mut self) -> std::process::Output {
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        if let Some(pipe) = self.stdout.take() {
-            let mut pipe = pipe;
-            let _ = pipe.read_to_end(&mut stdout);
+        fn drain<R: std::io::Read>(pipe: Option<R>) -> Vec<u8> {
+            let mut buffer = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buffer);
+            }
+            buffer
         }
-        if let Some(pipe) = self.stderr.take() {
-            let mut pipe = pipe;
-            let _ = pipe.read_to_end(&mut stderr);
-        }
+        let stdout_handle = self
+            .stdout
+            .take()
+            .map(|pipe| std::thread::spawn(move || drain(Some(pipe))));
+        let stderr_handle = self
+            .stderr
+            .take()
+            .map(|pipe| std::thread::spawn(move || drain(Some(pipe))));
         let status = self.wait().unwrap();
+        let stdout = stdout_handle
+            .map(|h| h.join().expect("stdout drain"))
+            .unwrap_or_default();
+        let stderr = stderr_handle
+            .map(|h| h.join().expect("stderr drain"))
+            .unwrap_or_default();
         std::process::Output {
             status,
             stdout,
@@ -2869,7 +2881,15 @@ fn review_update_sweeps_orphaned_checkouts_from_dead_pids() {
     // Simulate a SIGKILLed earlier run by creating its temp checkout naming
     // pattern with a pid that cannot exist; the next run must remove it.
     let update = UpdateFixture::new();
-    let dead_dir = std::env::temp_dir().join("omasafe-review-update-x-4000000");
+    // Unique middle segment keeps concurrent test runs from colliding; the
+    // parser only reads the pid after the last '-'.
+    let dead_dir = std::env::temp_dir().join(format!(
+        "omasafe-review-update-x{}-4000000",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+    ));
     let _ = fs::remove_dir_all(&dead_dir);
     fs::create_dir_all(dead_dir.join("leftover")).unwrap();
 
