@@ -33,6 +33,10 @@ pub const GIT_PROCESS_BUDGET: Duration = Duration::from_secs(60);
 pub const MAX_CACHE_BYTES: u64 = 512 * 1024 * 1024;
 /// Upper bound on evidence excerpts retained per finding, in bytes.
 pub const MAX_EVIDENCE_BYTES_PER_RESULT: usize = 16 * 1024;
+/// Hard cap on sink-position reference rejections retained in one analysis.
+/// An adversarial tree of unique sink literals cannot expand into
+/// unbounded limitation strings; overflow is disclosed, never silent.
+pub const MAX_SINK_REJECTIONS: usize = 256;
 /// Hard per-stream cap on captured child-process output. A chatty child can
 /// neither grow memory without bound nor deadlock the polling loop.
 pub const MAX_PROCESS_OUTPUT_BYTES_PER_STREAM: usize = 8 * 1024 * 1024;

@@ -1,0 +1,5 @@
+{
+  "schemaVersion": 1,
+  "id": "io.omasafe.h2.remote-create-component",
+  "kinds": ["bar-widget"]
+}

@@ -10,7 +10,7 @@ use serde::Serialize;
 
 /// Monotonic version of this catalog. Bump when rules are added, retired, or
 /// redefined; the policy identity changes with it.
-pub const RULE_CATALOG_VERSION: u32 = 3;
+pub const RULE_CATALOG_VERSION: u32 = 4;
 
 /// Monotonic version of the severity table. Severity or rule-meaning changes
 /// require a new version here.
@@ -187,6 +187,33 @@ pub const CATALOG: &[RuleDefinition] = &[
         "QML/Qt networking",
         "QML can make outbound requests and retrieve runtime content.",
         "Flag download-and-execute chains and sensitive-data exfiltration edges.",
+    ),
+    qml_rule(
+        "oma.qml.remote-component-load",
+        "QML loads a component from a remote URL",
+        Capability::NetworkAccess,
+        Severity::High,
+        "Reverified H0: network Loader.source / Qt.createComponent reachable",
+        "A URL-scheme literal at Loader.source or Qt.createComponent loads QML code over the network; both sinks are verified reachable on the pinned runtime.",
+        "Content loaded from a URL was never part of any reviewed commit; treat the plugin as unreviewed until the remote source is audited at the pinned revision.",
+    ),
+    qml_rule(
+        "oma.qml.remote-directory-import",
+        "Remote directory import indicator",
+        Capability::NetworkAccess,
+        Severity::Low,
+        "Reverified H0: remote directory imports scanner-intercepted",
+        "The plugin imports QML from a remote URL; the pinned runtime's scanner normalizes the URL onto a relative path and drops it, so nothing executes remotely through this syntax.",
+        "Indicator only: no remote directory import executed on the pinned build, so this records intent, not a live load. Re-probe any newer runtime before escalating.",
+    ),
+    qml_rule(
+        "oma.qml.out-of-tree-reference",
+        "QML loads content from outside the plugin tree",
+        Capability::FilesystemAccess,
+        Severity::Medium,
+        "Reverified H0: out-of-tree references resolve locally (no runtime sandbox)",
+        "An absolute-path or traversal reference loads content from outside the reviewed plugin tree, bypassing commit-bound review.",
+        "This is an unreviewed out-of-tree load, not a sandbox escape — there is no runtime sandbox. Audit the referenced location before trusting the review.",
     ),
     qml_rule(
         "oma.qml.dynamic-reference",
@@ -384,6 +411,23 @@ mod tests {
             rule("oma.qml.pam-authentication").unwrap().default_severity,
             Severity::High
         );
+        assert_eq!(
+            rule("oma.qml.remote-component-load")
+                .unwrap()
+                .default_severity,
+            Severity::High
+        );
+    }
+
+    #[test]
+    fn remote_directory_import_stays_an_indicator() {
+        // H0 verified remote directory imports are scanner-intercepted on the
+        // pinned runtime: the rule must never claim the High remote-load
+        // family, and its guidance must demand re-probing newer runtimes.
+        let definition = rule("oma.qml.remote-directory-import").unwrap();
+        assert_eq!(definition.default_severity, Severity::Low);
+        assert!(definition.review_guidance.contains("Re-probe"));
+        assert!(definition.summary.contains("scanner"));
     }
 
     #[test]
@@ -422,6 +466,18 @@ mod tests {
             ("oma.qml.detached-execution", "Quickshell.execDetached"),
             ("oma.qml.filesystem-access", "FileView"),
             ("oma.qml.network-access", "QML/Qt networking"),
+            (
+                "oma.qml.remote-component-load",
+                "Reverified H0: network Loader.source / Qt.createComponent reachable",
+            ),
+            (
+                "oma.qml.remote-directory-import",
+                "Reverified H0: remote directory imports scanner-intercepted",
+            ),
+            (
+                "oma.qml.out-of-tree-reference",
+                "Reverified H0: out-of-tree references resolve locally (no runtime sandbox)",
+            ),
             (
                 "oma.qml.persistence-scheduling",
                 "Timer and service entry points",

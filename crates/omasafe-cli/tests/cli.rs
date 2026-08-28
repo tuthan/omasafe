@@ -663,7 +663,7 @@ fn rules_list_text_is_deterministic() {
         .clone();
     assert_eq!(first, second);
     let rendered = String::from_utf8(first).unwrap();
-    assert!(rendered.contains("rule catalog v3"));
+    assert!(rendered.contains("rule catalog v4"));
     assert!(rendered.contains("oma.qml.session-lock"));
 }
 
@@ -728,7 +728,7 @@ fn analyze_reports_full_payload_inventory_end_to_end() {
     assert_eq!(report["result"]["target"]["source"], "installed-plugin");
     let analysis = &report["result"]["analysis"];
     assert_eq!(analysis["schema"], "omasafe.analysis.v1");
-    assert_eq!(analysis["policy_identity"]["rule_catalog_version"], 3);
+    assert_eq!(analysis["policy_identity"]["rule_catalog_version"], 4);
     let inventory = &report["result"]["payload_inventory"];
     let states = &inventory["coverage_states"];
     // S3+S4: analyzable files land in analyzed/unreferenced/partial; only
@@ -1086,7 +1086,9 @@ fn scan_plugin_negative_provenance_stays_clean() {
 "#,
     )
     .unwrap();
-    // Traversal and absolute literals never become edges.
+    // Traversal and absolute literals never become edges, and a remote URL
+    // outside a load sink stays silent — but the traversal Loader is now an
+    // out-of-tree load finding (H2), while the Image URL is not a sink.
     fs::write(
         temp.path().join("Refs.qml"),
         r#"Item {
@@ -1114,8 +1116,158 @@ fn scan_plugin_negative_provenance_stays_clean() {
         .clone();
     let report: Value = serde_json::from_slice(&output).unwrap();
     let analysis = &report["result"]["analysis"];
-    assert_eq!(analysis["findings"].as_array().unwrap().len(), 0);
+    let findings = analysis["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0]["rule_id"], "oma.qml.out-of-tree-reference");
+    assert_eq!(findings[0]["severity"], "medium");
     assert_eq!(analysis["invocation_edges"].as_array().unwrap().len(), 0);
+    // The finding is the disclosure; no typed rejection rides on top.
+    let limitations = analysis["coverage_limitations"].as_array().unwrap();
+    assert!(limitations.is_empty(), "{limitations:?}");
+}
+
+/// Scan an H2 adversarial fixture plugin tree from `fixtures/plugins/`.
+fn scan_h2_fixture(name: &str) -> Value {
+    let fixture = Fixture::new();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/plugins")
+        .join(name)
+        .canonicalize()
+        .unwrap();
+    let output = fixture
+        .command()
+        .args([
+            "scan-plugin",
+            "--path",
+            path.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    serde_json::from_slice(&output).unwrap()
+}
+
+#[test]
+fn h2_fixtures_surface_remote_component_loads() {
+    // H0 2026-08-27: both load positions are verified reachable, so the
+    // literal-remote fixtures carry the High rule at catalog severity, with
+    // no typed rejection riding on top of the finding.
+    for (name, sink_label) in [
+        ("remote-component-loader", "Loader.source"),
+        ("remote-create-component", "Qt.createComponent"),
+    ] {
+        let report = scan_h2_fixture(name);
+        let analysis = &report["result"]["analysis"];
+        let findings = analysis["findings"].as_array().unwrap();
+        let remote: Vec<&Value> = findings
+            .iter()
+            .filter(|finding| finding["rule_id"] == "oma.qml.remote-component-load")
+            .collect();
+        assert_eq!(remote.len(), 1, "{name}: {findings:?}");
+        assert_eq!(remote[0]["severity"], "high");
+        assert!(
+            remote[0]["evidence"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("remote-component-load:{sink_label}:https://"))
+        );
+        let limitations = analysis["coverage_limitations"].as_array().unwrap();
+        assert!(
+            limitations.iter().all(|limitation| !limitation
+                .as_str()
+                .unwrap()
+                .starts_with("sink-reference-rejected:")),
+            "{name}: {limitations:?}"
+        );
+    }
+    // createComponent additionally joins the dynamic-code family.
+    let report = scan_h2_fixture("remote-create-component");
+    let findings = report["result"]["analysis"]["findings"].as_array().unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding["rule_id"] == "oma.qml.dynamic-code"),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn h2_fixtures_keep_remote_directory_imports_indicator_only() {
+    // H0 probe C: remote directory imports are scanner-intercepted on the
+    // pinned runtime, so both the `as`-qualified and bare spellings record
+    // the low-severity indicator and never the High remote-load rule. Local
+    // relative imports and the resolving local Loader stay silent.
+    let report = scan_h2_fixture("remote-directory-import");
+    let analysis = &report["result"]["analysis"];
+    let findings = analysis["findings"].as_array().unwrap();
+    let indicators: Vec<&Value> = findings
+        .iter()
+        .filter(|finding| finding["rule_id"] == "oma.qml.remote-directory-import")
+        .collect();
+    assert_eq!(indicators.len(), 2, "{findings:?}");
+    assert!(
+        indicators
+            .iter()
+            .all(|finding| finding["severity"] == "low"),
+        "{findings:?}"
+    );
+    assert!(
+        !findings.iter().any(
+            |finding| finding["rule_id"] == "oma.qml.remote-component-load"
+                || finding["rule_id"] == "oma.qml.out-of-tree-reference"
+        ),
+        "{findings:?}"
+    );
+    let edges = analysis["invocation_edges"].as_array().unwrap();
+    assert!(
+        edges
+            .iter()
+            .any(|edge| edge["target_path"] == "widgets/Widget.qml"),
+        "{edges:?}"
+    );
+}
+
+#[test]
+fn h2_fixtures_surface_out_of_tree_references() {
+    for name in ["out-of-tree-absolute", "out-of-tree-traversal"] {
+        let report = scan_h2_fixture(name);
+        let findings = report["result"]["analysis"]["findings"].as_array().unwrap();
+        let out_of_tree: Vec<&Value> = findings
+            .iter()
+            .filter(|finding| finding["rule_id"] == "oma.qml.out-of-tree-reference")
+            .collect();
+        assert_eq!(out_of_tree.len(), 1, "{name}: {findings:?}");
+        assert_eq!(out_of_tree[0]["severity"], "medium");
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding["rule_id"] == "oma.qml.remote-component-load"),
+            "{name}: {findings:?}"
+        );
+    }
+}
+
+#[test]
+fn h2_benign_references_fixture_is_silent() {
+    // Icon names, format strings, commented URLs, and a non-sink
+    // unresolvable path-shaped string produce no finding and no limitation;
+    // the resolving local Loader still forms its edge.
+    let report = scan_h2_fixture("benign-references");
+    let analysis = &report["result"]["analysis"];
+    assert_eq!(analysis["findings"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        analysis["coverage_limitations"].as_array().unwrap().len(),
+        0
+    );
+    let edges = analysis["invocation_edges"].as_array().unwrap();
+    assert!(
+        edges.iter().any(|edge| edge["target_path"] == "Widget.qml"),
+        "{edges:?}"
+    );
 }
 
 #[test]

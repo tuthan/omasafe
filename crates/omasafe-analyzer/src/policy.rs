@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use omasafe_core::bounds::{
     DEFAULT_TIME_BUDGET, GIT_PROCESS_BUDGET, MAX_CACHE_BYTES, MAX_EVIDENCE_BYTES_PER_RESULT,
     MAX_FILE_BYTES, MAX_FILES, MAX_METADATA_BYTES, MAX_PROCESS_OUTPUT_BYTES_PER_STREAM,
-    MAX_TOTAL_BYTES, MAX_TREE_DEPTH, SAMPLE_BYTES,
+    MAX_SINK_REJECTIONS, MAX_TOTAL_BYTES, MAX_TREE_DEPTH, SAMPLE_BYTES,
 };
 use omasafe_report::analysis::PolicyIdentity;
 
@@ -39,6 +39,9 @@ pub struct LimitsConfiguration {
     pub max_cache_bytes: u64,
     /// Evidence caps shape coverage/truncation disclosure, hence policy.
     pub max_evidence_bytes_per_result: usize,
+    /// Sink-rejection retention cap shapes limitation truncation disclosure,
+    /// hence policy.
+    pub max_sink_rejections: usize,
     /// Child-output capture cap feeds analysis input and truncation states.
     pub max_process_output_bytes_per_stream: usize,
 }
@@ -55,6 +58,7 @@ pub fn limits_configuration() -> LimitsConfiguration {
         git_process_budget_ms: GIT_PROCESS_BUDGET.as_millis(),
         max_cache_bytes: MAX_CACHE_BYTES,
         max_evidence_bytes_per_result: MAX_EVIDENCE_BYTES_PER_RESULT,
+        max_sink_rejections: MAX_SINK_REJECTIONS,
         max_process_output_bytes_per_stream: MAX_PROCESS_OUTPUT_BYTES_PER_STREAM,
     }
 }
