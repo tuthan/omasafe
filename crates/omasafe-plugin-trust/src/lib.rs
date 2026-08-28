@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
@@ -63,6 +63,13 @@ impl PartialEq for SourceIdentity {
     fn eq(&self, other: &Self) -> bool {
         self.identity_material() == other.identity_material()
     }
+}
+
+struct ContentEntry {
+    path: String,
+    kind: u8,
+    mode: u32,
+    data: Vec<u8>,
 }
 
 impl Eq for SourceIdentity {}
@@ -455,11 +462,15 @@ pub fn source_identity(
     head: Option<String>,
     tree: Option<String>,
 ) -> SourceIdentity {
-    let mut entries = Vec::new();
-    let mut limitations = Vec::new();
-    let mut total_bytes = 0;
-    collect_entries(root, root, &mut entries, &mut total_bytes, &mut limitations);
+    let mut collector = ContentCollector::new(root);
+    collector.collect_dir(root, 0);
+    let ContentCollector {
+        mut entries,
+        limitations,
+        ..
+    } = collector;
     entries.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut limitations = limitations;
     limitations.sort();
     limitations.dedup();
     let mut hasher = Sha256::new();
@@ -486,6 +497,24 @@ pub fn source_identity(
         file_count: entries.len(),
         limitations,
         file_digests,
+    }
+}
+
+fn valid_ref(reference: &str) -> bool {
+    !reference.is_empty()
+        && !reference.starts_with('-')
+        && reference.len() <= 256
+        && reference.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'/' | b'.' | b'-' | b'^' | b'~')
+        })
+}
+
+fn unavailable_diff(limitation: &str) -> DiffResult {
+    DiffResult {
+        available: false,
+        text: None,
+        truncated: false,
+        limitation: Some(limitation.into()),
     }
 }
 
@@ -525,157 +554,337 @@ pub fn git_diff(root: &Path, ref_a: &str, ref_b: &str) -> DiffResult {
     }
 }
 
-fn valid_ref(reference: &str) -> bool {
-    !reference.is_empty()
-        && !reference.starts_with('-')
-        && reference.len() <= 256
-        && reference.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'/' | b'.' | b'-' | b'^' | b'~')
-        })
+/// Hard traversal bounds for security-critical identity collection. Every
+/// bound is a visible coverage loss in `limitations`, never a silent gap:
+/// depth cap against unbounded recursion, per-directory entry cap against
+/// entry bombs, the global MAX_FILES/byte limits, a wall-clock budget, and
+/// cooperative interruption.
+const MAX_TREE_DEPTH: usize = 64;
+const MAX_CHILDREN_PER_DIR: usize = if MAX_FILES.saturating_mul(4) > 4096 {
+    MAX_FILES.saturating_mul(4)
+} else {
+    4096
+};
+const MAX_COLLECTION_MILLIS: u128 = 10_000;
+
+struct ContentCollector {
+    root: PathBuf,
+    entries: Vec<ContentEntry>,
+    total_bytes: u64,
+    /// Bytes actually read from disk across the whole collection. Distinct
+    /// from `total_bytes` (retained bytes): a file can be read and then
+    /// dropped to a sentinel. Bounding THIS is what keeps a hook flood from
+    /// costing gigabytes of reads after the aggregate budget is spent.
+    read_bytes: u64,
+    limitations: Vec<String>,
+    started_at: std::time::Instant,
 }
 
-fn unavailable_diff(limitation: &str) -> DiffResult {
-    DiffResult {
-        available: false,
-        text: None,
-        truncated: false,
-        limitation: Some(limitation.into()),
+impl ContentCollector {
+    fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            entries: Vec::new(),
+            total_bytes: 0,
+            read_bytes: 0,
+            limitations: Vec::new(),
+            started_at: std::time::Instant::now(),
+        }
     }
-}
 
-struct ContentEntry {
-    path: String,
-    kind: u8,
-    mode: u32,
-    data: Vec<u8>,
-}
-
-fn collect_entries(
-    root: &Path,
-    directory: &Path,
-    entries: &mut Vec<ContentEntry>,
-    total_bytes: &mut u64,
-    limitations: &mut Vec<String>,
-) {
-    if directory.file_name().is_some_and(|name| name == ".git") {
-        return;
-    }
-    let read_dir = match fs::read_dir(directory) {
-        Ok(read_dir) => read_dir,
-        Err(error) => {
-            let _ = error;
-            limitations.push("unreadable_directory".into());
+    fn collect_git_file(
+        &mut self,
+        path: &Path,
+        kind: u8,
+        unreadable_limitation: &str,
+        oversize_limitation: &str,
+        allow_missing: bool,
+    ) {
+        if self.out_of_budget() {
             return;
         }
-    };
-    let mut children = Vec::new();
-    for item in read_dir {
-        match item {
-            Ok(entry) => children.push(entry),
-            Err(_) => limitations.push("directory_entry_unreadable".into()),
-        }
-    }
-    children.sort_by_key(|entry| entry.file_name());
-    for entry in children {
-        if entries.len() >= MAX_FILES {
-            limitations.push("file_limit".into());
+        if self.entries.len() >= MAX_FILES {
+            self.limitations.push("file_limit".into());
             return;
         }
-        let path = entry.path();
-        if path.file_name().is_some_and(|name| name == ".git") {
-            if path.is_dir() {
-                collect_git_metadata(root, &path, entries, limitations);
-            } else if let Ok(metadata) = fs::symlink_metadata(&path) {
-                let relative = path
-                    .strip_prefix(root)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                entries.push(ContentEntry {
-                    path: relative,
-                    kind: b'g',
-                    mode: file_mode(&metadata),
-                    data: bounded_file_bytes(&path),
-                });
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) => {
+                self.limitations.push(unreadable_limitation.into());
+                return;
             }
-            continue;
-        }
-        let Ok(metadata) = fs::symlink_metadata(&path) else {
-            limitations.push("metadata_unavailable".into());
-            continue;
+            Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(_) => {
+                self.limitations.push(unreadable_limitation.into());
+                return;
+            }
         };
         let relative = path
-            .strip_prefix(root)
-            .unwrap_or(&path)
+            .strip_prefix(&self.root)
+            .unwrap_or(path)
             .to_string_lossy()
             .replace('\\', "/");
+        // Budget check BEFORE the read: once the aggregate budget is spent,
+        // retain a bounded sentinel from metadata alone and read nothing.
+        // This caps total reads at ~MAX_TOTAL_BYTES (plus the single boundary
+        // file), so thousands of trailing hooks cannot each cost a
+        // MAX_METADATA_BYTES read.
+        if self.total_bytes >= MAX_TOTAL_BYTES {
+            self.limitations.push("aggregate_byte_limit".into());
+            self.entries.push(ContentEntry {
+                path: relative,
+                kind: b'x',
+                mode: file_mode(&metadata),
+                data: metadata.len().to_be_bytes().to_vec(),
+            });
+            return;
+        }
+        let (data, truncated) = match bounded_file_bytes(path) {
+            Ok(result) => result,
+            Err(()) => {
+                self.limitations.push(unreadable_limitation.into());
+                return;
+            }
+        };
+        self.read_bytes = self
+            .read_bytes
+            .saturating_add(data.len() as u64 + u64::from(truncated));
+        if truncated {
+            self.limitations.push(oversize_limitation.into());
+        }
+        if self.total_bytes.saturating_add(data.len() as u64) > MAX_TOTAL_BYTES {
+            // This file crossed the budget: retain only a bounded sentinel, so
+            // retained bytes stay <= MAX_TOTAL_BYTES. Subsequent files hit the
+            // pre-read guard above and are never read.
+            self.limitations.push("aggregate_byte_limit".into());
+            self.entries.push(ContentEntry {
+                path: relative,
+                kind: b'x',
+                mode: file_mode(&metadata),
+                data: data.len().to_be_bytes().to_vec(),
+            });
+            return;
+        }
+        self.total_bytes = self.total_bytes.saturating_add(data.len() as u64);
+        self.entries.push(ContentEntry {
+            path: relative,
+            kind,
+            mode: file_mode(&metadata),
+            data,
+        });
+    }
+
+    /// Captures the security-relevant `.git` inputs — config, HEAD,
+    /// packed-refs, and every hooks entry — under the SAME bounds as the main
+    /// walk (file count, per-directory entry cap, aggregate bytes, wall
+    /// clock, interruption), so a hook-directory entry bomb or a hook flood
+    /// produces a visible limitation instead of exhausting the collector or
+    /// silently inflating the identity.
+    fn collect_git_metadata(&mut self, git: &Path) {
+        for name in ["config", "HEAD", "packed-refs"] {
+            self.collect_git_file(
+                &git.join(name),
+                b'g',
+                "git_metadata_unreadable",
+                "git_metadata_oversize",
+                name == "packed-refs",
+            );
+        }
+        let hooks = git.join("hooks");
+        let read_dir = match fs::read_dir(&hooks) {
+            Ok(read_dir) => read_dir,
+            Err(_) => {
+                self.limitations.push("git_hooks_unreadable".into());
+                return;
+            }
+        };
+        let mut children = Vec::new();
+        for item in read_dir {
+            if children.len() >= MAX_CHILDREN_PER_DIR {
+                self.limitations.push("directory_entry_limit".into());
+                return;
+            }
+            match item {
+                Ok(entry) => children.push(entry),
+                Err(_) => self.limitations.push("directory_entry_unreadable".into()),
+            }
+            if self.out_of_budget() {
+                return;
+            }
+        }
+        children.sort_by_key(|entry| entry.file_name());
+        for entry in children {
+            if self.entries.len() >= MAX_FILES {
+                self.limitations.push("file_limit".into());
+                return;
+            }
+            if self.out_of_budget() {
+                return;
+            }
+            self.collect_git_file(
+                &entry.path(),
+                b'h',
+                "git_hook_unreadable",
+                "git_hook_oversize",
+                false,
+            );
+        }
+    }
+
+    fn out_of_budget(&mut self) -> bool {
+        if omasafe_core::interrupt::raised() {
+            self.limitations.push("collection_interrupted".into());
+            return true;
+        }
+        if self.started_at.elapsed().as_millis() > MAX_COLLECTION_MILLIS {
+            self.limitations.push("collection_time_budget".into());
+            return true;
+        }
+        false
+    }
+
+    fn collect_dir(&mut self, directory: &Path, depth: usize) {
+        if self.out_of_budget() {
+            return;
+        }
+        if depth > MAX_TREE_DEPTH {
+            self.limitations.push("tree_depth_limit".into());
+            return;
+        }
+        if self.entries.len() >= MAX_FILES {
+            self.limitations.push("file_limit".into());
+            return;
+        }
+        if directory.file_name().is_some_and(|name| name == ".git") {
+            return;
+        }
+        let read_dir = match fs::read_dir(directory) {
+            Ok(read_dir) => read_dir,
+            Err(_) => {
+                self.limitations.push("unreadable_directory".into());
+                return;
+            }
+        };
+        let mut children = Vec::new();
+        for item in read_dir {
+            if children.len() >= MAX_CHILDREN_PER_DIR {
+                self.limitations.push("directory_entry_limit".into());
+                return;
+            }
+            match item {
+                Ok(entry) => children.push(entry),
+                Err(_) => self.limitations.push("directory_entry_unreadable".into()),
+            }
+            if self.out_of_budget() {
+                return;
+            }
+        }
+        children.sort_by_key(|entry| entry.file_name());
+        for entry in children {
+            if self.entries.len() >= MAX_FILES {
+                self.limitations.push("file_limit".into());
+                return;
+            }
+            if self.out_of_budget() {
+                return;
+            }
+            self.collect_entry(directory, &entry.path(), depth);
+        }
+    }
+
+    fn collect_entry(&mut self, _directory: &Path, path: &Path, depth: usize) {
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            self.limitations.push("metadata_unavailable".into());
+            return;
+        };
+        let relative = path
+            .strip_prefix(&self.root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+        if name.as_deref() == Some(".git") {
+            if metadata.is_dir() {
+                self.collect_git_metadata(path);
+            } else {
+                self.collect_git_file(
+                    path,
+                    b'g',
+                    "git_metadata_unreadable",
+                    "git_metadata_oversize",
+                    false,
+                );
+            }
+            return;
+        }
         let mode = file_mode(&metadata);
         let file_type = metadata.file_type();
         if file_type.is_symlink() {
-            let data = fs::read_link(&path)
+            let data = fs::read_link(path)
                 .map(|target| target.to_string_lossy().into_owned().into_bytes())
                 .unwrap_or_default();
-            entries.push(ContentEntry {
+            self.entries.push(ContentEntry {
                 path: relative,
                 kind: b'l',
                 mode,
                 data,
             });
         } else if file_type.is_dir() {
-            entries.push(ContentEntry {
+            self.entries.push(ContentEntry {
                 path: relative,
                 kind: b'd',
                 mode,
                 data: Vec::new(),
             });
-            collect_entries(root, &path, entries, total_bytes, limitations);
+            self.collect_dir(path, depth + 1);
         } else if file_type.is_file() {
-            if *total_bytes >= MAX_TOTAL_BYTES {
-                limitations.push("aggregate_byte_limit".into());
-                entries.push(ContentEntry {
+            if self.total_bytes >= MAX_TOTAL_BYTES {
+                self.limitations.push("aggregate_byte_limit".into());
+                self.entries.push(ContentEntry {
                     path: relative,
                     kind: b'x',
                     mode,
                     data: metadata.len().to_be_bytes().to_vec(),
                 });
-                continue;
+                return;
             }
             if metadata.len() > MAX_FILE_BYTES {
-                limitations.push("oversize_file".into());
+                self.limitations.push("oversize_file".into());
                 let (data, sampled) = skipped_file_digest(
-                    &path,
+                    path,
                     metadata.len(),
-                    MAX_TOTAL_BYTES.saturating_sub(*total_bytes),
+                    MAX_TOTAL_BYTES.saturating_sub(self.total_bytes),
                 );
-                *total_bytes = total_bytes.saturating_add(sampled);
-                entries.push(ContentEntry {
+                self.total_bytes = self.total_bytes.saturating_add(sampled);
+                self.entries.push(ContentEntry {
                     path: relative,
                     kind: b'x',
                     mode,
                     data,
                 });
-                continue;
+                return;
             }
-            if total_bytes.saturating_add(metadata.len()) > MAX_TOTAL_BYTES {
-                limitations.push("aggregate_byte_limit".into());
+            if self.total_bytes.saturating_add(metadata.len()) > MAX_TOTAL_BYTES {
+                self.limitations.push("aggregate_byte_limit".into());
                 let (data, sampled) = skipped_file_digest(
-                    &path,
+                    path,
                     metadata.len(),
-                    MAX_TOTAL_BYTES.saturating_sub(*total_bytes),
+                    MAX_TOTAL_BYTES.saturating_sub(self.total_bytes),
                 );
-                *total_bytes = total_bytes.saturating_add(sampled);
-                entries.push(ContentEntry {
+                self.total_bytes = self.total_bytes.saturating_add(sampled);
+                self.entries.push(ContentEntry {
                     path: relative,
                     kind: b'x',
                     mode,
                     data,
                 });
-                continue;
+                return;
             }
-            match fs::read(&path) {
+            match fs::read(path) {
                 Ok(data) => {
-                    *total_bytes += data.len() as u64;
-                    entries.push(ContentEntry {
+                    self.read_bytes = self.read_bytes.saturating_add(data.len() as u64);
+                    self.total_bytes += data.len() as u64;
+                    self.entries.push(ContentEntry {
                         path: relative,
                         kind: b'f',
                         mode,
@@ -683,8 +892,8 @@ fn collect_entries(
                     });
                 }
                 Err(_) => {
-                    limitations.push("unreadable_file".into());
-                    entries.push(ContentEntry {
+                    self.limitations.push("unreadable_file".into());
+                    self.entries.push(ContentEntry {
                         path: relative,
                         kind: b'x',
                         mode,
@@ -693,62 +902,14 @@ fn collect_entries(
                 }
             }
         } else {
-            limitations.push("special_file".into());
-            entries.push(ContentEntry {
+            self.limitations.push("special_file".into());
+            self.entries.push(ContentEntry {
                 path: relative,
                 kind: b'x',
                 mode,
                 data: Vec::new(),
             });
         }
-    }
-}
-
-fn collect_git_metadata(
-    root: &Path,
-    git: &Path,
-    entries: &mut Vec<ContentEntry>,
-    limitations: &mut Vec<String>,
-) {
-    for name in ["config", "HEAD", "packed-refs"] {
-        let path = git.join(name);
-        if let Ok(metadata) = fs::symlink_metadata(&path)
-            && metadata.is_file()
-        {
-            let relative = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            let data = bounded_file_bytes(&path);
-            entries.push(ContentEntry {
-                path: relative,
-                kind: b'g',
-                mode: file_mode(&metadata),
-                data,
-            });
-        }
-    }
-    let hooks = git.join("hooks");
-    if let Ok(items) = fs::read_dir(&hooks) {
-        for item in items.flatten() {
-            let item_path = item.path();
-            if let Ok(metadata) = fs::symlink_metadata(&item_path) {
-                let relative = item_path
-                    .strip_prefix(root)
-                    .unwrap_or(&item_path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                entries.push(ContentEntry {
-                    path: relative,
-                    kind: b'h',
-                    mode: file_mode(&metadata),
-                    data: bounded_file_bytes(&item_path),
-                });
-            }
-        }
-    } else if hooks.exists() {
-        limitations.push("git_hooks_unreadable".into());
     }
 }
 
@@ -780,16 +941,16 @@ fn skipped_file_digest(path: &Path, size: u64, budget: u64) -> (Vec<u8>, u64) {
     (hasher.finalize().to_vec(), sampled)
 }
 
-fn bounded_file_bytes(path: &Path) -> Vec<u8> {
-    let Ok(mut file) = fs::File::open(path) else {
-        return Vec::new();
-    };
+fn bounded_file_bytes(path: &Path) -> Result<(Vec<u8>, bool), ()> {
+    let mut file = fs::File::open(path).map_err(|_| ())?;
     let mut bytes = Vec::new();
-    let _ = file
-        .by_ref()
+    file.by_ref()
         .take((MAX_METADATA_BYTES + 1) as u64)
-        .read_to_end(&mut bytes);
-    bytes
+        .read_to_end(&mut bytes)
+        .map_err(|_| ())?;
+    let truncated = bytes.len() > MAX_METADATA_BYTES;
+    bytes.truncate(MAX_METADATA_BYTES);
+    Ok((bytes, truncated))
 }
 
 #[cfg(unix)]
@@ -817,9 +978,44 @@ const NATIVE_OUTPUT_CAP: usize = 64 * 1024;
 fn run_omarchy(args: &[&str]) -> NativeCommand {
     let mut command = Command::new("omarchy");
     command.args(args.to_vec());
-    // The native updater itself exports this; setting it here keeps direct
-    // git children inside wrapper scripts from ever prompting.
-    command.env("GIT_TERMINAL_PROMPT", "0");
+    // Inherited Git hardening for the native updater's own git children
+    // (fetch/merge run hooks and honor .git/config directives):
+    // - system/global/user config neutralized, so nothing outside the
+    //   repository can redirect dataflow;
+    // - core.hooksPath forced to /dev/null via injected config, so NO hook
+    //   (post-merge included) can execute during the delegated mutation — the
+    //   pre-mutation audit refuses known hooks, this closes mid-update races;
+    // - prompts off and transports restricted to the ones git connects
+    //   itself, so a hostile URL can never reach a remote helper (ext:: runs
+    //   a shell command).
+    // These are environment config, not repository config: the .git/config
+    // audit reads the file directly and can never see them.
+    command
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_ALLOW_PROTOCOL", "file:git:http:https:ssh")
+        // Mirror every command-level hardening setting from
+        // omasafe_core::git::command(), plus an empty credential.helper that
+        // resets any helper list a racing writer accumulated: env-injected
+        // entries carry command-line precedence, so they override the
+        // repository-local config for the whole window. Subsection-keyed
+        // sinks (filter.<name>, url.<base>.insteadOf) cannot be enumerated —
+        // the caller neutralizes those by swapping in a hardened .git/config
+        // snapshot for the update window (GitConfigGuard in omasafe-cli).
+        .env("GIT_CONFIG_COUNT", "5")
+        .env("GIT_CONFIG_KEY_0", "core.fsmonitor")
+        .env("GIT_CONFIG_VALUE_0", "false")
+        .env("GIT_CONFIG_KEY_1", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_1", "/dev/null")
+        .env("GIT_CONFIG_KEY_2", "diff.external")
+        .env("GIT_CONFIG_VALUE_2", "")
+        .env("GIT_CONFIG_KEY_3", "protocol.ext.allow")
+        .env("GIT_CONFIG_VALUE_3", "never")
+        .env("GIT_CONFIG_KEY_4", "credential.helper")
+        .env("GIT_CONFIG_VALUE_4", "");
     let fallback = |message: String| NativeCommand {
         success: false,
         output: message,
@@ -874,7 +1070,10 @@ pub fn omarchy_bar_use_default() -> NativeCommand {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect, git_diff, git_metadata, source_identity};
+    use super::{
+        MAX_CHILDREN_PER_DIR, MAX_METADATA_BYTES, MAX_TREE_DEPTH, collect, git_diff, git_metadata,
+        source_identity,
+    };
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1008,6 +1207,175 @@ mod tests {
         assert_eq!(inventory.active_full_bar.as_deref(), Some("io.example.bar"));
         assert!(inventory.non_builtin_bar_replaces_bar);
         assert_eq!(inventory.plugins[0].enabled, Some(true));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn identity_collection_is_bounded_by_depth_and_entry_caps() {
+        let root = std::env::temp_dir().join(format!(
+            "omasafe-bounded-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+
+        // Deep tree: a directory chain far past MAX_TREE_DEPTH must surface a
+        // visible depth limitation instead of recursing unboundedly.
+        let mut deep = root.join("deep");
+        fs::create_dir_all(&deep).unwrap();
+        for level in 0..(MAX_TREE_DEPTH + 20) {
+            deep = deep.join(format!("l{level}"));
+            fs::create_dir_all(&deep).unwrap();
+        }
+        fs::write(deep.join("leaf.txt"), "leaf\n").unwrap();
+        let identity = source_identity("t.deep", &root.join("deep"), None, None, None);
+        assert!(
+            identity
+                .limitations
+                .contains(&"tree_depth_limit".to_owned()),
+            "{:?}",
+            identity.limitations
+        );
+        assert!(identity.file_count < MAX_TREE_DEPTH + 5, "{identity:?}");
+
+        // Entry bomb: one directory with far more entries than any cap must
+        // stop collecting without materializing the whole listing.
+        let bomb = root.join("bomb");
+        fs::create_dir_all(&bomb).unwrap();
+        for index in 0..(MAX_CHILDREN_PER_DIR + 100) {
+            fs::write(bomb.join(format!("f{index:07}")), "x").unwrap();
+        }
+        let identity = source_identity("t.bomb", &root.join("bomb"), None, None, None);
+        assert!(
+            identity.limitations.iter().any(|limitation| {
+                limitation == "file_limit" || limitation == "directory_entry_limit"
+            }),
+            "{:?}",
+            identity.limitations
+        );
+        assert!(identity.file_count <= MAX_CHILDREN_PER_DIR, "{identity:?}");
+
+        // Hook bomb: .git/hooks is collected as identity-relevant metadata,
+        // so an entry flood there must trip the same per-directory cap and
+        // surface a limitation instead of bypassing the collector's bounds.
+        let repo = root.join("hookbomb");
+        let hooks = repo.join(".git").join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        fs::write(
+            repo.join("manifest.json"),
+            r#"{"schemaVersion":1,"id":"t.hb"}"#,
+        )
+        .unwrap();
+        for index in 0..(MAX_CHILDREN_PER_DIR + 100) {
+            fs::write(hooks.join(format!("hook-{index:07}")), "#!/bin/sh\n").unwrap();
+        }
+        let identity = source_identity("t.hookbomb", &repo, None, None, None);
+        assert!(
+            identity
+                .limitations
+                .contains(&"directory_entry_limit".to_owned()),
+            "{:?}",
+            identity.limitations
+        );
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn identity_collection_discloses_git_metadata_truncation() {
+        let root = fixture_root();
+        let git = root.join(".git");
+        let hooks = git.join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        fs::write(
+            root.join("manifest.json"),
+            r#"{"schemaVersion":1,"id":"t.metadata"}"#,
+        )
+        .unwrap();
+        fs::write(git.join("config"), vec![b'c'; MAX_METADATA_BYTES + 1]).unwrap();
+        fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(
+            hooks.join("post-checkout"),
+            vec![b'h'; MAX_METADATA_BYTES + 1],
+        )
+        .unwrap();
+
+        let identity = source_identity("t.metadata", &root, None, None, None);
+        assert!(
+            identity
+                .limitations
+                .contains(&"git_metadata_oversize".to_owned()),
+            "{:?}",
+            identity.limitations
+        );
+        assert!(
+            identity
+                .limitations
+                .contains(&"git_hook_oversize".to_owned()),
+            "{:?}",
+            identity.limitations
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn identity_collection_stops_reading_past_aggregate_budget() {
+        use super::{ContentCollector, MAX_TOTAL_BYTES};
+        // Past the aggregate budget the collector must stop READING, not just
+        // stop retaining: it retains bounded sentinels AND performs no further
+        // disk reads. The old implementation read every remaining hook up to
+        // MAX_METADATA_BYTES before checking the budget — this measures reads
+        // and retention directly so that regression would fail here.
+        let root = fixture_root();
+        let git = root.join(".git");
+        let hooks = git.join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+
+        // Each hook is just over the per-file truncation cap, so it reads and
+        // retains ~MAX_METADATA_BYTES. The budget is exhausted after
+        // ~MAX_TOTAL_BYTES/MAX_METADATA_BYTES of them; every hook past that
+        // point must be skipped without a read. Provision comfortably more
+        // than the budget needs so a chunk of hooks falls after exhaustion.
+        let per_file = MAX_METADATA_BYTES + 1;
+        let budget_files = (MAX_TOTAL_BYTES as usize).div_ceil(MAX_METADATA_BYTES);
+        let count = budget_files + budget_files / 2; // 1.5x the budget
+        for index in 0..count {
+            fs::write(hooks.join(format!("hook-{index:04}")), vec![b'y'; per_file]).unwrap();
+        }
+
+        let mut collector = ContentCollector::new(&root);
+        collector.collect_git_metadata(&git);
+
+        // Reads are bounded to the budget plus at most one boundary file — NOT
+        // the whole corpus, which the old read-then-check code would consume.
+        let read_ceiling = MAX_TOTAL_BYTES + 2 * MAX_METADATA_BYTES as u64;
+        let corpus = count as u64 * per_file as u64;
+        assert!(
+            collector.read_bytes <= read_ceiling,
+            "read {} bytes, expected <= {read_ceiling}",
+            collector.read_bytes
+        );
+        // Sanity: the corpus is materially larger than the ceiling, so a
+        // read-everything regression is actually distinguishable here.
+        assert!(
+            corpus > read_ceiling + budget_files as u64 * MAX_METADATA_BYTES as u64 / 4,
+            "corpus {corpus} not large enough to distinguish the regression"
+        );
+        // Retained bytes stay within the aggregate budget regardless.
+        assert!(
+            collector.total_bytes <= MAX_TOTAL_BYTES,
+            "retained {} bytes, expected <= {MAX_TOTAL_BYTES}",
+            collector.total_bytes
+        );
+        assert!(
+            collector
+                .limitations
+                .contains(&"aggregate_byte_limit".to_owned()),
+            "{:?}",
+            collector.limitations
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

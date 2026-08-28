@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 
@@ -77,6 +78,23 @@ pub struct UpdateFlowRecord {
     /// Quiescing actions taken before mutation: "bar-switched", "disabled".
     #[serde(default)]
     pub quiesced: Vec<String>,
+    /// Durable recovery for the hardened-config swap window. Written and
+    /// fsync'd BEFORE the installed `.git/config` is swapped, so a SIGKILL or
+    /// power loss mid-window leaves a recoverable copy of the audited original
+    /// on disk instead of only in the dead process's memory. A subsequent run
+    /// reconciles `config_target` from `config_backup` before proceeding.
+    /// All optional and `serde(default)` for back-compat with older records.
+    #[serde(default)]
+    pub config_backup: Option<String>,
+    /// Absolute path of the `.git/config` that was swapped, restored from the
+    /// backup during reconciliation.
+    #[serde(default)]
+    pub config_target: Option<String>,
+    /// Original file mode of `config_target`, preserved across restore so the
+    /// audited original is put back with its own permissions, not the
+    /// hardened snapshot's.
+    #[serde(default)]
+    pub config_original_mode: Option<u32>,
 }
 
 impl UpdateFlowRecord {
@@ -100,7 +118,14 @@ impl UpdateFlowRecord {
         }
         let mut bytes = serde_json::to_vec_pretty(self)?;
         bytes.push(b'\n');
-        fs::write(path, bytes)?;
+        // Durable write: the recovery record must survive a hard kill or power
+        // loss, otherwise the config-swap backup reference it carries could be
+        // lost exactly when it is needed. A random, exclusively-created,
+        // non-following temp (never a predictable `.tmp` opened with
+        // create/O_FOLLOW) is fsync'd, atomically renamed, and the parent
+        // fsync'd — so a concurrent same-user writer cannot pre-plant a symlink
+        // at the temp path and have this overwrite an arbitrary target.
+        durable_replace(path, &bytes)?;
         Ok(())
     }
 }
@@ -214,18 +239,10 @@ impl TrustHistory {
     pub fn write_atomic_locked(&self, path: &Path) -> Result<(), Error> {
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent)?;
-        let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-        let mut file = fs::File::create(&temporary)?;
-        std::io::Write::write_all(&mut file, &serde_json::to_vec_pretty(self)?)?;
-        file.sync_all()?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
-        }
-        fs::rename(temporary, path)?;
-        sync_parent(parent)?;
-        Ok(())
+        // Secure temp (create-new + O_NOFOLLOW, random name, mode 0o600) so a
+        // pre-planted symlink at a predictable `tmp-<pid>` name cannot redirect
+        // this write onto another same-user file.
+        durable_replace(path, &serde_json::to_vec_pretty(self)?)
     }
 }
 
@@ -272,18 +289,10 @@ impl ScanState {
     pub fn write_atomic_locked(&self, path: &Path) -> Result<(), Error> {
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent)?;
-        let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-        let mut file = fs::File::create(&temporary)?;
-        std::io::Write::write_all(&mut file, &serde_json::to_vec_pretty(self)?)?;
-        file.sync_all()?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
-        }
-        fs::rename(temporary, path)?;
-        sync_parent(parent)?;
-        Ok(())
+        // Secure temp (create-new + O_NOFOLLOW, random name, mode 0o600) so a
+        // pre-planted symlink at a predictable `tmp-<pid>` name cannot redirect
+        // this write onto another same-user file.
+        durable_replace(path, &serde_json::to_vec_pretty(self)?)
     }
 }
 
@@ -336,6 +345,76 @@ fn sync_parent(parent: &Path) -> Result<(), Error> {
     let directory = fs::File::open(parent)?;
     directory.sync_all()?;
     Ok(())
+}
+
+/// Atomically installs `bytes` at `path` (mode 0o600) via a random,
+/// exclusively-created, non-following temporary in the SAME directory, then
+/// fsync + rename + parent fsync. `create_new` (O_CREAT|O_EXCL) plus
+/// O_NOFOLLOW means a pre-planted symlink or file at the temp path fails the
+/// open instead of being followed or overwritten — a predictable `.tmp`
+/// sibling opened with plain `File::create` would follow such a symlink and
+/// overwrite an arbitrary same-user target.
+fn durable_replace(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    let dir = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let mut last_error: Option<std::io::Error> = None;
+    for _ in 0..8 {
+        let temp = dir.join(format!(".omasafe-state.{:016x}", random_u64()));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let mut file = match options.open(&temp) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_error = Some(error);
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+            let _ = fs::remove_file(&temp);
+            return Err(error.into());
+        }
+        drop(file);
+        if let Err(error) = fs::rename(&temp, path) {
+            let _ = fs::remove_file(&temp);
+            return Err(error.into());
+        }
+        sync_parent(&dir)?;
+        return Ok(());
+    }
+    Err(last_error
+        .unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::AlreadyExists, "temp collision"))
+        .into())
+}
+
+/// 64 bits from the OS CSPRNG for unpredictable temp names. Falls back to a
+/// time/PID mix only if `getrandom` is unavailable; `create_new` still
+/// guarantees exclusivity regardless of name quality.
+fn random_u64() -> u64 {
+    #[cfg(unix)]
+    {
+        let mut buffer = [0u8; 8];
+        let read =
+            unsafe { libc::getrandom(buffer.as_mut_ptr() as *mut libc::c_void, buffer.len(), 0) };
+        if read == buffer.len() as isize {
+            return u64::from_ne_bytes(buffer);
+        }
+    }
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0);
+    nanos ^ ((std::process::id() as u64) << 32)
 }
 
 #[cfg(test)]

@@ -1912,8 +1912,14 @@ case "$*" in
     fi
     jq -c '[.plugin]' "$STATE"
     ;;
-  "plugin update io.example.cli --yes")
+    "plugin update io.example.cli --yes")
     mode=$(get '.updateMode // "ok"')
+    printf 'gitenv=%s:%s=%s:%s=%s:%s=%s:%s=%s:%s=%s\n' \
+      "$GIT_CONFIG_COUNT" "$GIT_CONFIG_KEY_0" "$GIT_CONFIG_VALUE_0" \
+      "$GIT_CONFIG_KEY_1" "$GIT_CONFIG_VALUE_1" \
+      "$GIT_CONFIG_KEY_2" "$GIT_CONFIG_VALUE_2" \
+      "$GIT_CONFIG_KEY_3" "$GIT_CONFIG_VALUE_3" \
+      "$GIT_CONFIG_KEY_4" "$GIT_CONFIG_VALUE_4" >> "$LOG"
     if [[ $mode == "fail" ]]; then
       echo "omarchy-plugin-update: update of 'io.example.cli' failed validation; rolled back" >&2
       exit 1
@@ -1926,8 +1932,33 @@ case "$*" in
     fi
     source="$ORIGIN"
     [[ $mode == "race" ]] && source="$RACE_ORIGIN"
+    if [[ $mode == "config-race" ]]; then
+      # Synchronous and BEFORE Git fetch/merge. The fake updater only runs
+      # after OmaSafe's pre-mutation audit, so this is exactly the window
+      # where native Git would consume injected config. The hardened snapshot
+      # plus env overrides must neutralize it: no execution, no persistence.
+      printf '#!/bin/sh\nprintf executed > "$OMASAFE_FAKE_FS_MONITOR_MARKER"\n' > "$OMASAFE_FAKE_FS_MONITOR_COMMAND"
+      /bin/chmod +x "$OMASAFE_FAKE_FS_MONITOR_COMMAND"
+      printf '\n[core]\n\tfsmonitor = %s\n' "$OMASAFE_FAKE_FS_MONITOR_COMMAND" >> "$PLUGIN_DIR/.git/config"
+    fi
     git -C "$PLUGIN_DIR" fetch -q "$source" HEAD
     git -C "$PLUGIN_DIR" merge -q --ff-only FETCH_HEAD
+    if [[ $mode == "dirty" ]]; then
+      printf 'planted\n' > "$PLUGIN_DIR/uncommitted-local.txt"
+    fi
+    if [[ $mode == "corrupt-index" ]]; then
+      printf 'garbage' > "$PLUGIN_DIR/.git/index"
+    fi
+    if [[ $mode == "inject" ]]; then
+      printf 'MZ fake payload' > "$PLUGIN_DIR/oma-extra.bin"
+    fi
+    if [[ $mode == "plant-hook" ]]; then
+      printf '#!/bin/sh\nrm -rf ~\n' > "$PLUGIN_DIR/.git/hooks/post-checkout"
+      chmod +x "$PLUGIN_DIR/.git/hooks/post-checkout"
+    fi
+    if [[ $mode == "config-inject" ]]; then
+      printf '\n[core]\n\thooksPath = /tmp/omasafe-evil-hooks\n' >> "$PLUGIN_DIR/.git/config"
+    fi
     echo "Updated io.example.cli."
     ;;
   "plugin disable io.example.cli")
@@ -2084,6 +2115,10 @@ impl UpdateFixture {
             "Item { property string x: \"candidate\" }\n",
         )
         .unwrap();
+        // The ignored-file channel: the native updater reports a clean
+        // worktree while extra bytes ride along. H1's installed-bytes check
+        // must catch this even though git metadata says everything is fine.
+        fs::write(work.path().join(".gitignore"), "oma-extra.bin\n").unwrap();
         let candidate = git_commit_all(work.path(), "B");
         run_git(
             work.path(),
@@ -2156,7 +2191,11 @@ impl UpdateFixture {
         );
         run_git(
             &fixture.plugin,
-            &["checkout", "--quiet", "--detach", "FETCH_HEAD"],
+            // Native installs are branch-based clones with a symbolic HEAD, and
+            // the fake updater's `merge --ff-only` keeps that shape; using it here
+            // ensures verification tolerates symbolic-HEAD installs, not just
+            // detached review checkouts.
+            &["checkout", "--quiet", "-B", "main", "FETCH_HEAD"],
         );
         assert_eq!(run_git(&fixture.plugin, &["rev-parse", "HEAD"]), base);
         run_git(
@@ -2221,6 +2260,14 @@ impl UpdateFixture {
             .env(
                 "OMASAFE_FAKE_PLUGIN_DIR",
                 self.fixture.plugin.to_string_lossy().as_ref(),
+            )
+            .env(
+                "OMASAFE_FAKE_FS_MONITOR_COMMAND",
+                self.fixture.state.path().join("raced-fsmonitor.sh"),
+            )
+            .env(
+                "OMASAFE_FAKE_FS_MONITOR_MARKER",
+                self.fixture.state.path().join("raced-fsmonitor-ran"),
             )
             .env("OMASAFE_DEBUG_REVIEW", "1")
             .args(["plugins", "review-update", "io.example.cli"])
@@ -2499,6 +2546,452 @@ fn review_update_rescan_failure_after_mutation_reports_guidance() {
         flow_record(&update.fixture).unwrap()["phase"],
         Value::String("failed".into())
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn review_update_dirty_worktree_after_mutation_fails_closed() {
+    let update = UpdateFixture::new();
+    update.seed_trust();
+    update.fake.set_mode("dirty");
+
+    let (stdout, stderr, code) =
+        update.review_update(&["--yes", "--expected-commit", &update.candidate]);
+    assert_eq!(code, Some(1));
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(text.contains("not verified clean"), "{text}");
+    assert!(text.contains("stays disabled"), "{text}");
+    assert!(!update.fake.enabled(), "must not re-enable an unclean tree");
+    assert!(
+        !update.fake.log_contains("plugin enable"),
+        "re-enable attempted despite dirty worktree"
+    );
+    assert_eq!(
+        run_git(&update.fixture.plugin, &["rev-parse", "HEAD"]),
+        update.candidate
+    );
+    let history: Value = serde_json::from_slice(
+        &fs::read(
+            update
+                .fixture
+                .state
+                .path()
+                .join("omasafe/trust-history.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_ne!(
+        history["records"].as_array().unwrap().last().unwrap()["accepted"]["head"],
+        Value::String(update.candidate.clone()),
+        "trust must not advance past a dirty postcondition"
+    );
+    assert_eq!(
+        flow_record(&update.fixture).unwrap()["phase"],
+        Value::String("failed".into())
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn review_update_unknown_dirty_state_fails_closed() {
+    // git status unavailable after the update is the same uncertainty the
+    // pre-flight refuses; post-update it must refuse with equal force.
+    let update = UpdateFixture::new();
+    update.seed_trust();
+    update.fake.set_mode("corrupt-index");
+
+    let (stdout, stderr, code) =
+        update.review_update(&["--yes", "--expected-commit", &update.candidate]);
+    assert_eq!(code, Some(1));
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(text.contains("git status is unavailable"), "{text}");
+    assert!(text.contains("stays disabled"), "{text}");
+    assert!(!update.fake.enabled());
+    assert!(!update.fake.log_contains("plugin enable"));
+    let history: Value = serde_json::from_slice(
+        &fs::read(
+            update
+                .fixture
+                .state
+                .path()
+                .join("omasafe/trust-history.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_ne!(
+        history["records"].as_array().unwrap().last().unwrap()["accepted"]["head"],
+        Value::String(update.candidate.clone())
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn review_update_planted_ignored_payload_is_detected() {
+    // HEAD matches and `git status` is clean because the extra file rides in
+    // through .gitignore — only re-reading the installed bytes catches it.
+    let update = UpdateFixture::new();
+    update.seed_trust();
+    update.fake.set_mode("inject");
+
+    let (stdout, stderr, code) =
+        update.review_update(&["--yes", "--expected-commit", &update.candidate]);
+    assert_eq!(code, Some(1));
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(text.contains("installed bytes differ"), "{text}");
+    assert!(text.contains("oma-extra.bin"), "diffing file named: {text}");
+    assert!(!update.fake.enabled());
+    assert!(!update.fake.log_contains("plugin enable"));
+    let history: Value = serde_json::from_slice(
+        &fs::read(
+            update
+                .fixture
+                .state
+                .path()
+                .join("omasafe/trust-history.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_ne!(
+        history["records"].as_array().unwrap().last().unwrap()["accepted"]["head"],
+        Value::String(update.candidate.clone()),
+        "trust must never advance to unverified bytes"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn scan_high_finding_reaches_notification_with_catalog_severity() {
+    // H1 exit criterion: a High finding reaches the notification path as
+    // High, not as a generic warning.
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.plugin.join("main.qml"),
+        "import QtQuick\nimport Quickshell.WlSessionLock\nItem { WlSessionLock {} }\n",
+    )
+    .unwrap();
+
+    let notify_log = fixture.state.path().join("notify-log.txt");
+    let shim = fixture.bin.path().join("notify-send");
+    fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> {}\n",
+            notify_log.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (_, kinds) = scan_alert_kinds(
+        &fixture,
+        &["scan", "--include-analysis", "--format", "json"],
+    );
+    assert!(
+        !kinds.contains(&"finding-regression".to_owned()),
+        "{kinds:?}"
+    );
+
+    let mut record = stored_analysis_event(&fixture, "io.example.cli");
+    record["finding_rule_ids"] = serde_json::json!([]);
+    let path = fixture.state.path().join("omasafe/scan-state.json");
+    let mut state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    state["analysis_events"]["io.example.cli"] = record;
+    fs::write(&path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+    let output = fixture
+        .command()
+        .args(["scan", "--include-analysis", "--format", "json", "--notify"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let alert = report["result"]["alerts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|alert| alert["kind"] == "finding-regression")
+        .expect("finding-regression alert present")
+        .clone();
+    assert_eq!(alert["severity"], Value::String("high".into()), "{}", alert);
+    assert_eq!(report["result"]["highest_severity"], "high");
+
+    let delivered = fs::read_to_string(&notify_log).unwrap_or_default();
+    assert!(delivered.contains("[high]"), "{delivered}");
+    assert!(delivered.contains("oma.qml.session-lock"), "{delivered}");
+}
+
+#[test]
+#[cfg(unix)]
+fn review_update_planted_git_hook_is_detected() {
+    // Hooks are part of SourceIdentity's audited file digests; a hook planted
+    // during the update window must fail the installed-bytes comparison even
+    // though HEAD matches and the worktree is clean.
+    let update = UpdateFixture::new();
+    update.seed_trust();
+    update.fake.set_mode("plant-hook");
+
+    let (stdout, stderr, code) =
+        update.review_update(&["--yes", "--expected-commit", &update.candidate]);
+    assert_eq!(code, Some(1));
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(
+        text.contains("installed bytes differ") || text.contains("active (non-template) git hook"),
+        "{text}"
+    );
+    assert!(
+        text.contains(".git/hooks/post-checkout") || text.contains("post-checkout"),
+        "{text}"
+    );
+    assert!(!update.fake.enabled());
+    assert!(!update.fake.log_contains("plugin enable"));
+}
+
+#[test]
+#[cfg(unix)]
+fn review_update_injected_hookspath_config_is_refused() {
+    // core.hooksPath redirects every git hook execution. Written DURING the
+    // update window it never reaches native Git as anything but the hardened
+    // snapshot (which the restore discards), and the tamper-evident restore
+    // must refuse the update outright.
+    let update = UpdateFixture::new();
+    update.seed_trust();
+    update.fake.set_mode("config-inject");
+
+    let (stdout, stderr, code) =
+        update.review_update(&["--yes", "--expected-commit", &update.candidate]);
+    assert_eq!(code, Some(1));
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(text.contains("modified during the update window"), "{text}");
+    let config = fs::read_to_string(update.fixture.plugin.join(".git/config")).unwrap();
+    assert!(
+        !config.contains("hooksPath"),
+        "the injection must not survive the restore: {config}"
+    );
+    assert!(!update.fake.enabled());
+    assert!(!update.fake.log_contains("plugin enable"));
+}
+
+#[test]
+#[cfg(unix)]
+fn review_update_refuses_preexisting_hook_or_config_before_mutation() {
+    // The native updater runs git fetch + merge, which would EXECUTE a
+    // pre-existing post-merge hook and honor config directives before the
+    // postcondition could merely report them. The audit must gate the
+    // mutation: the updater is never invoked on refusal.
+    let update = UpdateFixture::new();
+    update.seed_trust();
+    run_git(
+        &update.fixture.plugin,
+        &["config", "gc.recentObjectsHook", "touch /tmp/omasafe-pwned"],
+    );
+
+    let (stdout, stderr, code) =
+        update.review_update(&["--yes", "--expected-commit", &update.candidate]);
+    assert_eq!(code, Some(1));
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(text.contains("refused before mutation"), "{text}");
+    assert!(text.contains("gc.recentobjectshook"), "{text}");
+    assert!(
+        !update
+            .fake
+            .log_contains("plugin update io.example.cli --yes"),
+        "the native updater must not run after a pre-mutation refusal"
+    );
+    assert!(!update.fake.enabled());
+    assert!(!update.fake.log_contains("plugin enable"));
+}
+
+#[test]
+#[cfg(unix)]
+fn review_update_refuses_tampered_origin_url_before_mutation() {
+    // remote.origin.url is value-validated against the production HTTPS
+    // origin by the pre-mutation audit. A hostile https URL on a different
+    // host is refused offline-deterministically (cache is keyed by the real
+    // URL slug; the fetch gate and the audit both fail closed) BEFORE the
+    // native updater is ever invoked. A non-https tamper such as `ext::...`
+    // is refused even earlier by the candidate-resolution gate.
+    let update = UpdateFixture::new();
+    update.seed_trust();
+    run_git(
+        &update.fixture.plugin,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://127.0.0.1:1/steal.git",
+        ],
+    );
+
+    let (stdout, stderr, code) =
+        update.review_update(&["--yes", "--expected-commit", &update.candidate]);
+    assert_eq!(code, Some(1));
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(
+        text.contains("refused") || text.contains("failed"),
+        "{text}"
+    );
+    assert!(
+        !update
+            .fake
+            .log_contains("plugin update io.example.cli --yes"),
+        "the native updater must not run after a hostile-origin refusal"
+    );
+    // The refusal precedes any mutation: the enabled state is untouched.
+    assert!(update.fake.enabled());
+}
+
+#[test]
+#[cfg(unix)]
+fn review_update_hardens_native_updater_git_environment() {
+    // The updater's git children must run with hooks disabled and hardened
+    // config, inherited through the environment; env-injected config is
+    // invisible to the .git/config file audit by construction.
+    let update = UpdateFixture::new();
+    update.seed_trust();
+
+    let (_, _, code) = update.review_update(&["--yes", "--expected-commit", &update.candidate]);
+    assert_eq!(code, Some(0));
+    assert!(
+        update.fake.log_contains(
+            "gitenv=5:core.fsmonitor=false:core.hooksPath=/dev/null:diff.external=:protocol.ext.allow=never:credential.helper="
+        ),
+        "full Git hardening missing from the updater environment: {}",
+        fs::read_to_string(&update.fake.log_path).unwrap_or_default()
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn review_update_neutralizes_mid_update_fsmonitor_injection() {
+    // The fake updater runs after OmaSafe's pre-mutation audit and appends
+    // core.fsmonitor to .git/config synchronously BEFORE its git fetch and
+    // merge — exactly the execution window. The hardened config snapshot must
+    // keep native Git from consuming mutable local config: the raced command
+    // never executes (env fsmonitor=false overrides anything appended), the
+    // restore discards it, and the tamper-evident restore refuses the update.
+    let update = UpdateFixture::new();
+    update.seed_trust();
+    update.fake.set_mode("config-race");
+
+    let (stdout, stderr, code) =
+        update.review_update(&["--yes", "--expected-commit", &update.candidate]);
+    assert_eq!(code, Some(1));
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(text.contains("modified during the update window"), "{text}");
+    assert!(
+        !update
+            .fixture
+            .state
+            .path()
+            .join("raced-fsmonitor-ran")
+            .exists(),
+        "the raced fsmonitor command must not execute"
+    );
+    let config = fs::read_to_string(update.fixture.plugin.join(".git/config")).unwrap();
+    assert!(
+        !config.contains("fsmonitor"),
+        "the injection must not survive the update-window restore: {config}"
+    );
+    assert!(
+        update.fake.log_contains(
+            "gitenv=5:core.fsmonitor=false:core.hooksPath=/dev/null:diff.external=:protocol.ext.allow=never:credential.helper="
+        ),
+        "full Git hardening missing from the raced update: {}",
+        fs::read_to_string(&update.fake.log_path).unwrap_or_default()
+    );
+    assert!(!update.fake.enabled());
+    assert!(!update.fake.log_contains("plugin enable"));
+}
+
+#[test]
+#[cfg(unix)]
+fn scan_finding_regression_alerts_carry_catalog_severity() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.plugin.join("main.qml"),
+        "Process { command: [\"sh\", \"-c\", \"ls\"] }\n",
+    )
+    .unwrap();
+
+    let (_, kinds) = scan_alert_kinds(
+        &fixture,
+        &["scan", "--include-analysis", "--format", "json"],
+    );
+    assert!(
+        !kinds.contains(&"finding-regression".to_owned()),
+        "{kinds:?}"
+    );
+
+    let mut record = stored_analysis_event(&fixture, "io.example.cli");
+    record["finding_rule_ids"] = serde_json::json!([]);
+    let path = fixture.state.path().join("omasafe/scan-state.json");
+    let mut state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    state["analysis_events"]["io.example.cli"] = record;
+    fs::write(&path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+    let output = fixture
+        .command()
+        .args(["scan", "--include-analysis", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let alert = report["result"]["alerts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|alert| alert["kind"] == "finding-regression")
+        .expect("finding-regression alert present")
+        .clone();
+    assert_eq!(
+        alert["severity"],
+        Value::String("medium".into()),
+        "{}",
+        serde_json::to_string_pretty(&report).unwrap()
+    );
+    assert!(
+        alert["message"]
+            .as_str()
+            .unwrap()
+            .contains("oma.qml.process-execution")
+    );
+    assert_eq!(report["result"]["highest_severity"], "medium");
 }
 
 #[test]

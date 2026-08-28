@@ -928,3 +928,196 @@ Next: **v0.2 tag** (signed) once the nightly full-corpus baseline is
 provisioned and the self-scan findings get their triage pass.
 
 
+## v0.2.1 H1 — Fail-Closed Reviewed Update and Severity Fidelity
+
+Status: **complete**
+
+Implemented (per `docs/plans/v0.2.1-hardening-implementation.md`, scope
+source `docs/reviews/2026-08-27-scan-rule-coverage-review.md`):
+
+- Review-update post-update dirty postcondition now fails closed for BOTH
+  `dirty == Some(true)` and unknown (`None`) worktree state — the same
+  uncertainty the pre-flight already refuses — leaving the plugin disabled,
+  keeping the flow record in phase "failed", and never re-enabling or
+  advancing trust.
+- New installed-bytes verification between the native mutation and any
+  re-enable: a dedicated `worktree_content_map` compares every file under the
+  INSTALLED tree against the approved candidate checkout byte-for-byte
+  (mode + size + content digest, symlink targets included; only the `.git`
+  subtree and the checkout's own `.owner.lock` are excluded). HEAD matching
+  with divergent bytes — e.g. a payload smuggled in through `.gitignore` — is
+  now caught where the old checks passed it.
+- Analyzer policy identity captured before mutation and re-checked after:
+  a mid-flight policy change fails closed instead of trusting an analysis
+  made under different rules.
+- Installed-tree analysis coverage state and analysis fingerprint must match
+  the approved candidate; mismatches leave the plugin disabled without
+  advancing trust.
+- Trust advances from the identity of the verified INSTALLED tree, never from
+  the temporary staging checkout.
+- Severity fidelity: new analyzer finding rules no longer collapse into one
+  generic "warning" alert — each added rule id emits its own alert carrying
+  the catalog severity and title. `track_highest_severity` was rewritten to a
+  single ladder over both vocabularies (`none < info < low < warning <
+  medium < error < high < critical`) so `error`/`high` alerts can no longer
+  be flattened to `warning`; `scan` JSON `highest_severity` reflects it.
+  Desktop notification bodies now carry `[severity]`.
+- Tests: review-update against a post-mutation dirty worktree, an unavailable
+  git status, and a planted `.gitignore`-hidden payload all fail with nonzero
+  exit, plugin left disabled, trust not advanced, and no enable attempted;
+  finding-regression alerts assert catalog severity survives to
+  `highest_severity`.
+
+Verification:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings   # both feature configs
+cargo test --workspace
+scripts/release-gate.sh --skip-network                   # exit 0
+```
+
+Next: H2 (reference sinks) with the split severity from the H0 record.
+
+## v0.2.1 H0/H1 — Review-Response Revision (second pass)
+
+Status: **complete**
+
+Three review passes closed seventeen findings (seven in the second, five in
+the final residual pass). The earlier revision text (custom worktree walker, wholesale
+`.git` exclusion, notify-send assertion) described since-replaced machinery
+and is superseded by this entry.
+
+H0 — runtime reverification and lifecycle boundary (complete, machine-executed):
+
+- `scripts/h0-runtime-reverify.sh` probes run isolated quickshell instances
+  with loopback-served inert QML. Probe A: network `Loader.source` REACHABLE
+  (marker instantiated). Probe B was corrected to wait for asynchronous
+  completion — `Qt.createComponent("http://...")` enters Loading and reaches
+  Ready with a working instance, so remote component creation IS reachable and
+  the planned High rule covers both sinks. Probe C: remote directory imports
+  are scanner-intercepted (URL normalizes onto a relative path and is dropped)
+  — H2 ships them as an indicator, not the High finding; the plan doc was
+  updated to split severity by sink.
+- Probe D runs the REAL native install helper (`omarchy plugin add
+  <local marker repo> --enable --yes`) against a SECOND omarchy shell launched
+  from a disposable config copy with a disposable HOME (unique instance path;
+  the live session shell is never addressed) behind an explicit
+  `OMASAFE_H0_ALLOW_LIFECYCLE=1` guard. Assertions: helper exit 0, marker
+  discovered and enabled, IPC-only disable transition (true -> false), no
+  leftover hidden `.add.tmp.*` staging directory.
+- The script asserts expected markers per probe AND validates each probe's
+  exit status: probe B and the type-missing branch of probe C require exit 0,
+  the scanner-interception branch of probe C requires the verified runtime's
+  255, and any other status (timeout kill included) fails the probe. Exit 0
+  only when every probe produced its expected verdict; 1 on any timeout,
+  error marker, missing marker, forbidden marker, unexpected exit status, or
+  failed transition; 2 on lifecycle-guard refusal. Probe guards stop
+  themselves once the verdict lands so success never trips the timeout
+  ceiling.
+- Surface doc re-stamped 2026-08-27 (Omarchy 4.0.1-1 / Quickshell 0.3.1-1;
+  package changed from quickshell-git, triggering the reverification) with
+  the three reverified answers and the InputInjection / ScreenCapture /
+  SensitiveDataAccess capability vocabulary. Clean-VM re-run of the script is
+  the remaining release step.
+
+H1 — fail-closed reviewed update and severity fidelity (final design):
+
+- Audits run BEFORE mutation. The native updater executes `git fetch` +
+  `git merge`, which would run a pre-existing `post-merge` hook and honor
+  every .git/config directive before any postcondition could report them, so
+  `audit_installed_git_state` (active-hook audit + config allowlist) gates the
+  delegated update: on refusal the updater is never invoked.
+- The update window is hardened in depth, with one accepted residual recorded
+  below. `run_omarchy` inherits the full Git hardening (global/system config
+  neutralized; `core.fsmonitor=false`, `core.hooksPath=/dev/null`, empty
+  `diff.external`, `protocol.ext.allow=never`, and an empty `credential.helper`
+  that resets any raced helper list, injected via GIT_CONFIG_COUNT env with
+  command-line precedence), so a writer racing the window cannot make
+  fetch/merge execute fsmonitor/hook/credential/diff commands. Subsection-keyed
+  sinks (`filter.<name>`, `merge.<name>.driver`, `url.<base>.insteadOf`) cannot
+  be enumerated, so `GitConfigGuard` swaps the audited `.git/config` for a
+  hardened minimal snapshot — which DEFINES no such sink — for the duration of
+  the delegated update and restores the original afterwards, including on
+  failure and interrupt. The `hardened_config_neutralizes_a_smudge_filter`
+  regression proves this by content: a real `filter.evil.smudge` payload runs
+  under a positive control without hardening, and never runs while the snapshot
+  is in place.
+- Accepted residual (same-UID execution): the swap neutralizes sinks by
+  content, but it cannot make a file the file's own owner is forbidden to
+  rewrite. A same-UID process that races a NEW `.git/config` carrying a
+  subsection-keyed sink into place between the swap and Git's read can still get
+  that command executed during fetch/merge — userspace cannot prevent this
+  without privilege. It is instead made NON-TRUST-ADVANCING: the restore is
+  tamper-evident via a metadata witness (inode/ctime/mtime/size, not just
+  bytes, so a write-then-revert-to-identical-bytes is still caught), so any
+  concurrent write is detected, discarded, and fails the update — trust never
+  advances over a tampered window even though the injected command may already
+  have run. A regression fixture appends `core.fsmonitor` synchronously before
+  the fake updater's git fetch; the update completes native Git work without
+  executing the injected command and is then refused, leaving the plugin
+  disabled and the config clean.
+- The config audit parses with Git itself under bounded hardened settings
+  (`config --file .git/config --list --null`, so CLI-injected hygiene
+  settings can never leak into the audit). The allowlist is EXACT keys with
+  VALUE validation — no broad namespaces: `gc.*` is denied wholesale (Git
+  executes `gc.recentObjectsHook`-style values through the shell),
+  `remote.origin.url` must equal the production HTTPS origin exactly
+  (ext::/scp-style/paths refused) and `remote.origin.fetch` must be the
+  standard tracking refspec, branch tracking remotes must be remote names
+  (never paths), and pull/fetch/push keys are enumerated with enum values.
+  hooksPath, sshCommand, fsmonitor, askPass, credential helpers, diff/gpg
+  programs, aliases, filters, includes, insteadOf, and submodule machinery
+  all fail closed by absence. Unit tests pin executable/redirecting key
+  refusals and origin/refspec value validation.
+- Installed-vs-candidate verification is layered. Byte equality via
+  SourceIdentity's collector covers the worktree (tracked, ignored, hidden)
+  on both sides; git internals that legitimately differ between a detached
+  review checkout and a branch-based installed clone (.git/HEAD,
+  packed-refs, template hook samples, .git/config, the checkout-side
+  .owner.lock) are exempt from BYTES and verified semantically instead:
+  resolved tree identity (installed HEAD^{tree} must equal the candidate's
+  tree object, with HEAD already pinned to the candidate) plus the audits
+  above.
+- ANY SourceIdentity limitation on either side fails closed (file_limit,
+  unreadable_directory/file, metadata_unavailable, oversize_file,
+  aggregate_byte_limit, tree_depth_limit, directory_entry_limit,
+  git_hooks_unreadable, git_metadata_unreadable, git_metadata_oversize,
+  git_hook_unreadable, git_hook_oversize, collection budget, interruption):
+  a partial digest map can never prove byte equality.
+- The traversal machinery in omasafe-plugin-trust was rewritten as a bounded
+  collector: MAX_TREE_DEPTH recursion cap, per-directory child cap checked
+  DURING accumulation (entry bombs stop before materializing), global
+  MAX_FILES/aggregate-byte limits, a wall-clock collection budget, and
+  cooperative interruption — every bound surfacing as a visible limitation.
+  The .git metadata capture (config, HEAD, packed-refs, EVERY hooks entry)
+  runs through the same bounds — the same caps, the same byte accounting, the
+  same budget and interruption checks — so a hook-directory entry bomb or
+  hook flood surfaces a limitation instead of bypassing the collector. Git
+  metadata and hook reads are capped at `MAX_METADATA_BYTES` and disclose
+  truncation rather than silently accepting equal prefixes; once the
+  aggregate budget is exhausted the collector retains only bounded size
+  sentinels, so retained bytes stay within the advertised 64 MiB no matter
+  how many metadata or hook files follow. Unit tests pin deep-tree,
+  entry-bomb, hook-bomb, metadata-truncation, and aggregate-budget behavior.
+- The candidate checkout now shapes its origin remote exactly like an
+  installed clone (remote add + set-url to the production HTTPS URL) and the
+  test fixture installs branch-based (symbolic HEAD) checkouts, matching
+  native clones.
+- Severity fidelity unchanged from the first pass: per-rule catalog-severity
+  alerts, ladder-ordered highest severity, `[severity]` in notification
+  bodies, and tests proving a High finding (oma.qml.session-lock) reaches
+  the notify-send payload as `[high]`.
+
+Verification:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings   # both feature configs
+cargo test --workspace                                   # 62 cli + 15 trust tests
+scripts/h0-runtime-reverify.sh                           # probes A/B/C
+OMASAFE_H0_ALLOW_LIFECYCLE=1 scripts/h0-runtime-reverify.sh --with-lifecycle
+```
+
+Next: H2 (reference sinks) with the split severity from the H0 record; clean-VM
+re-run of the H0 script before tagging.

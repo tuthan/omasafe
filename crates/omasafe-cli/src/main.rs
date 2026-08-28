@@ -1,7 +1,8 @@
 use std::collections::BTreeSet;
-use std::io::IsTerminal;
+use std::fs;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use omasafe_core::{TOOL_VERSION, paths::XdgPaths};
 use omasafe_marketplace::{
@@ -393,11 +394,561 @@ impl Drop for TempCandidate {
     }
 }
 
-/// `plugins review-update ID [--expected-commit SHA] [--yes]`: evaluate an
-/// exact candidate commit, present the delta versus the trusted baseline,
-/// gate approval explicitly, delegate the mutation to the native updater,
-/// and verify postconditions before re-enabling or trusting. Rejected
-/// candidates never touch the live tree.
+/// `.git/config` is the one identity input that benign lifecycle commands
+/// legitimately rewrite (clone wiring, branch tracking), so it cannot be
+/// byte-compared. Instead it is parsed by Git itself (bounded argv, hardened
+/// env, NUL-delimited `--file` mode so CLI-injected hygiene settings can never
+/// leak into the audit) and every ENTRY outside this allowlist of known-benign
+/// repository-local entries is refused. Section and variable names are
+/// case-insensitive in Git, so both are matched lowercased; subsections stay
+/// case-sensitive. Exact keys only — no wildcards: `gc.*` is denied wholesale
+/// because Git executes values like `gc.recentObjectsHook` through the shell,
+/// and `remote.*` beyond the two origin keys below would admit arbitrary
+/// transport URLs (`ext::` runs a command). The origin URL must equal the
+/// production HTTPS repository exactly and the refspec must be the standard
+/// tracking refspec. Everything executable or dataflow-redirecting —
+/// hooksPath, sshCommand, fsmonitor, askPass, credential helpers, diff/gpg
+/// programs, aliases, filters, includes, insteadOf redirects, submodule
+/// machinery — is absent from the allowlist and therefore fails closed.
+fn benign_git_config_entry(key: &str, value: &str, expected_origin: &str) -> bool {
+    let Some((head, variable)) = key.rsplit_once('.') else {
+        return false;
+    };
+    let variable = variable.to_lowercase();
+    let (section, subsection) = match head.split_once('.') {
+        Some((section, subsection)) => (section.to_lowercase(), Some(subsection)),
+        None => (head.to_lowercase(), None),
+    };
+    match section.as_str() {
+        "core" => matches!(
+            variable.as_str(),
+            "repositoryformatversion"
+                | "filemode"
+                | "bare"
+                | "logallrefupdates"
+                | "symlinks"
+                | "compression"
+                | "precomposeunicode"
+                | "bigfilethreshold"
+                | "autocrlf"
+                | "safecrlf"
+                | "fscache"
+                | "untrackedcache"
+        ),
+        "user" => matches!(variable.as_str(), "name" | "email" | "signingkey"),
+        "init" => variable == "defaultbranch",
+        "remote" if subsection == Some("origin") => match variable.as_str() {
+            "url" => value.trim_end_matches('/') == expected_origin.trim_end_matches('/'),
+            "fetch" => value == "+refs/heads/*:refs/remotes/origin/*",
+            _ => false,
+        },
+        "branch" => match variable.as_str() {
+            // The tracking remote must name a configured remote, never a path
+            // or URL: a path would let `git pull` reach local transports.
+            "remote" => value == "origin" || value == ".",
+            "merge" => value.starts_with("refs/heads/"),
+            _ => false,
+        },
+        "pull" => match variable.as_str() {
+            "rebase" => matches!(value, "true" | "false" | "merges" | "interactive"),
+            "ff" => matches!(value, "true" | "false" | "only"),
+            _ => false,
+        },
+        "fetch" => {
+            matches!(
+                variable.as_str(),
+                "prune" | "prunetags" | "showforcedupdates"
+            ) && matches!(value, "true" | "false")
+        }
+        "push" => match variable.as_str() {
+            "default" => matches!(
+                value,
+                "nothing" | "matching" | "current" | "upstream" | "tracking" | "simple"
+            ),
+            "followtags" => matches!(value, "true" | "false"),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Lists every config entry in the installed repository's .git/config that the
+/// allowlist refuses. Keys are reported lowercased for stable operator output.
+fn non_benign_git_config_entries(
+    root: &Path,
+    expected_origin: &str,
+) -> Result<Vec<String>, String> {
+    let raw = bounded_git(
+        Some(root),
+        &["config", "--file", ".git/config", "--list", "--null"],
+    )?;
+    Ok(raw
+        .split('\0')
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| {
+            let (key, value) = match entry.split_once('\n') {
+                Some((key, value)) => (key, value),
+                None => (entry, ""),
+            };
+            (!benign_git_config_entry(key, value, expected_origin)).then(|| key.to_lowercase())
+        })
+        .collect())
+}
+
+/// Every hook entry in the repository's .git/hooks that is not a regular
+/// `*.sample` template file. `Err` means the hooks directory is unreadable,
+/// which is itself a refusal: an unauditable hook directory is not
+/// trustworthy.
+fn active_hooks_in(repo: &Path) -> Result<Vec<String>, String> {
+    const MAX_HOOK_ENTRIES: usize = omasafe_core::bounds::MAX_FILES;
+    const MAX_HOOK_AUDIT_TIME: Duration = Duration::from_secs(10);
+    let hooks_dir = repo.join(".git").join("hooks");
+    let mut live = Vec::new();
+    let mut entries = std::fs::read_dir(&hooks_dir)
+        .map_err(|error| format!(".git/hooks could not be read: {error}"))?;
+    let started_at = Instant::now();
+    let mut entry_count = 0;
+    loop {
+        if omasafe_core::interrupt::raised() {
+            return Err(".git/hooks audit was interrupted".into());
+        }
+        if started_at.elapsed() > MAX_HOOK_AUDIT_TIME {
+            return Err(".git/hooks audit exceeded its time budget".into());
+        }
+        let Some(entry) = entries.next() else {
+            break;
+        };
+        entry_count += 1;
+        if entry_count > MAX_HOOK_ENTRIES {
+            return Err(format!(
+                ".git/hooks contains more than {MAX_HOOK_ENTRIES} entries"
+            ));
+        }
+        let entry =
+            entry.map_err(|error| format!(".git/hooks entry could not be read: {error}"))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_file = entry
+            .path()
+            .symlink_metadata()
+            .map_err(|error| {
+                format!(".git/hooks entry {name:?} metadata could not be read: {error}")
+            })?
+            .is_file();
+        if !(is_file && name.ends_with(".sample")) {
+            live.push(name);
+        }
+    }
+    live.sort();
+    live.dedup();
+    Ok(live)
+}
+
+/// Hook and config audit shared by the pre-mutation gate and the update
+/// postcondition. The native updater runs `git fetch` + `git merge`, which
+/// executes merge-time hooks and honors every directive in the installed
+/// .git/config, so anything executable or dataflow-redirecting must be
+/// refused BEFORE that mutation; the postcondition repeats the audit to close
+/// the window for changes made during the update itself.
+fn audit_installed_git_state(installed_dir: &Path, expected_origin: &str) -> Result<(), String> {
+    match active_hooks_in(installed_dir) {
+        Err(error) => {
+            return Err(format!(
+                ".git/hooks is not safely auditable; a repository whose hooks cannot be audited \
+                 is not trustworthy: {error}"
+            ));
+        }
+        Ok(hooks) if !hooks.is_empty() => {
+            return Err(format!(
+                "active (non-template) git hook(s) present in the repository: {hooks:?}. Remove \
+                 them or accept them explicitly before re-running 'plugins review-update'."
+            ));
+        }
+        Ok(_) => {}
+    }
+    match non_benign_git_config_entries(installed_dir, expected_origin) {
+        Err(error) => return Err(error),
+        Ok(keys) if !keys.is_empty() => {
+            return Err(format!(
+                "git configuration contains entries outside OmaSafe's benign allowlist: {keys:?}"
+            ));
+        }
+        Ok(_) => {}
+    }
+    Ok(())
+}
+
+/// Snapshot-swaps the installed repository's `.git/config` with a hardened
+/// minimal config for the duration of the native update window, restoring the
+/// audited original afterwards — on success, failure, and interrupt alike,
+/// via `Drop`.
+///
+/// Why a snapshot rather than more env overrides: between the pre-mutation
+/// audit and the postcondition, native Git children (fetch, merge, the
+/// checkout of the fast-forward) read `.git/config`. `GIT_CONFIG_COUNT`-style
+/// env injection overrides enumerable keys (fsmonitor, hooksPath, credential
+/// helper list, diff external), but subsection-keyed executable sinks —
+/// `filter.<name>.smudge`/`process` consumed via attributes during checkout,
+/// `merge.<name>.driver`, `url.<base>.insteadOf` URL rewriting that can point
+/// the fetch at an attacker-controlled host or transport — cannot be
+/// enumerated. With the hardened snapshot in place, native Git consumes only
+/// known-benign entries during the window: the replacement config DEFINES no
+/// executable sink at all, so there is nothing for Git to run. This
+/// content-neutralization is the primary defense and is exercised by
+/// `hardened_config_neutralizes_a_smudge_filter`, which runs a real smudge
+/// payload through `git checkout` under the guard and asserts its marker is
+/// never created.
+///
+/// Residual threat and its bound: a same-UID process racing a NEW config into
+/// place between our swap and Git's read could still get a sink executed —
+/// userspace cannot make a file the file's own owner cannot rewrite, so this
+/// specific race is not preventable without privilege. It is instead made
+/// non-advancing: the metadata witness below detects ANY concurrent write
+/// (see next paragraph), so trust never advances over a window that was
+/// tampered with, even though the injected command may already have run.
+///
+/// The snapshot is also tamper-evident, and NOT by final-byte comparison
+/// alone: `restore` compares both the hardened bytes AND a metadata witness
+/// (`ConfigWitness`) captured when the snapshot was installed. A writer that
+/// injects a directive, lets Git consume it, then restores the exact hardened
+/// bytes before `restore` runs would defeat a bytes-only check — but any such
+/// write bumps the inode's ctime (in-place edit) or replaces the inode
+/// entirely (atomic rename), and ctime cannot be moved backwards by an
+/// unprivileged process. The witness therefore detects write-and-revert; the
+/// injection is discarded, and the caller refuses. Unreviewed config writes
+/// are untrusted by definition — discarding them is fail-closed. The
+/// pre-mutation audit has already refused `extensions.*`, so
+/// `repositoryformatversion = 0` is exact for every auditable repository.
+///
+/// Durability: the audited original is written to a durable, fsync'd backup
+/// in the state directory and its path recorded in the `UpdateFlowRecord`
+/// BEFORE the swap, so a SIGKILL or power loss mid-window (which skips `Drop`)
+/// leaves a recoverable copy on disk, not only in this process's memory. A
+/// subsequent run reconciles the target from that backup — see
+/// `reconcile_config_backup`.
+struct GitConfigGuard {
+    config_path: PathBuf,
+    original: Vec<u8>,
+    original_mode: u32,
+    hardened: Vec<u8>,
+    witness: ConfigWitness,
+    restored: bool,
+}
+
+/// Result of `GitConfigGuard::restore`, kept distinct so the caller clears the
+/// durable recovery pointer ONLY when the original was positively reinstalled.
+enum RestoreOutcome {
+    /// Original reinstalled and the window showed no tampering.
+    Clean,
+    /// Original reinstalled, but the window was tampered with — trust must not
+    /// advance.
+    Tampered,
+    /// The original could NOT be reinstalled; the target may still hold the
+    /// hardened snapshot and the durable backup must be preserved for recovery.
+    RestoreFailed(String),
+}
+
+/// Metadata witness of the installed hardened config. `ctime` advances on ANY
+/// inode change — content, mode, or being the target of a rename — and an
+/// unprivileged process cannot move it backwards (`utimensat` sets atime/mtime
+/// but bumps ctime itself). So a write-then-revert-to-identical-bytes still
+/// shows a changed ctime, and an atomic-rename replacement shows a changed
+/// inode. Comparing this witness, not just the final bytes, is what makes the
+/// child-process window tamper-evident.
+#[derive(PartialEq, Eq)]
+struct ConfigWitness {
+    dev: u64,
+    ino: u64,
+    ctime: i128,
+    mtime: i128,
+    size: u64,
+}
+
+impl ConfigWitness {
+    #[cfg(unix)]
+    fn of(metadata: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            ctime: i128::from(metadata.ctime()) * 1_000_000_000 + i128::from(metadata.ctime_nsec()),
+            mtime: i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec()),
+            size: metadata.size(),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn of(metadata: &fs::Metadata) -> Self {
+        Self {
+            dev: 0,
+            ino: 0,
+            ctime: 0,
+            mtime: 0,
+            size: metadata.len(),
+        }
+    }
+}
+
+impl GitConfigGuard {
+    fn swap_to_hardened(
+        installed_dir: &Path,
+        origin_url: &str,
+        backup_path: &Path,
+        flow: &mut UpdateFlowRecord,
+        flow_path: &Path,
+    ) -> Result<Self, String> {
+        let config_path = installed_dir.join(".git").join("config");
+        // symlink_metadata: never follow a symlink standing in for the config.
+        let metadata = fs::symlink_metadata(&config_path).map_err(|error| {
+            format!("could not stat {config_path:?} to snapshot before hardening: {error}")
+        })?;
+        if !metadata.file_type().is_file() {
+            return Err(format!(
+                "{config_path:?} is not a regular file; refusing to harden a symlinked or \
+                 special config"
+            ));
+        }
+        let original = fs::read(&config_path).map_err(|error| {
+            format!("could not read {config_path:?} to snapshot before hardening: {error}")
+        })?;
+        let original_mode = config_file_mode(&metadata);
+
+        // Durable backup + recovery record BEFORE the swap. If this process
+        // dies after the swap, a later run restores config_target from
+        // config_backup instead of adopting the hardened minimal config as the
+        // original.
+        secure_replace(backup_path, &original, 0o600)?;
+        flow.config_backup = Some(backup_path.to_string_lossy().into_owned());
+        flow.config_target = Some(config_path.to_string_lossy().into_owned());
+        flow.config_original_mode = Some(original_mode);
+        flow.store(flow_path).map_err(|error| {
+            format!("could not persist config-swap recovery record before hardening: {error}")
+        })?;
+
+        let hardened = format!(
+            "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n\
+             \tlogallrefupdates = true\n[remote \"origin\"]\n\turl = {origin_url}\n\
+             \tfetch = +refs/heads/*:refs/remotes/origin/*\n"
+        )
+        .into_bytes();
+        secure_replace(&config_path, &hardened, 0o600)?;
+        let witness = ConfigWitness::of(&fs::symlink_metadata(&config_path).map_err(|error| {
+            format!("could not stat hardened {config_path:?} to witness it: {error}")
+        })?);
+        Ok(Self {
+            config_path,
+            original,
+            original_mode,
+            hardened,
+            witness,
+            restored: false,
+        })
+    }
+
+    /// Restores the audited original with its original mode and reports the
+    /// outcome. The recovery backup is intentionally NOT removed here: only
+    /// after the caller has positively cleared and persisted the recovery
+    /// record is the backup safe to delete, so a crash mid-restore never
+    /// orphans it. On `RestoreFailed` the target may still hold the hardened
+    /// snapshot; `restored` stays false so `Drop` makes a best-effort retry,
+    /// and the caller must keep the recovery pointer.
+    fn restore(mut self) -> RestoreOutcome {
+        let tampered = self.tampered();
+        match secure_replace(&self.config_path, &self.original, self.original_mode) {
+            Ok(()) => {
+                self.restored = true;
+                if tampered {
+                    RestoreOutcome::Tampered
+                } else {
+                    RestoreOutcome::Clean
+                }
+            }
+            Err(error) => RestoreOutcome::RestoreFailed(error),
+        }
+    }
+
+    /// True if the installed snapshot changed in any way during the window:
+    /// the file is no longer a regular file, its inode/ctime/mtime/size
+    /// witness moved (catching write-then-revert), or its bytes differ.
+    fn tampered(&self) -> bool {
+        match fs::symlink_metadata(&self.config_path) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                if ConfigWitness::of(&metadata) != self.witness {
+                    return true;
+                }
+                fs::read(&self.config_path)
+                    .map(|current| current != self.hardened)
+                    .unwrap_or(true)
+            }
+            _ => true,
+        }
+    }
+}
+
+impl Drop for GitConfigGuard {
+    fn drop(&mut self) {
+        if self.restored {
+            return;
+        }
+        self.restored = true;
+        // Best-effort in-memory restore on unwinding/early return. The durable
+        // backup file is intentionally left in place: only the terminal
+        // success path (or a reconciliation run) removes it.
+        if let Err(error) = secure_replace(&self.config_path, &self.original, self.original_mode) {
+            eprintln!(
+                "omasafe: restoring the original .git/config failed: {error}.\
+                 \nInspect the plugin's git configuration manually before re-enabling."
+            );
+        }
+    }
+}
+
+/// Reconciles a leftover config-swap backup from an interrupted update. If the
+/// record carries a durable backup of the audited original `.git/config`,
+/// restore the target from it — idempotent, since the target is either the
+/// hardened snapshot from a mid-window death or already the restored original
+/// — preserving the recorded original mode, then clear the swap state and
+/// remove the backup.
+///
+/// Fail-closed: any read/restore failure, and a MISSING backup while the
+/// record still references one, return `Err`. `restore` never deletes the
+/// backup before the cleared record is persisted, so a referenced-but-missing
+/// backup is not the normal "already restored" case — it means the target
+/// cannot be verified back to the audited original, and the caller must block
+/// rather than start a fresh attempt over a possibly still-hardened config.
+/// `Ok` means there is nothing left to reconcile.
+fn reconcile_config_backup(record: &mut UpdateFlowRecord, flow_path: &Path) -> Result<(), String> {
+    let (Some(backup), Some(target)) = (record.config_backup.clone(), record.config_target.clone())
+    else {
+        return Ok(());
+    };
+    let backup_path = PathBuf::from(&backup);
+    let target_path = PathBuf::from(&target);
+    let original = fs::read(&backup_path).map_err(|error| {
+        format!(
+            "the interrupted update's config backup {backup_path:?} is unavailable ({error}); \
+             {target_path:?} cannot be verified back to the audited original and may still hold \
+             the hardened snapshot. Inspect it manually and remove {} before retrying.",
+            flow_path.display()
+        )
+    })?;
+    let mode = record.config_original_mode.unwrap_or(0o644);
+    secure_replace(&target_path, &original, mode).map_err(|error| {
+        format!(
+            "could not reconcile {target_path:?} from the interrupted update's config backup: \
+             {error}. Restore it manually from {backup_path:?} before trusting the plugin."
+        )
+    })?;
+    // Clear and durably persist the record BEFORE deleting the backup — the
+    // same ordering as the Clean/Tampered paths. If the process died or the
+    // store failed after an early remove_file, the durable record would still
+    // reference a now-missing backup and permanently block recovery.
+    record.config_backup = None;
+    record.config_target = None;
+    record.config_original_mode = None;
+    record
+        .store(flow_path)
+        .map_err(|error| format!("could not persist the reconciled recovery record: {error}"))?;
+    let _ = fs::remove_file(&backup_path);
+    Ok(())
+}
+
+/// Atomically installs `bytes` at `path` with mode `mode`, using a random,
+/// exclusively-created, non-following temporary in the SAME directory, then
+/// fsync + rename + parent fsync. `create_new` (O_CREAT|O_EXCL) plus
+/// O_NOFOLLOW means a pre-planted symlink or file at the temp path fails the
+/// open instead of being followed or overwritten — closing the predictable
+/// temp-name symlink-overwrite hole. The random name also denies an attacker a
+/// predictable path to squat.
+fn secure_replace(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| format!("{path:?} has no parent directory"))?;
+    let mut last_error: Option<String> = None;
+    for _ in 0..8 {
+        let temp = dir.join(format!(
+            ".omasafe-cfg.{:016x}{:016x}",
+            random_u64(),
+            random_u64()
+        ));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(mode)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let mut file = match options.open(&temp) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_error = Some(error.to_string());
+                continue;
+            }
+            Err(error) => {
+                return Err(format!("could not create config temp in {dir:?}: {error}"));
+            }
+        };
+        if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+            let _ = fs::remove_file(&temp);
+            return Err(format!("could not write config temp {temp:?}: {error}"));
+        }
+        drop(file);
+        if let Err(error) = fs::rename(&temp, path) {
+            let _ = fs::remove_file(&temp);
+            return Err(format!(
+                "could not install config snapshot at {path:?}: {error}"
+            ));
+        }
+        // The rename is not durably committed until the parent directory is
+        // fsync'd; a failure here means the swap/backup may not survive power
+        // loss, so it must be reported rather than swallowed.
+        sync_dir(dir).map_err(|error| {
+            format!("could not fsync {dir:?} after installing {path:?}: {error}")
+        })?;
+        return Ok(());
+    }
+    Err(format!(
+        "could not create a unique config temp in {dir:?}: {}",
+        last_error.unwrap_or_else(|| "exhausted attempts".into())
+    ))
+}
+
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(unix)]
+fn config_file_mode(metadata: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o777
+}
+
+#[cfg(not(unix))]
+fn config_file_mode(_metadata: &fs::Metadata) -> u32 {
+    0o644
+}
+
+/// 64 bits from the OS CSPRNG for unpredictable temp names. Falls back to a
+/// time/PID mix only if `getrandom` is unavailable; `create_new` still
+/// guarantees exclusivity regardless of name quality.
+fn random_u64() -> u64 {
+    #[cfg(unix)]
+    {
+        let mut buffer = [0u8; 8];
+        let read =
+            unsafe { libc::getrandom(buffer.as_mut_ptr() as *mut libc::c_void, buffer.len(), 0) };
+        if read == buffer.len() as isize {
+            return u64::from_ne_bytes(buffer);
+        }
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0);
+    nanos ^ ((std::process::id() as u64) << 32)
+}
+
 fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut yes = false;
     let mut expected_commit: Option<String> = None;
@@ -437,9 +988,15 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
     paths.ensure()?;
     let flow_path = paths.state.join("review-update.json");
     match UpdateFlowRecord::load(&flow_path) {
-        Ok(Some(record)) if record.plugin_id != id => {
+        Ok(Some(mut record)) if record.plugin_id != id => {
             // One in-flight update at a time: another plugin's unresolved
-            // record must never be overwritten or deleted by this run.
+            // record must never be overwritten or deleted by this run. Still
+            // reconcile a leftover config swap so that plugin's .git/config is
+            // never left as the hardened minimal snapshot; the record itself
+            // is kept for the operator to resolve.
+            if let Err(error) = reconcile_config_backup(&mut record, &flow_path) {
+                eprintln!("omasafe: {error}");
+            }
             eprintln!(
                 "an interrupted reviewed update for '{}' (candidate {}, phase {}) is still unresolved;\n\
                  resolve it first — see its manual checks below — before reviewing a different plugin.",
@@ -451,7 +1008,20 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
             )
             .into());
         }
-        Ok(Some(record)) => {
+        Ok(Some(mut record)) => {
+            // Same plugin: reconcile any leftover config swap back to the
+            // audited original BEFORE proceeding. If reconciliation cannot
+            // verify the target back to the audited original, block the fresh
+            // attempt — otherwise it would overwrite the recovery record and
+            // backup while the installed config may still be the hardened
+            // snapshot.
+            if let Err(error) = reconcile_config_backup(&mut record, &flow_path) {
+                eprintln!(
+                    "omasafe: refusing a fresh attempt for '{}': {error}",
+                    record.plugin_id
+                );
+                return Err("unresolved config-swap recovery blocks this reviewed update".into());
+            }
             eprintln!(
                 "WARNING: an interrupted reviewed update for '{}' was found\n  candidate commit: {}\n  phase at interruption: {} (started {})\n  quiescing actions taken before it stopped: {}",
                 record.plugin_id,
@@ -607,6 +1177,21 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
         &["checkout", "--quiet", "--detach", "FETCH_HEAD"],
     )
     .map_err(|error| format!("candidate checkout failed: {error}"))?;
+    // Shape the candidate's .git/config exactly like an installed clone:
+    // source-identity verification byte-compares security-relevant git
+    // metadata, and the installed repository legitimately carries the
+    // production HTTPS remote. Refspecs stay identical because both write
+    // through a standard `origin` remote.
+    bounded_git(
+        Some(&checkout.0),
+        &["remote", "add", "origin", bare.to_string_lossy().as_ref()],
+    )
+    .map_err(|error| format!("candidate checkout failed: {error}"))?;
+    bounded_git(
+        Some(&checkout.0),
+        &["remote", "set-url", "origin", url.as_str()],
+    )
+    .map_err(|error| format!("candidate checkout failed: {error}"))?;
     if baseline_head_available && let Some(head) = baseline.head.as_deref() {
         let _ = bounded_git(
             Some(&checkout.0),
@@ -652,6 +1237,18 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
+    let candidate_fingerprint =
+        omasafe_analyzer::fingerprint_analysis(&artifacts.results, &artifacts.capabilities);
+    let candidate_policy: String =
+        serde_json::to_string(&serde_json::to_value(omasafe_analyzer::policy_identity())?)?;
+    let mut candidate_coverage: Vec<String> = candidate_inventory
+        .limitations
+        .iter()
+        .chain(artifacts.limitations.iter())
+        .cloned()
+        .collect();
+    candidate_coverage.sort();
+    candidate_coverage.dedup();
 
     let tree = bounded_git(
         Some(&bare),
@@ -663,7 +1260,7 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
         &checkout.0,
         Some(url.clone()),
         Some(candidate.clone()),
-        tree,
+        tree.clone(),
     );
 
     interruption_checkpoint("after candidate evaluation")?;
@@ -811,6 +1408,9 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
         started_at: now(),
         phase: "quiescing".into(),
         quiesced: Vec::new(),
+        config_backup: None,
+        config_target: None,
+        config_original_mode: None,
     };
     flow.store(&flow_path)?;
 
@@ -851,13 +1451,98 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
         }
         flow.store(&flow_path)?;
     }
+    flow.phase = "auditing".into();
+    flow.store(&flow_path)?;
+    // --- Pre-mutation audit: native Git must not be allowed to consume the
+    // installed repository's hooks or config before OmaSafe audits them. A
+    // pre-existing post-merge hook would otherwise EXECUTE during the
+    // delegated fetch/merge and only be reported by the postcondition
+    // afterwards. Refuse here instead; the postcondition below still repeats
+    // the same audit to close the window for changes made during the update,
+    // and the updater runs with inherited Git hardening (hooks disabled via
+    // injected config; see run_omarchy) so even a hook planted mid-update
+    // cannot execute.
+    let installed_pre_dir = PathBuf::from(record.path.clone());
+    if let Err(failure) = audit_installed_git_state(&installed_pre_dir, &url) {
+        flow.phase = "failed".into();
+        flow.store(&flow_path)?;
+        eprintln!(
+            "refused before mutation: the installed repository failed the hook/config audit;\
+             \n{failure}\
+             \nThe plugin stays disabled and the native updater was not invoked."
+        );
+        return Err("pre-mutation git state audit failed".into());
+    }
     flow.phase = "delegating".into();
     flow.store(&flow_path)?;
     interruption_checkpoint(
         "after quiescing; the plugin stays disabled and the recovery record is kept",
     )?;
     // --- Delegate the mutation; never fork native lifecycle logic ---
+    // Native Git consumes the repository-local config for the whole window
+    // (fetch URL rewriting, credential helpers, fsmonitor, attribute-driven
+    // filter drivers during the checkout); env-injected overrides cannot
+    // enumerate subsection-keyed sinks (filter.<name>, url.<base>.insteadOf),
+    // so the audited config is swapped for a hardened snapshot for the
+    // duration and restored afterwards. See GitConfigGuard.
+    let config_backup_path = flow_path.with_extension("config-backup");
+    let config_guard = GitConfigGuard::swap_to_hardened(
+        &installed_pre_dir,
+        &url,
+        &config_backup_path,
+        &mut flow,
+        &flow_path,
+    )
+    .map_err(|error| format!("update-window config hardening failed: {error}"))?;
     let outcome = omarchy_plugin_update(id);
+    match config_guard.restore() {
+        RestoreOutcome::Clean => {
+            // Original positively reinstalled: drop the recovery pointer.
+            // Persist the cleared record BEFORE deleting the backup, so a crash
+            // in between never leaves the on-disk record pointing at a deleted
+            // backup (which reconciliation would then treat as unresolved).
+            flow.config_backup = None;
+            flow.config_target = None;
+            flow.config_original_mode = None;
+            flow.store(&flow_path)?;
+            let _ = fs::remove_file(&config_backup_path);
+        }
+        RestoreOutcome::Tampered => {
+            // Original reinstalled, but the window was tampered with. Clear the
+            // pointer (the target is restored), persist, then delete the backup
+            // and refuse the update.
+            flow.config_backup = None;
+            flow.config_target = None;
+            flow.config_original_mode = None;
+            flow.phase = "failed".into();
+            flow.store(&flow_path)?;
+            let _ = fs::remove_file(&config_backup_path);
+            eprintln!(
+                "postcondition failed: git configuration was modified during the update window; \
+                 the injected change was discarded and never trusted, but the environment must be \
+                 treated as hostile. The plugin stays disabled; inspect .git/config and any \
+                 running processes before re-running 'plugins review-update'."
+            );
+            return Err("git configuration modified during the update window".into());
+        }
+        RestoreOutcome::RestoreFailed(error) => {
+            // The original could NOT be reinstalled. KEEP the recovery pointer
+            // and backup so the next run reconciles the target; do not delete
+            // anything. Persist the failed record with its backup reference
+            // intact.
+            flow.phase = "failed".into();
+            flow.store(&flow_path)?;
+            eprintln!(
+                "postcondition failed: could not restore the original .git/config after the \
+                 update window ({error}). A durable backup of the audited original is preserved \
+                 at {backup} and referenced by the recovery record; the next 'plugins \
+                 review-update' run will reconcile it. The plugin stays disabled — inspect \
+                 .git/config manually before re-enabling.",
+                backup = config_backup_path.display()
+            );
+            return Err("restoring the original .git/config failed after the update".into());
+        }
+    }
     if !outcome.success && omasafe_core::interrupt::raised() {
         flow.phase = "failed".into();
         flow.store(&flow_path)?;
@@ -936,10 +1621,198 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
         );
         return Err("installed HEAD does not match the reviewed commit".into());
     }
-    if updated_record.dirty == Some(true) {
+    if updated_record.dirty != Some(false) {
         flow.phase = "failed".into();
         flow.store(&flow_path)?;
-        eprintln!("postcondition warning: worktree reports dirty after fast-forward merge");
+        if updated_record.dirty.is_none() {
+            eprintln!(
+                "postcondition failed: installed worktree git status is unavailable after the\n\
+                 update, so a safe re-enable cannot be guaranteed. The plugin stays disabled.\n\
+                 Inspect and resolve it manually:\n\
+                   git -C ~/.config/omarchy/plugins/{id} status\n\
+                 then re-run 'plugins review-update' once 'git status' works again."
+            );
+        } else {
+            eprintln!(
+                "postcondition failed: local changes appeared in the worktree during the update;\n\
+                 the plugin stays disabled. Inspect them manually:\n\
+                   git -C ~/.config/omarchy/plugins/{id} status\n\
+                   git -C ~/.config/omarchy/plugins/{id} diff\n\
+                 either restore the reviewed tree ('git -C ~/.config/omarchy/plugins/{id}\n\
+                 reset --hard {candidate}') or re-enable only after verifying the content yourself."
+            );
+        }
+        return Err("installed worktree is not verified clean after the update".into());
+    }
+
+    // --- Verify the INSTALLED tree against the approved candidate ---
+    // Trust may only advance from what is actually on disk under
+    // ~/.config/omarchy/plugins, never from the temporary checkout. Layers:
+    //   1. Byte equality via SourceIdentity's audited bounded collector over
+    //      the WORKTREE (tracked, ignored, and hidden files alike). Git
+    //      internals that legitimately differ between a detached review
+    //      checkout and a branch-based installed clone (.git/HEAD,
+    //      packed-refs, template hook samples, .git/config, the flow-owned
+    //      .owner.lock) are exempt from BYTES and verified semantically
+    //      below instead.
+    //   2. Resolved git identity: installed HEAD (already pinned to the
+    //      candidate) and installed HEAD^{tree} must equal the candidate's
+    //      tree object, so HEAD/packed-refs divergence cannot hide content.
+    //   3. Active-hook audit: every .git/hooks entry must be a regular
+    //      `*.sample` template file; anything else is a live hook and fails.
+    //   4. Config allowlist: .git/config parsed by Git itself under bounded
+    //      hardened settings; only known-benign repository-local keys pass.
+    //   5. Exhaustive-collection gate: ANY SourceIdentity limitation on
+    //      either side (file_limit, unreadable*, oversize, aggregate,
+    //      depth/entry caps, hooks unreadable, budget, interruption) fails
+    //      closed — a partial digest map can never prove byte equality.
+    let installed_dir = PathBuf::from(updated_record.path.clone());
+    let installed_tree = bounded_git(Some(&installed_dir), &["rev-parse", "HEAD^{tree}"]).ok();
+    let installed_identity = source_identity(
+        id,
+        &installed_dir,
+        updated_record.repository.clone(),
+        updated_record.head.clone(),
+        installed_tree.clone(),
+    );
+    if !candidate_identity.limitations.is_empty() || !installed_identity.limitations.is_empty() {
+        flow.phase = "failed".into();
+        flow.store(&flow_path)?;
+        eprintln!(
+            "postcondition failed: identity collection lost coverage (candidate: {:?},\
+             installed: {:?}). A partial digest map cannot prove byte equality with the\
+             reviewed candidate {candidate}; the plugin stays disabled and trust does not\
+             advance. Resolve the collection limitation and re-run 'plugins review-update'.",
+            candidate_identity.limitations, installed_identity.limitations
+        );
+        return Err("identity collection lost coverage during update verification".into());
+    }
+    let exempt_from_byte_compare = |key: &str, installed_digest: Option<&String>| -> bool {
+        // Byte-different-but-benign git internals; each is verified another way.
+        key == ".git/config"
+            || key == ".git/HEAD"
+            || key == ".git/packed-refs"
+            || key.starts_with(".git/hooks/")
+            || (key == ".owner.lock" && installed_digest.is_none())
+    };
+    let mut mismatched_files = Vec::new();
+    for key in candidate_identity
+        .file_digests
+        .keys()
+        .chain(installed_identity.file_digests.keys())
+    {
+        if candidate_identity.file_digests.get(key) != installed_identity.file_digests.get(key)
+            && !exempt_from_byte_compare(key, installed_identity.file_digests.get(key))
+        {
+            mismatched_files.push(key.clone());
+        }
+    }
+    mismatched_files.sort();
+    mismatched_files.dedup();
+    if !mismatched_files.is_empty() {
+        flow.phase = "failed".into();
+        flow.store(&flow_path)?;
+        eprintln!(
+            "postcondition failed: installed bytes differ from the reviewed candidate {candidate}\
+             (HEAD matches but {} entr(ies) do not). The plugin stays disabled and trust does not\
+             advance. Inspect manually:\
+               git -C ~/.config/omarchy/plugins/{id} status --ignored\
+               find ~/.config/omarchy/plugins/{id} -type f -o -type l",
+            mismatched_files.len()
+        );
+        for key in mismatched_files.iter().take(10) {
+            eprintln!("  differing: {key}");
+        }
+        return Err("installed bytes differ from the reviewed candidate".into());
+    }
+    if installed_tree.as_deref() != tree.as_deref() {
+        flow.phase = "failed".into();
+        flow.store(&flow_path)?;
+        eprintln!(
+            "postcondition failed: installed tree object is {:?}, not the reviewed tree {:?}.\\
+             The plugin stays disabled and trust does not advance. Inspect manually:\\
+               git -C ~/.config/omarchy/plugins/{id} rev-parse HEAD^{{tree}}",
+            installed_tree, tree
+        );
+        return Err("installed tree does not match the reviewed candidate tree".into());
+    }
+    if let Err(failure) = audit_installed_git_state(&installed_dir, &url) {
+        flow.phase = "failed".into();
+        flow.store(&flow_path)?;
+        eprintln!(
+            "postcondition failed: the installed repository failed the hook/config audit.\
+             \n{failure}\
+             \nThe plugin stays disabled and trust does not advance."
+        );
+        return Err("installed-tree git state failed the post-update audit".into());
+    }
+    let installed_policy: String =
+        serde_json::to_string(&serde_json::to_value(omasafe_analyzer::policy_identity())?)?;
+    if installed_policy != candidate_policy {
+        flow.phase = "failed".into();
+        flow.store(&flow_path)?;
+        eprintln!(
+            "postcondition failed: analyzer policy identity changed while the update was in\n\
+             flight; the approved analysis no longer describes this CLI's policy. The plugin\n\
+             stays disabled and trust does not advance. Re-run 'plugins review-update'."
+        );
+        return Err("analyzer policy identity changed during the update".into());
+    }
+    let installed_ingest = omasafe_analyzer::ingest_filesystem(
+        &installed_dir,
+        omasafe_analyzer::Limits::default(),
+        omasafe_core::bounds::TimeBudget::default(),
+    );
+    let mut installed_inventory = match installed_ingest {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            flow.phase = "failed".into();
+            flow.store(&flow_path)?;
+            eprintln!(
+                "postcondition failed: the installed tree could not be analyzed ({error});\n\
+                 trust will not advance and the plugin stays disabled."
+            );
+            return Err("installed-tree analysis failed after update".into());
+        }
+    };
+    let installed_reader = pinned_filesystem_reader(installed_dir.clone());
+    let budget = omasafe_core::bounds::TimeBudget::default();
+    let installed_artifacts =
+        omasafe_analyzer::analyze_inventory(&mut installed_inventory, &installed_reader, &budget);
+    let installed_fingerprint = omasafe_analyzer::fingerprint_analysis(
+        &installed_artifacts.results,
+        &installed_artifacts.capabilities,
+    );
+    let mut installed_coverage: Vec<String> = installed_inventory
+        .limitations
+        .iter()
+        .chain(installed_artifacts.limitations.iter())
+        .cloned()
+        .collect();
+    installed_coverage.sort();
+    installed_coverage.dedup();
+    if installed_coverage != candidate_coverage {
+        flow.phase = "failed".into();
+        flow.store(&flow_path)?;
+        eprintln!(
+            "postcondition failed: coverage state of the installed tree differs from the\n\
+             approved candidate analysis (candidate: {:?}, installed: {:?}). The plugin stays\n\
+             disabled and trust does not advance.",
+            candidate_coverage, installed_coverage
+        );
+        return Err("installed-tree coverage state differs from the approved candidate".into());
+    }
+    if installed_fingerprint != candidate_fingerprint {
+        flow.phase = "failed".into();
+        flow.store(&flow_path)?;
+        eprintln!(
+            "postcondition failed: analysis fingerprint of the installed tree differs from the\n\
+             approved candidate despite identical bytes; nondeterminism or tampering is\n\
+             suspected. The plugin stays disabled and trust does not advance."
+        );
+        return Err(
+            "installed-tree analysis fingerprint differs from the approved candidate".into(),
+        );
     }
 
     if omasafe_core::interrupt::raised() {
@@ -982,13 +1855,14 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
 
     history.accept(TrustRecord {
         plugin_id: id.to_owned(),
-        accepted: candidate_identity,
+        accepted: installed_identity,
         accepted_at: now(),
         note: format!("reviewed update to {candidate}"),
     });
     history.write_atomic_locked(&history_path)?;
 
     let _ = std::fs::remove_file(&flow_path);
+    let _ = std::fs::remove_file(&config_backup_path);
     println!(
         "Reviewed update complete: {id} is at reviewed commit {candidate}; trust baseline advanced."
     );
@@ -1109,7 +1983,7 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
     let mut alerts = Vec::new();
     let mut new_alerts = Vec::new();
     let mut live_keys = BTreeSet::new();
-    let mut highest_severity = "none";
+    let mut highest_severity = "none".to_owned();
     if history_recovered {
         let key = "coverage:trust-history".to_owned();
         live_keys.insert(key.clone());
@@ -1582,20 +2456,25 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
                     .filter(|rule| !previous.finding_rule_ids.contains(rule))
                     .cloned()
                     .collect();
-                if !added_rules.is_empty() {
-                    emit_scan_alert(
-                        format!(
-                            "analysis:{}:finding-regression:{}",
-                            plugin.id,
-                            added_rules.join(",")
+                // One alert per added rule with its catalog severity: a High
+                // finding must not reach reports and notifications as a
+                // generic warning.
+                for rule_id in added_rules {
+                    let definition = omasafe_analyzer::rule(&rule_id);
+                    let (severity, title) = match definition {
+                        Some(definition) => (
+                            definition.default_severity.to_string(),
+                            definition.title.to_owned(),
                         ),
+                        None => ("warning".to_owned(), rule_id.clone()),
+                    };
+                    emit_scan_alert(
+                        format!("analysis:{}:finding-regression:{}", plugin.id, rule_id),
                         plugin.id.clone(),
                         "finding-regression",
-                        "warning",
+                        &severity,
                         format!(
-                            "analysis produced new findings since the last \
-                                 evaluation: {}",
-                            added_rules.join(", ")
+                            "analysis produced a new finding ({severity}): {rule_id} - {title}"
                         ),
                         false,
                         notify,
@@ -1683,7 +2562,7 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
         quiet: live_keys.is_empty(),
         outstanding: live_keys.len(),
         new: new_alerts.len(),
-        highest_severity: highest_severity.into(),
+        highest_severity: highest_severity.clone(),
         post_change_detection: true,
         alerts,
     };
@@ -1707,11 +2586,27 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
     Ok(has_findings)
 }
 
-fn track_highest_severity(current: &mut &'static str, alert: &ScanAlert) {
-    if alert.severity == "critical" {
-        *current = "critical";
-    } else if *current == "none" && !alert.severity.is_empty() {
-        *current = "warning";
+/// Single ladder over both severity vocabularies OmaSafe emits: legacy alert
+/// levels (`warning`, `error`, `critical`) and analyzer catalog severities
+/// (`info`, `low`, `medium`, `high`, `critical`). An unrecognized value keeps
+/// the old fail-safe behavior of ranking at warning level.
+fn alert_severity_rank(value: &str) -> u8 {
+    match value {
+        "none" => 0,
+        "info" => 1,
+        "low" => 2,
+        "warning" => 3,
+        "medium" => 4,
+        "error" => 5,
+        "high" => 6,
+        "critical" => 7,
+        _ => 3,
+    }
+}
+
+fn track_highest_severity(current: &mut String, alert: &ScanAlert) {
+    if alert_severity_rank(&alert.severity) > alert_severity_rank(current) {
+        *current = alert.severity.clone();
     }
 }
 
@@ -1730,7 +2625,7 @@ fn emit_scan_alert(
     alerts: &mut Vec<ScanAlert>,
     new_alerts: &mut Vec<ScanAlert>,
     state: &mut ScanState,
-    highest_severity: &mut &'static str,
+    highest_severity: &mut String,
 ) {
     live_keys.insert(key.clone());
     let alert = ScanAlert {
@@ -1756,8 +2651,9 @@ fn emit_scan_alert(
 
 fn notify_user(alert: &ScanAlert) {
     let body = format!(
-        "{}: {}",
+        "{}: [{}] {}",
         safe_text(&alert.plugin_id),
+        safe_text(&alert.severity),
         safe_text(&alert.message)
     );
     let result = std::process::Command::new("notify-send")
@@ -3407,6 +4303,138 @@ fn now_nanos() -> u128 {
 }
 
 #[cfg(test)]
+mod git_config_audit_tests {
+    use super::{active_hooks_in, benign_git_config_entry};
+    use omasafe_core::bounds::MAX_FILES;
+    use std::fs;
+
+    const ORIGIN: &str = "https://plugins.test/cli.git";
+
+    #[test]
+    fn executable_and_redirecting_keys_are_refused() {
+        // Git executes these through the shell or redirects dataflow with
+        // them; every one must fail closed by absence from the allowlist.
+        for key in [
+            "gc.recentObjectsHook",
+            "gc.recentobjectshook",
+            "gc.logExpiry",
+            "core.hooksPath",
+            "core.sshCommand",
+            "core.fsmonitor",
+            "core.askPass",
+            "credential.helper",
+            "diff.external",
+            "gpg.program",
+            "alias.!sh",
+            "filter.lfs.smudge",
+            "include.path",
+            "includeif.gitdir/.path",
+            "remote.origin.insteadof",
+            "remote.origin.partialclonefilter",
+            "remote.origin.mirror",
+            "submodule.foo.update",
+            "protocol.ext.allow",
+        ] {
+            assert!(
+                !benign_git_config_entry(key, "value", ORIGIN),
+                "{key} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn origin_url_and_refspec_are_value_validated() {
+        assert!(benign_git_config_entry(
+            "remote.origin.url",
+            "https://plugins.test/cli.git",
+            ORIGIN
+        ));
+        // Trailing-slash spelling of the same origin is tolerated.
+        assert!(benign_git_config_entry(
+            "remote.origin.url",
+            "https://plugins.test/cli.git/",
+            ORIGIN
+        ));
+        for value in [
+            "https://evil.example/steal.git",
+            "ext::sh -c touch /tmp/x",
+            "/tmp/local-repo",
+            "git@plugins.test:cli.git",
+        ] {
+            assert!(
+                !benign_git_config_entry("remote.origin.url", value, ORIGIN),
+                "origin url {value} must be refused"
+            );
+        }
+        assert!(benign_git_config_entry(
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+            ORIGIN
+        ));
+        assert!(!benign_git_config_entry(
+            "remote.origin.fetch",
+            "+refs/*:refs/*",
+            ORIGIN
+        ));
+    }
+
+    #[test]
+    fn benign_lifecycle_entries_pass() {
+        for (key, value) in [
+            ("core.repositoryformatversion", "0"),
+            ("core.filemode", "true"),
+            ("core.bare", "false"),
+            ("core.logallrefupdates", "true"),
+            ("user.name", "OmaSafe Operator"),
+            ("user.email", "operator@example.invalid"),
+            ("init.defaultbranch", "main"),
+            ("remote.origin.url", ORIGIN),
+            ("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"),
+            ("branch.main.remote", "origin"),
+            ("branch.main.merge", "refs/heads/main"),
+            ("pull.rebase", "merges"),
+            ("fetch.prune", "false"),
+            ("push.default", "simple"),
+        ] {
+            assert!(
+                benign_git_config_entry(key, value, ORIGIN),
+                "{key}={value} must be allowed"
+            );
+        }
+        // Section/variable case-insensitivity; subsection case-sensitivity.
+        assert!(benign_git_config_entry(
+            "CORE.RepositoryFormatVersion",
+            "0",
+            ORIGIN
+        ));
+        assert!(benign_git_config_entry(
+            "branch.MAIN.remote",
+            "origin",
+            ORIGIN
+        ));
+        // A tracking remote that is not a configured remote name is refused.
+        assert!(!benign_git_config_entry(
+            "branch.main.remote",
+            "/tmp/local-repo",
+            ORIGIN
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn active_hook_audit_bounds_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let hooks = root.path().join(".git/hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        for index in 0..=MAX_FILES {
+            fs::write(hooks.join(format!("hook-{index:05}")), "#!/bin/sh\n").unwrap();
+        }
+        let error = active_hooks_in(root.path()).unwrap_err();
+        assert!(error.contains("more than"), "{error}");
+    }
+}
+
+#[cfg(test)]
 mod s5_reader_tests {
     use super::*;
     use omasafe_analyzer::{CoverageState, PayloadEntry, PayloadKind};
@@ -3506,5 +4534,299 @@ mod s5_reader_tests {
         record.object_id = Some("abc".to_owned());
         record.sha256_sampled = None;
         assert!(reader(&record).is_none());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod config_guard_tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    const ORIGIN: &str = "https://plugins.test/cli.git";
+
+    fn empty_flow() -> (UpdateFlowRecord, tempfile::TempDir) {
+        let state = tempfile::tempdir().unwrap();
+        let record = UpdateFlowRecord {
+            schema_version: 1,
+            plugin_id: "io.example.cfg".into(),
+            candidate_commit: "0".repeat(40),
+            started_at: "now".into(),
+            phase: "delegating".into(),
+            quiesced: Vec::new(),
+            config_backup: None,
+            config_target: None,
+            config_original_mode: None,
+        };
+        (record, state)
+    }
+
+    /// installed_dir with a `.git/config` of `original` bytes at `mode`.
+    fn installed(original: &[u8], mode: u32) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let git = dir.path().join(".git");
+        fs::create_dir_all(&git).unwrap();
+        let config = git.join("config");
+        fs::write(&config, original).unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(mode)).unwrap();
+        dir
+    }
+
+    #[test]
+    fn clean_window_restores_original_bytes_and_mode() {
+        let original = b"[core]\n\trepositoryformatversion = 0\n[custom]\n\tkeep = yes\n";
+        let install = installed(original, 0o640);
+        let config = install.path().join(".git").join("config");
+        let (mut flow, state) = empty_flow();
+        let flow_path = state.path().join("review-update.json");
+        let backup = flow_path.with_extension("config-backup");
+
+        let guard = GitConfigGuard::swap_to_hardened(
+            install.path(),
+            ORIGIN,
+            &backup,
+            &mut flow,
+            &flow_path,
+        )
+        .unwrap();
+        // During the window the config is the hardened minimal snapshot and a
+        // durable backup of the original exists and is referenced.
+        assert_ne!(fs::read(&config).unwrap(), original.to_vec());
+        assert_eq!(fs::read(&backup).unwrap(), original.to_vec());
+        assert!(flow.config_backup.is_some());
+
+        assert!(
+            matches!(guard.restore(), RestoreOutcome::Clean),
+            "clean window restores cleanly"
+        );
+        assert_eq!(fs::read(&config).unwrap(), original.to_vec());
+        assert_eq!(
+            fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+            0o640,
+            "original mode is preserved"
+        );
+        // restore() no longer deletes the backup; the caller does that only
+        // after positively clearing and persisting the recovery record.
+        assert!(backup.exists(), "backup retained for the caller to clear");
+    }
+
+    #[test]
+    fn write_and_revert_is_detected_by_the_witness() {
+        // A racing writer injects a directive (atomic replace), lets Git
+        // "consume" it, then restores the EXACT hardened bytes before restore
+        // runs. Bytes match afterwards, but the inode changed — the witness
+        // catches it and restore fails closed.
+        let original = b"[core]\n\trepositoryformatversion = 0\n";
+        let install = installed(original, 0o644);
+        let config = install.path().join(".git").join("config");
+        let (mut flow, state) = empty_flow();
+        let flow_path = state.path().join("review-update.json");
+        let backup = flow_path.with_extension("config-backup");
+
+        let guard = GitConfigGuard::swap_to_hardened(
+            install.path(),
+            ORIGIN,
+            &backup,
+            &mut flow,
+            &flow_path,
+        )
+        .unwrap();
+        let hardened = fs::read(&config).unwrap();
+
+        // Inject via atomic replace (new inode)...
+        let injected = install.path().join(".git").join("config.attacker");
+        fs::write(&injected, b"[core]\n[filter \"x\"]\n\tsmudge = payload\n").unwrap();
+        fs::rename(&injected, &config).unwrap();
+        // ...then restore the exact hardened bytes, also via atomic replace.
+        let revert = install.path().join(".git").join("config.revert");
+        fs::write(&revert, &hardened).unwrap();
+        fs::rename(&revert, &config).unwrap();
+        assert_eq!(fs::read(&config).unwrap(), hardened, "bytes match again");
+
+        assert!(
+            matches!(guard.restore(), RestoreOutcome::Tampered),
+            "write-and-revert must be detected by the witness"
+        );
+        // The audited original is still restored despite the tamper verdict.
+        assert_eq!(fs::read(&config).unwrap(), original.to_vec());
+    }
+
+    #[test]
+    fn reconcile_restores_target_from_durable_backup() {
+        // Simulate a mid-window death: the target holds the hardened snapshot,
+        // a durable backup of the original exists, and the record points at
+        // both. Reconciliation must put the original back with its mode and
+        // clear the swap state.
+        let original = b"[core]\n\trepositoryformatversion = 0\n[keep]\n\tx = 1\n";
+        let install = installed(b"[core]\n\thardened = snapshot\n", 0o600);
+        let config = install.path().join(".git").join("config");
+        let (mut flow, state) = empty_flow();
+        let flow_path = state.path().join("review-update.json");
+        let backup = flow_path.with_extension("config-backup");
+        fs::write(&backup, original).unwrap();
+        flow.config_backup = Some(backup.to_string_lossy().into_owned());
+        flow.config_target = Some(config.to_string_lossy().into_owned());
+        flow.config_original_mode = Some(0o640);
+        flow.store(&flow_path).unwrap();
+
+        reconcile_config_backup(&mut flow, &flow_path).expect("reconcile succeeds");
+
+        assert_eq!(fs::read(&config).unwrap(), original.to_vec());
+        assert_eq!(
+            fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert!(!backup.exists(), "backup removed after reconcile");
+        assert!(flow.config_backup.is_none(), "swap state cleared");
+        // Idempotent: a second reconcile with cleared state is a no-op.
+        reconcile_config_backup(&mut flow, &flow_path).expect("idempotent no-op");
+        assert_eq!(fs::read(&config).unwrap(), original.to_vec());
+    }
+
+    #[test]
+    fn restore_failure_preserves_backup_and_recovery_pointer() {
+        // If the original cannot be reinstalled, RestoreFailed is reported and
+        // the durable backup + recovery pointer are preserved (not orphaned),
+        // so a later run can reconcile the target.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root ignores the directory write bit that forces failure
+        }
+        let original = b"[core]\n\trepositoryformatversion = 0\n";
+        let install = installed(original, 0o644);
+        let git = install.path().join(".git");
+        let (mut flow, state) = empty_flow();
+        let flow_path = state.path().join("review-update.json");
+        let backup = flow_path.with_extension("config-backup");
+
+        let guard = GitConfigGuard::swap_to_hardened(
+            install.path(),
+            ORIGIN,
+            &backup,
+            &mut flow,
+            &flow_path,
+        )
+        .unwrap();
+        // Make `.git` unwritable so restore's temp creation fails.
+        fs::set_permissions(&git, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let outcome = guard.restore();
+        // Re-permit writes so Drop's retry and cleanup can proceed.
+        fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            matches!(outcome, RestoreOutcome::RestoreFailed(_)),
+            "unrestorable window must report RestoreFailed"
+        );
+        // The durable backup and its pointer survive for recovery.
+        assert!(backup.exists(), "backup preserved on restore failure");
+        assert!(
+            flow.config_backup.is_some(),
+            "recovery pointer preserved on restore failure"
+        );
+        assert_eq!(fs::read(&backup).unwrap(), original.to_vec());
+    }
+
+    #[test]
+    fn reconcile_blocks_when_referenced_backup_is_missing() {
+        // A record still references a backup, but the file is gone: the target
+        // cannot be verified back to the original, so reconcile must fail
+        // closed rather than silently treat it as completed.
+        let install = installed(b"[core]\n\thardened = snapshot\n", 0o600);
+        let config = install.path().join(".git").join("config");
+        let (mut flow, state) = empty_flow();
+        let flow_path = state.path().join("review-update.json");
+        let missing = flow_path.with_extension("config-backup");
+        flow.config_backup = Some(missing.to_string_lossy().into_owned());
+        flow.config_target = Some(config.to_string_lossy().into_owned());
+        flow.config_original_mode = Some(0o644);
+
+        let error =
+            reconcile_config_backup(&mut flow, &flow_path).expect_err("missing backup must block");
+        assert!(error.contains("unavailable"), "{error}");
+        // The pointer is NOT cleared, so the caller keeps blocking.
+        assert!(flow.config_backup.is_some());
+    }
+
+    #[test]
+    fn hardened_config_neutralizes_a_smudge_filter() {
+        use std::process::Command;
+        // Under root, worktree filters and perms behave differently; skip.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let install = tempfile::tempdir().unwrap();
+        let repo = install.path();
+        let marker_dir = tempfile::tempdir().unwrap();
+        let marker = marker_dir.path().join("smudge-ran");
+
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .current_dir(repo)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t.invalid"]);
+        git(&["config", "user.name", "t"]);
+        fs::write(repo.join("file.txt"), "hello\n").unwrap();
+        fs::write(repo.join(".gitattributes"), "file.txt filter=evil\n").unwrap();
+        git(&["add", "file.txt", ".gitattributes"]);
+        git(&["commit", "-q", "-m", "init"]);
+        // Malicious smudge filter: create a marker when it runs.
+        let smudge = format!("touch '{}'", marker.display());
+        git(&["config", "filter.evil.smudge", &smudge]);
+
+        // Positive control: with the filter defined, a forced checkout runs it.
+        fs::remove_file(repo.join("file.txt")).unwrap();
+        git(&["checkout", "--", "file.txt"]);
+        assert!(
+            marker.exists(),
+            "positive control: the smudge payload runs without hardening"
+        );
+        fs::remove_file(&marker).unwrap();
+
+        // Under the guard the hardened config defines no filter, so the same
+        // forced checkout must NOT run the payload during the window.
+        let (mut flow, state) = empty_flow();
+        let flow_path = state.path().join("review-update.json");
+        let backup = flow_path.with_extension("config-backup");
+        let guard =
+            GitConfigGuard::swap_to_hardened(repo, ORIGIN, &backup, &mut flow, &flow_path).unwrap();
+        fs::remove_file(repo.join("file.txt")).unwrap();
+        git(&["checkout", "--", "file.txt"]);
+        assert!(
+            !marker.exists(),
+            "hardened config must neutralize the smudge filter during the window"
+        );
+        assert!(matches!(guard.restore(), RestoreOutcome::Clean));
+    }
+
+    #[test]
+    fn swap_refuses_a_symlinked_config() {
+        // .git/config is a symlink to an outside file: hardening must refuse
+        // rather than follow it (which would expose/overwrite the target).
+        let dir = tempfile::tempdir().unwrap();
+        let git = dir.path().join(".git");
+        fs::create_dir_all(&git).unwrap();
+        let outside = dir.path().join("outside");
+        fs::write(&outside, b"victim\n").unwrap();
+        std::os::unix::fs::symlink(&outside, git.join("config")).unwrap();
+        let (mut flow, state) = empty_flow();
+        let flow_path = state.path().join("review-update.json");
+        let backup = flow_path.with_extension("config-backup");
+
+        let error = match GitConfigGuard::swap_to_hardened(
+            dir.path(),
+            ORIGIN,
+            &backup,
+            &mut flow,
+            &flow_path,
+        ) {
+            Ok(_) => panic!("symlinked config must be refused"),
+            Err(error) => error,
+        };
+        assert!(error.contains("not a regular file"), "{error}");
+        assert_eq!(fs::read(&outside).unwrap(), b"victim\n".to_vec());
     }
 }
