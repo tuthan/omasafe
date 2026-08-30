@@ -2212,3 +2212,85 @@ cargo test --workspace                                   # 182 analyzer (parser)
 ./scripts/generate-cli-assets.sh --check                 # exit 0
 scripts/determinism-canary.sh                            # exit 0
 ```
+## v0.2.1 H3 — Review Response (twelfth round, reopened: quoted newlines, heredoc structure, option arity, and xargs taint)
+
+Status: **complete**
+
+Round 12 was reopened against the post-extraction HEAD: the focused suite
+passed but seven P1 behavioral gaps and one P2 line-attribution defect
+remained. All eight were reproduced as failing tests first
+(`detect::round_twelve_tests`, 12 cases), then fixed. The round also
+benefits from the Stage A layout: the source-layer fixes land in
+`detect/shell/source.rs` and `detect/shell/lexer.rs`, not in the monolith.
+
+1. **Multiline quoted bodies lost newline semantics (P1).**
+   `eval 'echo safe\ncurl URL | sh'` assembled into one unit joined by a
+   space, merging the body's two commands. Quoted and backtick
+   continuations now push the literal newline (data inside the quotes),
+   and the lexer treats a raw newline in reparsed text as a `;`-equivalent
+   statement separator (words break on `\n`/`\r` like on spaces), so eval
+   and `-c` bodies reparse as multi-statement scripts. Unquoted group
+   continuations keep the existing `;` insertion.
+2. **Heredocs were not structurally associated with their command (P1).**
+   The old pass handled only the first `<<`, checked only the header's
+   first command, and discarded everything after the delimiter. The new
+   pass scans every stdin heredoc (`<<`/`<<-`; fd-prefixed forms stay
+   data) with exact raw spans from the lexer's own operator classifier,
+   captures every body in redirection order, attributes each redirect to
+   the command containing it (`printf x | sh <<C | cat` executes the
+   body), keeps only the last adjacent redirect's body per command, and
+   preserves pipeline tails. Unterminated heredocs still pass through
+   untouched, and a raw-scan/token disagreement leaves the line alone.
+3. **`-c` resolved before valued cluster options (P1).**
+   `bash -co errexit 'sh'` captured `errexit` as the body and missed High;
+   `bash -co sh 'echo safe'` produced a false High. A later valued letter
+   (`o`/`O`) in the same cluster now defers the `-c` capture; when the
+   option walk reaches the first operand with `-c` pending, the operand IS
+   the body (`--` and `-` operands included).
+4. **Parse-only mode lost its input source (P1).**
+   `InterpreterMode::ParseOnly` now carries whether a `-c` body exists:
+   `bash -n -c 'echo safe'` parses the body and leaves the pipe for a
+   later `sh` (High), while body-less parse-only (`bash -n`) still drains.
+   `--dump-strings`/`--dump-po-strings` moved from exit-before-read to a
+   noexec classification: they read and parse stdin without executing, so
+   `curl | (bash --dump-strings; sh)` no longer emits a false High.
+5. **xargs searched for `-c` past the script operand (P1).**
+   `xargs sh local-script -c` fired because any `-c` spelling counted. The
+   wrapped shell invocation is now parsed as options-then-operand: a
+   static script operand pins the executed file (input words become
+   positional parameters), a stdin operand (`-`) or no operand at all
+   (input as the executed script file) counts as code, and `-c` only
+   decides when it precedes the operand.
+6. **xargs replacement-string taint was unimplemented (P1).**
+   `-I`/`--replace` placeholders are now extracted and followed: the input
+   reaches code when the placeholder is the wrapped program, the executed
+   script operand, or inside a `-c` body at command position, in an `eval`
+   argument, or as an interpreter's script operand. Data positions
+   (`cp {} /tmp/x`, `echo {}`) stay silent.
+7. **Decoder clusters ignored option arity (P1).**
+   `base64 -w0d` read as decode mode and fired both families. GNU
+   base64/base32 option parsing is now arity-aware: `-w` consumes the
+   glued remainder (or the next argument) as the wrap width, so `-w0d` is
+   a width, `-di` decodes, and `--decode` still matches.
+8. **Heredoc removal corrupted line attribution (P2).**
+   Removed body/terminator lines are now replaced with blank lines, and
+   the rewritten header's own embedded newlines are counted against the
+   original span, so findings anchor to their physical line
+   (`cat <<CODE` + payload + `CODE` + a line-4 curl reports line 4).
+
+Tests: twelve new cases in `detect::round_twelve_tests` pin the seven P1s
+and the P2 at the artifact layer, plus the lowest responsible source-layer
+case for quoted newlines. Full verification re-run:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings   # both feature configs
+cargo test --workspace                                   # both feature configs
+./scripts/generate-cli-assets.sh --check                 # exit 0
+scripts/determinism-canary.sh                            # exit 0
+```
+
+Extraction note: `detect/shell/source.rs` still reads interpreter
+classification from the parent `detect` module for heredoc ownership; that
+upward reference becomes a sibling import when plan PR 3 extracts command
+and interpreter modeling.

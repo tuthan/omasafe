@@ -78,7 +78,15 @@ pub(in crate::detect) fn tokenize(input: &str) -> Vec<ShellToken> {
     let mut i = 0usize;
     while i < bytes.len() {
         match bytes[i] {
-            b' ' | b'\t' => i += 1,
+            b' ' | b'\t' | b'\r' => i += 1,
+            // A raw newline separates statements exactly like `;`. It reaches
+            // the lexer unquoted inside reparsed bodies (eval/`-c` text,
+            // substitution interiors), where the physical line structure is
+            // gone but the newline's meaning survives.
+            b'\n' => {
+                tokens.push(ShellToken::Operator(";".to_owned()));
+                i += 1;
+            }
             b';' => {
                 tokens.push(ShellToken::Operator(";".to_owned()));
                 i += 1;
@@ -212,7 +220,10 @@ fn arithmetic_command_close(bytes: &[u8], start: usize) -> Option<usize> {
 /// then `<`/`>` with the `>>`, `<>`, `<<`, and `&` (duplication) variants. A
 /// bare `<(`/`>(` (no fd digits) is a process substitution, not a redirect,
 /// and is left to `read_word`.
-fn redirect_operator_at(bytes: &[u8], start: usize) -> Option<(String, usize)> {
+pub(in crate::detect) fn redirect_operator_at(
+    bytes: &[u8],
+    start: usize,
+) -> Option<(String, usize)> {
     let mut i = start;
     while i < bytes.len() && bytes[i].is_ascii_digit() {
         i += 1;
@@ -269,7 +280,7 @@ fn read_word(input: &str, start: usize) -> (ShellToken, usize) {
     let mut dynamic = false;
     while i < bytes.len() {
         match bytes[i] {
-            b' ' | b'\t' | b';' | b'|' | b'&' | b'(' | b')' => break,
+            b' ' | b'\t' | b'\n' | b'\r' | b';' | b'|' | b'&' | b'(' | b')' => break,
             b'<' | b'>' => {
                 if bytes.get(i + 1) == Some(&b'(')
                     && let Some((open, close)) = balanced_bracket_span(input, i + 1)

