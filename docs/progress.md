@@ -2412,3 +2412,52 @@ cargo test --workspace
 ./scripts/generate-cli-assets.sh --check                 # exit 0
 scripts/determinism-canary.sh                            # exit 0
 ```
+
+## Plan A3 — Shell Syntax and Command Modeling Extraction
+
+Status: **complete**
+
+Behavior-preserving extraction (Stage A step 4 of
+[`detect-rs-maintenance-plan.md`](detect-rs-maintenance-plan.md)) per the
+established A2 conventions: item bodies moved verbatim, no renames, no
+signature changes, visibility scoped to `pub(in crate::detect)`.
+
+- `detect/shell/syntax.rs` (192 lines): statement splitting with the
+  preceding control operator (`conditional_statements`), the
+  conditional-list exit-status set (`Outcomes`), `!` pipeline negation,
+  pipeline segmentation, and compound-group discovery (`GroupKind`,
+  `matching_group_close`, `grouped_token_ranges`). Depends only on the
+  lexer.
+- `detect/shell/command.rs` (452 lines): `ScriptCommand` and
+  command-position parsing — `segment_commands` with prefix skipping and
+  wrapper unwrapping (`sudo`/`command`/`env`/`exec`/`time`/`pkexec`/`doas`,
+  including `env -S`), argv collection, `command_basename`, redirect
+  semantics (`redirect_moves_stdout_away`, `redirect_moves_stdin_away`,
+  depth-zero redirect walks), `compound_position`, and
+  `statement_outcomes` (placed here because the outcome model reads
+  command heads, keeping the plan's dependency direction:
+  command → syntax, never the reverse).
+- `detect/shell/interpreter.rs` (310 lines): interpreter basenames and
+  families, the per-argument execution-mode parse (`interpreter_mode`:
+  `-c` bodies with deferred cluster capture, stdin scripts, parse-only,
+  exits, long options), `separate_cluster_value`, and the statically
+  known shell text a command executes (`interpreter_static_body`,
+  `static_command_body`, eval argument joining).
+
+The facade re-imports the moved names explicitly; the effect walks,
+xargs input model, and detector families remain in `detect.rs` (A4
+territory). `detect.rs` is now 10,914 lines (from 11,806), of which
+~5,800 are test modules that A5 will move last. Item-signature identity
+across the move was checked mechanically (names and arities unchanged;
+only fmt wrapping differs).
+
+Full verification gate (both feature configurations):
+
+```text
+cargo fmt --all -- --check                               # exit 0
+cargo clippy --workspace --all-targets -- -D warnings    # both configs
+cargo test --workspace                                   # both configs
+./scripts/generate-cli-assets.sh --check                 # exit 0
+scripts/determinism-canary.sh                            # exit 0
+git diff --check                                         # clean
+```
