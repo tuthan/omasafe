@@ -10,7 +10,7 @@ use serde::Serialize;
 
 /// Monotonic version of this catalog. Bump when rules are added, retired, or
 /// redefined; the policy identity changes with it.
-pub const RULE_CATALOG_VERSION: u32 = 4;
+pub const RULE_CATALOG_VERSION: u32 = 5;
 
 /// Monotonic version of the severity table. Severity or rule-meaning changes
 /// require a new version here.
@@ -337,6 +337,56 @@ pub const CATALOG: &[RuleDefinition] = &[
         review_guidance: "Verify the exact root command surface; never infer safety from a benign-looking wrapper name.",
     },
     RuleDefinition {
+        id: "oma.script.reverse-shell",
+        title: "Script opens an interactive reverse shell",
+        language: Language::Shell,
+        capability: Capability::ProcessExecution,
+        default_severity: Severity::High,
+        surface_anchor: "arbitrary non-QML payloads",
+        summary: "A bundled script opens an operator-controlled shell back to a remote host (/dev/tcp redirect, nc -e, socat exec:, bash -i >&).",
+        review_guidance: "Highest-signal family in the catalog: an interactive remote shell is a full handover of the user account. Treat as blocking.",
+    },
+    RuleDefinition {
+        id: "oma.python.reverse-shell",
+        title: "Python script wires a socket to a process",
+        language: Language::Python,
+        capability: Capability::ProcessExecution,
+        default_severity: Severity::High,
+        surface_anchor: "arbitrary non-QML payloads",
+        summary: "Bundled Python connects a network socket and hands it to a spawned process on the same statement line.",
+        review_guidance: "The classic Python reverse shell is exactly this wiring. Review the connect target and spawned command manually; multi-line wiring is the H4 dataflow slice.",
+    },
+    RuleDefinition {
+        id: "oma.script.decode-execute",
+        title: "Script decodes content and executes it",
+        language: Language::Shell,
+        capability: Capability::ProcessExecution,
+        default_severity: Severity::High,
+        surface_anchor: "arbitrary non-QML payloads",
+        summary: "A bundled script pipes decoded content (base64 -d, openssl enc -d, xxd -r) into a shell or interpreter on one line.",
+        review_guidance: "Decoded-then-executed content was never reviewable text. Note the shell blind spot: an unquoted base64 blob is not a quoted literal, so the obfuscation indicator cannot fire on shell — this rule is the line-level net.",
+    },
+    RuleDefinition {
+        id: "oma.script.privileged-shared-temp",
+        title: "Privileged execution from shared temporary storage indicator",
+        language: Language::Shell,
+        capability: Capability::ProcessExecution,
+        default_severity: Severity::Low,
+        surface_anchor: "arbitrary non-QML payloads",
+        summary: "A bundled script invokes a privilege wrapper on a /tmp or /dev/shm path.",
+        review_guidance: "Indicator only: a pathname alone does not prove attacker control. Re-check whether anything outside the plugin can replace the referenced path before judging.",
+    },
+    RuleDefinition {
+        id: "oma.script.privileged-shared-temp-controlled",
+        title: "Script relaxes permissions on shared temporary storage",
+        language: Language::Shell,
+        capability: Capability::ProcessExecution,
+        default_severity: Severity::High,
+        surface_anchor: "arbitrary non-QML payloads",
+        summary: "A bundled script makes a /tmp or /dev/shm path group- or world-writable on one line (chmod with a permissive mode).",
+        review_guidance: "An explicit mode release on shared storage lets any local user swap the payload a privileged invocation later runs. Connected untrusted-write confirmation is the H4 dataflow slice.",
+    },
+    RuleDefinition {
         id: "oma.shell.ipc-injected-objects",
         title: "Shell IPC/injected object inventory",
         language: Language::JavaScript,
@@ -431,6 +481,22 @@ mod tests {
     }
 
     #[test]
+    fn shared_temp_pathname_is_never_a_finding_on_its_own() {
+        // H3: the indicator records a privileged invocation touching shared
+        // temporary storage; the High rule needs an explicit mode release.
+        // The indicator ID is never repurposed as the finding.
+        let indicator = rule("oma.script.privileged-shared-temp").unwrap();
+        assert_eq!(indicator.default_severity, Severity::Low);
+        assert!(
+            indicator.summary.contains("indicator")
+                || indicator.review_guidance.contains("Indicator only")
+        );
+        let controlled = rule("oma.script.privileged-shared-temp-controlled").unwrap();
+        assert_eq!(controlled.default_severity, Severity::High);
+        assert!(controlled.id != indicator.id);
+    }
+
+    #[test]
     fn severity_ordering_matches_documented_scale() {
         assert!(Severity::Info < Severity::Low);
         assert!(Severity::Low < Severity::Medium);
@@ -461,6 +527,17 @@ mod tests {
             ("oma.python.download-execute", "arbitrary non-QML payloads"),
             (
                 "oma.python.privilege-escalation",
+                "arbitrary non-QML payloads",
+            ),
+            ("oma.script.reverse-shell", "arbitrary non-QML payloads"),
+            ("oma.python.reverse-shell", "arbitrary non-QML payloads"),
+            ("oma.script.decode-execute", "arbitrary non-QML payloads"),
+            (
+                "oma.script.privileged-shared-temp",
+                "arbitrary non-QML payloads",
+            ),
+            (
+                "oma.script.privileged-shared-temp-controlled",
                 "arbitrary non-QML payloads",
             ),
             ("oma.qml.detached-execution", "Quickshell.execDetached"),

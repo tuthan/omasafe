@@ -663,7 +663,7 @@ fn rules_list_text_is_deterministic() {
         .clone();
     assert_eq!(first, second);
     let rendered = String::from_utf8(first).unwrap();
-    assert!(rendered.contains("rule catalog v4"));
+    assert!(rendered.contains("rule catalog v5"));
     assert!(rendered.contains("oma.qml.session-lock"));
 }
 
@@ -728,7 +728,7 @@ fn analyze_reports_full_payload_inventory_end_to_end() {
     assert_eq!(report["result"]["target"]["source"], "installed-plugin");
     let analysis = &report["result"]["analysis"];
     assert_eq!(analysis["schema"], "omasafe.analysis.v1");
-    assert_eq!(analysis["policy_identity"]["rule_catalog_version"], 4);
+    assert_eq!(analysis["policy_identity"]["rule_catalog_version"], 5);
     let inventory = &report["result"]["payload_inventory"];
     let states = &inventory["coverage_states"];
     // S3+S4: analyzable files land in analyzed/unreferenced/partial; only
@@ -1267,6 +1267,98 @@ fn h2_benign_references_fixture_is_silent() {
     assert!(
         edges.iter().any(|edge| edge["target_path"] == "Widget.qml"),
         "{edges:?}"
+    );
+}
+
+/// Scan an H3 adversarial fixture plugin tree from `fixtures/plugins/`.
+fn scan_h3_fixture(name: &str) -> Value {
+    scan_h2_fixture(name)
+}
+
+#[test]
+fn h3_fixtures_surface_script_evasions() {
+    // Each evasion fixture produces exactly the rule family it exists to
+    // prove, at catalog severity.
+    for (name, rule_id, expected, severity) in [
+        ("reverse-shell", "oma.script.reverse-shell", 2u64, "high"),
+        (
+            "download-execute-nopipe",
+            "oma.script.download-execute",
+            2,
+            "high",
+        ),
+        ("decode-execute", "oma.script.decode-execute", 1, "high"),
+        (
+            "privileged-shared-temp",
+            "oma.script.privileged-shared-temp",
+            1,
+            "low",
+        ),
+        (
+            "privileged-shared-temp-controlled",
+            "oma.script.privileged-shared-temp-controlled",
+            1,
+            "high",
+        ),
+    ] {
+        let report = scan_h3_fixture(name);
+        let findings = report["result"]["analysis"]["findings"].as_array().unwrap();
+        let matching: Vec<&Value> = findings
+            .iter()
+            .filter(|finding| finding["rule_id"] == rule_id)
+            .collect();
+        assert_eq!(matching.len(), expected as usize, "{name}: {findings:?}");
+        assert!(
+            matching
+                .iter()
+                .all(|finding| finding["severity"] == severity),
+            "{name}: {findings:?}"
+        );
+    }
+    // The controlled fixture carries the High rule WITHOUT repurposing the
+    // indicator id; the indicator fixture never carries the High rule.
+    let controlled = scan_h3_fixture("privileged-shared-temp-controlled");
+    let controlled_findings = controlled["result"]["analysis"]["findings"]
+        .as_array()
+        .unwrap();
+    assert!(
+        !controlled_findings
+            .iter()
+            .any(|finding| finding["rule_id"] == "oma.script.privileged-shared-temp"),
+        "{controlled_findings:?}"
+    );
+    let indicator = scan_h3_fixture("privileged-shared-temp");
+    let indicator_findings = indicator["result"]["analysis"]["findings"]
+        .as_array()
+        .unwrap();
+    assert!(
+        !indicator_findings
+            .iter()
+            .any(|finding| finding["rule_id"] == "oma.script.privileged-shared-temp-controlled"),
+        "{indicator_findings:?}"
+    );
+}
+
+#[test]
+fn h3_benign_scripts_fixture_stays_finding_free() {
+    // Logged curl-pipe string, nc without -e, non-temp sudo, decode without
+    // a consumer, and a non-releasing chmod produce zero findings. The live
+    // wget still records honest egress attribution.
+    let report = scan_h3_fixture("benign-scripts");
+    let analysis = &report["result"]["analysis"];
+    assert_eq!(analysis["findings"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        analysis["coverage_limitations"].as_array().unwrap().len(),
+        0
+    );
+    assert!(
+        analysis["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|capability| capability["capability"] == "network-access"),
+        "{:?}",
+        analysis["capabilities"]
     );
 }
 

