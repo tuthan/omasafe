@@ -325,6 +325,13 @@ details. Each H3 review finding should normally add:
 
 ## Review and merge sequence
 
+Sequencing invariant: a defect round closes completely before the next
+extraction PR starts — every reported case fixed, nearby variants probed and
+pinned, and at least one CLI-level false-positive and false-negative fixture
+landing in `fixtures/plugins/`. The A1 golden regenerates only from a corpus
+that covers the closed round; a stale golden would freeze defective behavior
+as the characterization baseline.
+
 Recommended pull-request sequence:
 
 1. Fix and pin the round-12 P1 findings on the current structure (Stage 0).

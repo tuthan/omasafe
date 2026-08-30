@@ -5,7 +5,7 @@
 //! values plus provenance, so every later layer reads the same token
 //! stream instead of re-scanning raw text.
 
-use crate::detect::balanced_bracket_span;
+use crate::detect::model::balanced_bracket_span;
 
 /// A substitution's kind: command substitution (`$( … )`, backticks) expands
 /// to text a command consumes, process substitution (`<( … )`, `>( … )`)

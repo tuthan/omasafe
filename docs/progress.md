@@ -2294,3 +2294,63 @@ Extraction note: `detect/shell/source.rs` still reads interpreter
 classification from the parent `detect` module for heredoc ownership; that
 upward reference becomes a sibling import when plan PR 3 extracts command
 and interpreter modeling.
+## v0.2.1 H3 — Review Response (round-12 reopen recovery: variant pinning, CLI FP/FN fixture, A2 completion)
+
+Status: **complete**
+
+Stage 0 was reopened a second time: the seven reopened P1s were fixed but
+their NEIGHBORHOOD was not. A 25-case variant battery across all seven
+families found two more genuine defects, both now fixed and pinned:
+
+1. **Forwarded heredoc bodies were dropped (P1, false negative).**
+   `cat <<C | sh` with `C = curl URL | sh` executed the body through the
+   forwarding filter, but the heredoc pass treated every non-interpreter
+   owner as data and dropped the body. Ownership is now a three-way
+   classification: a shell interpreter in stdin-script mode rewrites the
+   body as its own `-c`; a pure forwarding filter (`cat` with no file
+   operand, `tee`) attaches the body as the DOWNSTREAM consumer's `-c`
+   (`cat <<C | sh` becomes `cat | sh -c '…'`), crossing only pipeline
+   syntax — never the list separators `;`/`&&`, which leave the body
+   unconsumed (`cat <<A; sh <<B` keeps B's body on sh, A stays data).
+2. **Decoder width values broke stdin modeling (P1, false negative).**
+   `base64 -w 0 -d` fired decode-execute but missed download-execute:
+   `drains_stdin` counted the `-w` width VALUE as a file operand, so the
+   segment stopped forwarding and the fetch-to-interpreter chain broke.
+   Operand counting is now arity-aware for base64/base32 (`-w`/`--wrap`
+   consume the next argument); `-w0di` is still a width, `-w 0 -d` still
+   decodes.
+
+The remaining 23 battery variants passed at HEAD and are pinned as
+permanent tests in `detect::round_twelve_tests` (18 cases total). A new
+CLI-level fixture `fixtures/plugins/script-fp-fn/` holds BOTH directions of
+the round in one plugin — the multiline quoted eval must fire (exactly one
+download-execute High), while `base64 -w0d`, `xargs sh local-helper -c`,
+and heredoc data must stay silent — asserted end-to-end through
+`omasafe scan-plugin` (`h3_script_fixture_pins_false_positive_and_false_negative`).
+The A1 golden corpus now includes the fixture; the regenerated baseline
+shows the expected delta only (one finding, three honest network-access
+capabilities, new fingerprint; all pre-existing fixture lines unchanged).
+
+Structure (recovery steps 4–5, behavior-preserving):
+
+- `detect/shell/source.rs` no longer imports interpreter or command
+  modeling from the parent: heredoc ownership policy is injected at the
+  facade as `classify_heredoc_owner`/`spells_shell_stdin_interpreter`
+  closures, so the source layer depends only on the lexer and the module
+  graph is acyclic.
+- `balanced_bracket_span` moved to `detect/model.rs` (shared byte spans);
+  the lexer and the Python detectors import it directly instead of
+  reaching into the facade.
+- Remaining A2 leaves extracted: `detect/qml/strings.rs`
+  (`decode_js_escapes`) and `detect/script/python.rs` (the Python
+  reverse-shell family).
+
+Full verification re-run (both feature configurations):
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+./scripts/generate-cli-assets.sh --check                 # exit 0
+scripts/determinism-canary.sh                            # exit 0
+```

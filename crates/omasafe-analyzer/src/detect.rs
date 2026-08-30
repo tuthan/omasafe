@@ -27,8 +27,14 @@ use crate::fingerprint::{Confidence, NormalizedResult};
 use crate::payload::{CoverageState, PayloadEntry, PayloadInventory, PayloadKind};
 use crate::rules::{Capability, Language, Severity, rule};
 
+mod model;
+mod qml;
+mod script;
 mod shell;
 
+use model::balanced_bracket_span;
+use qml::strings::decode_js_escapes;
+use script::python::python_reverse_shell;
 use shell::budget::ShellBudget;
 use shell::lexer::{ShellToken, SubstKind, Substitution, tokenize};
 use shell::source::shell_logical_units;
@@ -547,132 +553,6 @@ fn is_out_of_tree_spelling(value: &str) -> bool {
         .trim_start_matches("./")
         .split('/')
         .any(|segment| segment == "..")
-}
-
-/// Decode JS/QML string escape sequences so sink classification sees the
-/// value the runtime evaluates: `"\x68ttps://…"` loads `https://…`, so
-/// escaped literals must not slip past scheme detection (H2 review). Applies
-/// exactly once, at string extraction; classification and evidence carry the
-/// decoded runtime value. Unknown escapes decode to the escaped character
-/// (JS semantics); a trailing backslash stays literal.
-fn decode_js_escapes(content: &str) -> String {
-    if !content.contains('\\') {
-        return content.to_owned();
-    }
-    let mut decoded = String::with_capacity(content.len());
-    let mut chars = content.chars().peekable();
-    while let Some(current) = chars.next() {
-        if current != '\\' {
-            decoded.push(current);
-            continue;
-        }
-        let Some(&next) = chars.peek() else {
-            decoded.push('\\');
-            break;
-        };
-        match next {
-            // Line-continuation: backslash + LineTerminatorSequence evaluates
-            // to the empty string, so `"ht\<LF>tps://…"` is `https://…` at
-            // runtime. A CR + LF pair is a single terminator sequence.
-            '\n' | '\u{2028}' | '\u{2029}' => {
-                chars.next();
-            }
-            '\r' => {
-                chars.next();
-                if chars.peek() == Some(&'\n') {
-                    chars.next();
-                }
-            }
-            // Legacy octal escape (Annex B): backslash + 1–3 octal digits.
-            // The first digit bounds the length — 0–3 allow three digits,
-            // 4–7 only two — so `\1` is U+0001 and `\101` is 'A'. `\0` not
-            // followed by an octal digit is NUL. `\8`/`\9` are not octal and
-            // fall through to the identity arm below.
-            '0'..='7' => {
-                chars.next();
-                let mut octal = String::new();
-                octal.push(next);
-                let max = if next <= '3' { 3 } else { 2 };
-                while octal.len() < max
-                    && chars.peek().is_some_and(|char| ('0'..='7').contains(char))
-                {
-                    octal.push(chars.next().unwrap());
-                }
-                let value = u32::from_str_radix(&octal, 8).unwrap_or(0);
-                decoded.push(char::from_u32(value).unwrap_or('\u{FFFD}'));
-            }
-            'n' | 'r' | 't' | 'b' | 'f' | 'v' => {
-                decoded.push(match next {
-                    'n' => '\n',
-                    'r' => '\r',
-                    't' => '\t',
-                    'b' => '\u{0008}',
-                    'f' => '\u{000C}',
-                    _ => '\u{000B}',
-                });
-                chars.next();
-            }
-            'x' => {
-                chars.next();
-                let mut hex = String::new();
-                while hex.len() < 2 && chars.peek().is_some_and(|char| char.is_ascii_hexdigit()) {
-                    hex.push(chars.next().unwrap());
-                }
-                if hex.len() == 2 {
-                    let value = u32::from_str_radix(&hex, 16).unwrap_or(0);
-                    decoded.push(char::from_u32(value).unwrap_or('\u{FFFD}'));
-                } else {
-                    decoded.push_str("\\x");
-                    decoded.push_str(&hex);
-                }
-            }
-            'u' => {
-                chars.next();
-                if chars.peek() == Some(&'{') {
-                    chars.next();
-                    let mut hex = String::new();
-                    while hex.len() < 6 && chars.peek().is_some_and(|char| char.is_ascii_hexdigit())
-                    {
-                        hex.push(chars.next().unwrap());
-                    }
-                    if chars.peek() == Some(&'}')
-                        && let Some(value) =
-                            u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32)
-                    {
-                        chars.next();
-                        decoded.push(value);
-                    } else {
-                        decoded.push_str("\\u{");
-                        decoded.push_str(&hex);
-                    }
-                } else {
-                    let mut hex = String::new();
-                    while hex.len() < 4 && chars.peek().is_some_and(|char| char.is_ascii_hexdigit())
-                    {
-                        hex.push(chars.next().unwrap());
-                    }
-                    if hex.len() == 4 {
-                        let value = u32::from_str_radix(&hex, 16).unwrap_or(0);
-                        decoded.push(char::from_u32(value).unwrap_or('\u{FFFD}'));
-                    } else {
-                        decoded.push_str("\\u");
-                        decoded.push_str(&hex);
-                    }
-                }
-            }
-            '\'' | '"' | '`' | '\\' | '/' => {
-                decoded.push(next);
-                chars.next();
-            }
-            // Unknown escape: JS keeps the escaped character, drops the
-            // backslash.
-            other => {
-                decoded.push(other);
-                chars.next();
-            }
-        }
-    }
-    decoded
 }
 
 /// Findings for literals at load sinks (H2). Network schemes at the two
@@ -1256,50 +1136,6 @@ fn argv_head_fetches(elements: &[&str]) -> HeadEgress {
         return HeadEgress { fetches, exhausted };
     }
     silent
-}
-
-/// The bracketed span starting at `open` ('(' or '['): to its matching
-/// closer, honoring nesting and quoted strings.
-fn balanced_bracket_span(text: &str, open: usize) -> Option<(usize, usize)> {
-    let bytes = text.as_bytes();
-    let opener = *bytes.get(open)?;
-    let closer = match opener {
-        b'(' => b')',
-        b'[' => b']',
-        b'{' => b'}',
-        _ => return None,
-    };
-    let mut depth = 0usize;
-    let mut index = open;
-    let mut in_string: Option<u8> = None;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        match in_string {
-            Some(quote) => {
-                if byte == b'\\' {
-                    index += 2;
-                    continue;
-                }
-                if byte == quote {
-                    in_string = None;
-                }
-            }
-            None => {
-                if byte == b'"' || byte == b'\'' {
-                    in_string = Some(byte);
-                } else if byte == opener {
-                    depth += 1;
-                } else if byte == closer {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some((open + 1, index));
-                    }
-                }
-            }
-        }
-        index += 1;
-    }
-    None
 }
 
 /// The value span after `property:` on one line, stopping at a closing
@@ -4678,85 +4514,6 @@ fn chmod_relaxes_shared_temp(segment: &[ShellToken]) -> bool {
                 .iter()
                 .any(|arg| writable_shared_temp_mode(arg))
     })
-}
-
-/// Python reverse shell (H3 review): a connected socket whose descriptor
-/// reaches a process — a `dup2(` or `Popen(` call whose own argument span
-/// passes that socket's `fileno()` (or chains
-/// `create_connection( … ).fileno()` inline). Independent socket and
-/// dup2 words never fire: `s = socket.create_connection((host, 443));
-/// os.dup2(1, 2)` and `s.connect(…); os.dup2(log.fileno(), 1)` stay
-/// silent.
-fn python_reverse_shell(code: &str) -> bool {
-    let mut sockets = Vec::new();
-    for (index, _) in code.match_indices(".connect(") {
-        if let Some(receiver) = dotted_identifier_before(code, index) {
-            sockets.push(receiver);
-        }
-    }
-    for (index, _) in code.match_indices("create_connection(") {
-        if let Some(target) = assigned_name_before(code, index) {
-            sockets.push(target);
-        }
-    }
-    for call in ["dup2(", "Popen("] {
-        for (index, _) in code.match_indices(call) {
-            let Some((open, close)) = balanced_bracket_span(code, index + call.len() - 1) else {
-                continue;
-            };
-            let args = &code[open..close];
-            let wired = sockets
-                .iter()
-                .any(|socket| args.contains(&format!("{socket}.fileno()")))
-                || (args.contains("fileno()") && args.contains("create_connection("));
-            if wired {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Receiver chain of a `.connect(` call: the dotted identifier before the
-/// dot (`s`, `self.sock`).
-fn dotted_identifier_before(code: &str, dot_index: usize) -> Option<&str> {
-    let bytes = code.as_bytes();
-    let mut start = dot_index;
-    while start > 0
-        && (bytes[start - 1].is_ascii_alphanumeric()
-            || bytes[start - 1] == b'_'
-            || bytes[start - 1] == b'.')
-    {
-        start -= 1;
-    }
-    let name = &code[start..dot_index];
-    (!name.is_empty()).then_some(name)
-}
-
-/// Assignment target feeding a `create_connection(` call: the assignment
-/// operator must live in the SAME statement as the call —
-/// `s = socket.create_connection(…)` (or `s = wrapper(…)` wrapping it).
-/// A `=` left over from an earlier statement (`log = open(…);
-/// socket.create_connection(…); os.dup2(log.fileno(), 1)`) binds nothing,
-/// and comparison operators (`==`, `<=`, `>=`, `!=`) are never
-/// assignments.
-fn assigned_name_before(code: &str, call_index: usize) -> Option<&str> {
-    let before = &code[..call_index];
-    let statement_start = before.rfind([';', '\n']).map_or(0, |index| index + 1);
-    let statement = &before[statement_start..];
-    let equals = statement.rfind('=')?;
-    if statement[..equals].ends_with(['!', '<', '>', '=']) {
-        return None; // ==, !=, <=, >= comparisons
-    }
-    let target = statement[..equals].trim_end();
-    let start = target
-        .char_indices()
-        .rev()
-        .take_while(|(_, character)| character.is_alphanumeric() || *character == '_')
-        .last()
-        .map(|(byte, _)| byte)?;
-    let name = &target[start..];
-    (!name.is_empty()).then_some(name)
 }
 
 /// Plugin manifests feed context-level results and capability context that
