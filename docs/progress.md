@@ -2638,3 +2638,56 @@ cargo test --workspace                                   # both configs
 scripts/determinism-canary.sh                            # exit 0
 git diff --check                                         # clean
 ```
+
+## Plan Step 6 — QML/JS and Python Frontend Extraction (Stage A closed)
+
+Status: **complete**
+
+The remaining production code left `detect.rs` for the plan's target
+layout, completing Stage A's acceptance criterion (a facade well below
+1,500 lines). Item bodies moved verbatim; visibility stays scoped to
+`pub(in crate::detect)`.
+
+- `detect/model.rs` (317 lines): `FileOutcome`, `ResultParts`, `SinkKind`,
+  the rule-id constants, `parts`/`occurrence`, `capability_covering_rule`,
+  and the shared text helpers (`truncate_bytes`, `lower_contains`,
+  `strip_line_comment`/`CommentStyle`, `unquoted_text`, `find_word`,
+  `disclose_budget_limitation`) beside the existing byte-span helper.
+- `detect/references.rs` (280 lines): the reference machinery —
+  `resolve_reference`, `SinkPosition`, `ReferenceCandidate`, scheme
+  classification, typed rejection reasons, sink findings, and directory
+  imports.
+- `detect/qml/lexical.rs` (752 lines): the lexical QML/JS scanner,
+  `find_shell_interpreter`, execution-span evaluation, argv egress
+  attribution, and the lexical sink-literal walks.
+- `detect/qml/ast.rs` (835 lines, feature-gated): the tree-sitter walk
+  with its import-surface and reference-sink handling.
+- `detect/qml/mod.rs` (38 lines): the QML/JS entry points over both
+  feature configurations.
+- `detect/script/mod.rs` (392 lines): shell/Python dispatch and result
+  anchoring, with the heredoc-ownership and forwarded-body classifiers
+  the shell source layer receives.
+- `detect.rs` (452 lines): public API, inventory orchestration, manifest
+  context — a facade. The model surface is re-exported through the facade
+  namespace (`pub(in crate::detect) use model::*;`) because the shell
+  detector modules and the test tree consume those names via
+  `crate::detect::` paths; a small `#[cfg(test)]` re-export block serves
+  names only the test tree reads.
+
+Mechanical verification: item-signature diff across the whole tree shows
+zero removed or renamed items (the only additions are the moved items'
+new module homes). Full verification gate in both feature
+configurations:
+
+```text
+cargo fmt --all -- --check                               # exit 0
+cargo clippy --workspace --all-targets -- -D warnings    # both configs
+cargo test --workspace                                   # both configs
+./scripts/generate-cli-assets.sh --check                 # exit 0
+scripts/determinism-canary.sh                            # exit 0
+git diff --check                                         # clean
+```
+
+Stage A is complete: `detect.rs` is a 452-line facade over ten focused
+modules; every module is under the 1,500-line bound. Stage B (the typed
+shell IR and centralized command effects) is next.
