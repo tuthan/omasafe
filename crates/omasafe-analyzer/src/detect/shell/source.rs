@@ -2,14 +2,24 @@
 //! command units, with comments applied statefully and heredoc payloads
 //! kept out of top-level command scanning.
 //!
-//! The `crate::detect` imports below read interpreter classification from
-//! the parent module; that upward reference is temporary until command and
-//! interpreter modeling extract into sibling modules (plan PR 3).
+//! This module depends only on the lexer. Heredoc ownership policy — what
+//! the redirect-owning command does with the body — is injected by the
+//! facade as classifiers, so the source layer stays free of interpreter
+//! and command modeling.
 
 use super::lexer::{ShellToken, redirect_operator_at, tokenize};
-use crate::detect::{
-    InterpreterFamily, InterpreterMode, interpreter_family, interpreter_mode, segment_commands,
-};
+
+/// What the command owning a heredoc redirect does with the body.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::detect) enum HeredocOwner {
+    /// A shell interpreter in stdin-script mode: the body is executed code.
+    ExecutesStdin,
+    /// A pure stdin-forwarding filter (`cat`, `tee`) with no file operand:
+    /// the body flows to whatever consumes the owner's stdout downstream.
+    ForwardsStdin,
+    /// Data: the body is never executed.
+    Data,
+}
 
 /// Whether the assembled text ends with an open pipeline or list operator —
 /// the grammar demands the next line (`curl URL |`, `fetch &&`).
@@ -28,8 +38,13 @@ fn trailing_pipeline_operator(text: &str) -> bool {
 /// statefully along the way — a `#` at a word boundary drops the rest of
 /// its line, and a backslash-newline inside a comment never continues.
 /// Each unit keeps its STARTING line number for findings.
-pub(in crate::detect) fn shell_logical_units(source: &str) -> Vec<(u32, String)> {
-    let source = shell_source_without_heredoc_payloads(source);
+pub(in crate::detect) fn shell_logical_units(
+    source: &str,
+    classifies_owner: &dyn Fn(&[ShellToken], usize) -> HeredocOwner,
+    spells_shell_stdin: &dyn Fn(&str) -> bool,
+) -> Vec<(u32, String)> {
+    let source =
+        shell_source_without_heredoc_payloads(source, classifies_owner, spells_shell_stdin);
     let mut units: Vec<(u32, String)> = Vec::new();
     let mut text = String::new();
     let mut start_line = 1u32;
@@ -313,30 +328,6 @@ fn delimiter_word_span(bytes: &[u8], mut i: usize) -> Option<(usize, usize)> {
     (i > start).then_some((start, i))
 }
 
-/// Whether the heredoc redirected at token `op_index` is owned by a shell
-/// interpreter running in stdin-script mode — the one case where the body is
-/// executed code rather than data. The command containing the redirect runs
-/// from the last top-level separator before it; wrapper chains count when
-/// their wrapped interpreter reads stdin (`sudo sh <<X`).
-fn heredoc_owner_is_shell_interpreter(tokens: &[ShellToken], op_index: usize) -> bool {
-    let mut boundary = 0usize;
-    let mut depth = 0i32;
-    for (index, token) in tokens[..op_index].iter().enumerate() {
-        match token.operator() {
-            Some("(" | "{" | "((") => depth += 1,
-            Some(")" | "}" | "))") => depth = (depth - 1).max(0),
-            Some("|" | "|&" | ";" | "&&" | "||" | "&") if depth == 0 => boundary = index + 1,
-            _ => {}
-        }
-    }
-    segment_commands(&tokens[boundary..op_index])
-        .iter()
-        .any(|command| {
-            interpreter_family(command) == Some(InterpreterFamily::Shell)
-                && matches!(interpreter_mode(command), InterpreterMode::StdinScript)
-        })
-}
-
 /// Remove heredoc payload lines from ordinary command scanning. A heredoc is
 /// data unless its owning command is a shell interpreter; for that one case,
 /// the body is rewritten into an equivalent `-c` body at the redirect's
@@ -349,7 +340,11 @@ fn heredoc_owner_is_shell_interpreter(tokens: &[ShellToken], op_index: usize) ->
 /// lines are replaced with blank lines so later units keep their physical
 /// line numbers. Unterminated heredocs are left alone: treating the rest of
 /// the file as data would hide live code after malformed input.
-fn shell_source_without_heredoc_payloads(source: &str) -> String {
+fn shell_source_without_heredoc_payloads(
+    source: &str,
+    classifies_owner: &dyn Fn(&[ShellToken], usize) -> HeredocOwner,
+    spells_shell_stdin: &dyn Fn(&str) -> bool,
+) -> String {
     let lines: Vec<&str> = source.lines().collect();
     let mut output = Vec::new();
     let mut index = 0usize;
@@ -410,26 +405,41 @@ fn shell_source_without_heredoc_payloads(source: &str) -> String {
             index += 1;
             continue;
         }
-        let owners: Vec<bool> = (0..redirects.len())
-            .map(|k| heredoc_owner_is_shell_interpreter(&tokens, token_ops[k]))
+        let owners: Vec<HeredocOwner> = (0..redirects.len())
+            .map(|k| classifies_owner(&tokens, token_ops[k]))
             .collect();
         let mut header = String::new();
         let mut byte_cursor = 0usize;
         for (k, redirect) in redirects.iter().enumerate() {
             header.push_str(&line[byte_cursor..redirect.span.0]);
             byte_cursor = redirect.span.1;
-            if owners[k]
-                // Later redirects of the same command override earlier stdin,
-                // so only the last adjacent one supplies the body.
-                && token_ops
-                    .get(k + 1)
-                    .is_none_or(|next| *next != token_ops[k] + 2)
-            {
-                if !header.ends_with([' ', '\t', '(', ';', '&', '|']) {
-                    header.push(' ');
+            // Later redirects of the same command override earlier stdin, so
+            // only the last adjacent one supplies the body.
+            let last_adjacent = token_ops
+                .get(k + 1)
+                .is_none_or(|next| *next != token_ops[k] + 2);
+            match owners[k] {
+                HeredocOwner::ExecutesStdin if last_adjacent => {
+                    if !header.ends_with([' ', '\t', '(', ';', '&', '|']) {
+                        header.push(' ');
+                    }
+                    let quoted = bodies[k].join("\n").replace('\'', "'\"'\"'");
+                    header.push_str(&format!("-c '{quoted}'"));
                 }
-                let quoted = bodies[k].join("\n").replace('\'', "'\"'\"'");
-                header.push_str(&format!("-c '{quoted}'"));
+                // A forwarding filter passes the body to its downstream
+                // consumer: attach it as that consumer's `-c` body
+                // (`cat <<C | sh` runs the body, exactly like `sh -c '…'`).
+                HeredocOwner::ForwardsStdin if last_adjacent => {
+                    let tail = &line[byte_cursor..];
+                    if let Some(offset) = tail_consumer_insert_offset(tail, spells_shell_stdin) {
+                        let quoted = bodies[k].join("\n").replace('\'', "'\"'\"'");
+                        let end = byte_cursor + offset;
+                        header.push_str(&line[byte_cursor..end]);
+                        header.push_str(&format!(" -c '{quoted}'"));
+                        byte_cursor = end;
+                    }
+                }
+                _ => {}
             }
         }
         header.push_str(&line[byte_cursor..]);
@@ -446,4 +456,42 @@ fn shell_source_without_heredoc_payloads(source: &str) -> String {
         index += original_span;
     }
     output.join("\n")
+}
+
+/// Byte offset just past the pipeline tail's first word when that word
+/// spells a shell interpreter reading stdin (`| sh`, `|& bash`, `| (sh)`) —
+/// where a forwarded heredoc body becomes the consumer's `-c` body. Only
+/// PIPELINE syntax is crossed: a forwarded body flows through `|`, `|&`,
+/// and group opens, never across the list separators `;`/`&&`/`||`, which
+/// leave the body unconsumed. The word ends at the next operator or
+/// whitespace.
+fn tail_consumer_insert_offset(
+    tail: &str,
+    spells_shell_stdin: &dyn Fn(&str) -> bool,
+) -> Option<usize> {
+    let bytes = tail.as_bytes();
+    let mut i = 0usize;
+    loop {
+        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'(' | b'{') {
+            i += 1;
+        }
+        if bytes.get(i) == Some(&b'|') {
+            i += 1;
+            if bytes.get(i) == Some(&b'&') {
+                i += 1; // `|&` pipes stdout and stderr alike
+            }
+        } else {
+            break;
+        }
+    }
+    let start = i;
+    while i < bytes.len()
+        && !matches!(
+            bytes[i],
+            b' ' | b'\t' | b'\n' | b'|' | b'&' | b';' | b')' | b'}' | b'<' | b'>'
+        )
+    {
+        i += 1;
+    }
+    (i > start && spells_shell_stdin(&tail[start..i])).then_some(i)
 }

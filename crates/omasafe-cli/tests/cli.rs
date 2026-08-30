@@ -1363,6 +1363,37 @@ fn h3_benign_scripts_fixture_stays_finding_free() {
 }
 
 #[test]
+fn h3_script_fixture_pins_false_positive_and_false_negative() {
+    // One fixture holding BOTH directions of the round-12 review: the
+    // multiline quoted eval must fire only after logical-source assembly
+    // (false-negative guard), while option arity, operand precedence, and
+    // heredoc data must stay silent through full-file analysis
+    // (false-positive guard).
+    let report = scan_h3_fixture("script-fp-fn");
+    let analysis = &report["result"]["analysis"];
+    let findings = analysis["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0]["rule_id"], "oma.script.download-execute");
+    assert_eq!(findings[0]["severity"], "high");
+    assert!(
+        findings[0]["evidence"]
+            .as_str()
+            .unwrap()
+            .starts_with("download-execute"),
+        "{findings:?}"
+    );
+    assert!(
+        analysis["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|capability| capability["capability"] == "network-access"),
+        "{:?}",
+        analysis["capabilities"]
+    );
+}
+
+#[test]
 fn equivalence_staleness_is_disclosed_when_cached_snapshot_moves() {
     let temp = tempfile::TempDir::new().unwrap();
     fs::write(temp.path().join("Main.qml"), "Text {}\n").unwrap();
