@@ -2354,3 +2354,61 @@ cargo test --workspace
 ./scripts/generate-cli-assets.sh --check                 # exit 0
 scripts/determinism-canary.sh                            # exit 0
 ```
+
+## v0.2.1 H3 — Review Response (round 13: heredoc body isolation, xargs batch/replace model)
+
+Status: **complete**
+
+Round-13 review found five adjacent regressions (three P1, two P2) in the
+round-12 neighborhoods. All fixed and pinned in
+`detect::round_thirteen_tests`:
+
+1. **Kept heredoc bodies contaminated each other (P1, false negative).**
+   Converting every attached body to a keep — so kept lines could hold
+   their physical positions — concatenated independently executed shell
+   programs into ONE synthetic source: with `cat <<A | sh -c sh; sh <<B`,
+   an unmatched quote in A swallowed B, hiding a real `curl … | sh`.
+   Kept bodies are no longer in-stream text: the heredoc pass returns each
+   out-of-band body (indirect stdin-to-code consumer, xargs-processed
+   input) as its own unit group, assembled in isolation and offset to the
+   body's first physical line. Separately executed programs never share a
+   parsing unit, and kept lines keep their line attribution. The
+   attached-to-keep conversion is gone: attached bodies grow the header
+   and the blank sections absorb the surplus uniformly.
+2. **`-d`/`-0` combined with `-n` kept only the first item globally
+   (P1, false negative).** GNU xargs executes the first item of EVERY
+   batch. Delimiter mode now carries `-n` (`Whole` gained
+   `per_invocation`; `-n` retunes word and delimiter modes), and the
+   retained items are the first of each batch (`xargs -d, -n2 sh -c`
+   executes the second batch's body).
+3. **Bare `--replace` consumed the wrapped command (P1, false
+   negative).** GNU `--replace[=STR]` takes its value only after `=` and
+   defaults to `{}`. Fixed in all three places that modeled the arity:
+   `xargs_placeholder` (bare → `{}`), `xargs_wrapped_command` (no separate
+   value word), and the landing scan (no `advance = 2`).
+4. **`-I`/`-L`/`-n` precedence was not last-option-wins (P2, false
+   positive).** GNU xargs warns and honors the LAST of the three. The
+   placeholder scan now drops a placeholder overridden by a later
+   `-n`/`-L`/`--max-args`/`--max-lines` (a later `-I` restores it), and
+   `-n` replaces line mode instead of being refused — `xargs -I{} -n2
+   sh -c '{}'` is silent, `-n2 -I{}` still fires.
+5. **Blank lines consumed `-L` capacity (P2, false positive).** GNU `-L`
+   batches nonblank lines: a blank line neither fills a batch nor starts
+   one unless a trailing-blank line logically continues onto it. The
+   grouping now skips standalone blank lines, so the model's batch
+   boundaries match runtime invocations.
+
+The `-L` work also pinned a model detail the new tests encode: `-L`
+word-splits each logical line and the batch's first WORD item becomes the
+`-c` body, so an unquoted pipeline line executes only its first word
+(`sh -c curl …`) — the pipeline must be quoted to run as one item.
+
+Full verification re-run (both feature configurations):
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+./scripts/generate-cli-assets.sh --check                 # exit 0
+scripts/determinism-canary.sh                            # exit 0
+```

@@ -43,6 +43,10 @@ pub(in crate::detect) enum ShellToken {
         /// or double-quoted `$`/backtick expansion, or a captured
         /// substitution — so the value is not statically known text.
         dynamic: bool,
+        /// Byte span of the word's raw spelling in the tokenized text
+        /// (quotes and escapes included), so a rewrite can anchor at the
+        /// exact source position the word occupies.
+        span: (usize, usize),
     },
     Operator(String),
 }
@@ -59,6 +63,14 @@ impl ShellToken {
         match self {
             ShellToken::Operator(op) => Some(op),
             ShellToken::Word { .. } => None,
+        }
+    }
+
+    /// The word's raw byte span in the tokenized text; `None` for operators.
+    pub(in crate::detect) fn span(&self) -> Option<(usize, usize)> {
+        match self {
+            ShellToken::Word { span, .. } => Some(*span),
+            ShellToken::Operator(_) => None,
         }
     }
 }
@@ -370,6 +382,7 @@ fn read_word(input: &str, start: usize) -> (ShellToken, usize) {
             value: String::from_utf8_lossy(&value).into_owned(),
             substitutions,
             dynamic,
+            span: (start, i),
         },
         i,
     )

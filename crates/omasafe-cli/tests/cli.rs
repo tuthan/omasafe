@@ -1375,6 +1375,16 @@ fn h3_script_fixture_pins_false_positive_and_false_negative() {
     assert_eq!(findings.len(), 1, "{findings:?}");
     assert_eq!(findings[0]["rule_id"], "oma.script.download-execute");
     assert_eq!(findings[0]["severity"], "high");
+    // The line pins WHICH fixture line fired: the intended positive is the
+    // eval unit starting on line 4, so a vanished positive replaced by a
+    // false positive on a guard line (option arity, heredoc data) can no
+    // longer satisfy this test.
+    assert_eq!(findings[0]["line"], 4, "{findings:?}");
+    assert_eq!(
+        findings[0]["explanation"],
+        "A bundled script pipes downloaded content straight into a shell or interpreter.",
+        "{findings:?}"
+    );
     assert!(
         findings[0]["evidence"]
             .as_str()

