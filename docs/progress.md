@@ -2461,3 +2461,62 @@ cargo test --workspace                                   # both configs
 scripts/determinism-canary.sh                            # exit 0
 git diff --check                                         # clean
 ```
+
+## Plan A4 — Detector Family Extraction
+
+Status: **complete**
+
+Behavior-preserving extraction (Stage A step 5 of
+[`detect-rs-maintenance-plan.md`](detect-rs-maintenance-plan.md)), A2/A3
+conventions unchanged: bodies moved verbatim, no renames, visibility scoped
+to `pub(in crate::detect)`, facade re-imports explicitly.
+
+- `detect/shell/effects.rs` (716 lines): the stdin/stdout/code-execution
+  effect model — `StdinBehavior`, `segment_stdin_behavior`, the
+  producer/consumer reachability walks (`segment_has_live_producer`,
+  `pipeline_has_live_producer`, `stdout_reaches`,
+  `segment_stdout_preserved`, the compound-group stdin walks),
+  `ShellSummary`/`static_body_summary`, and the fetch/decode command
+  classifications (`command_fetches`, `command_decodes`,
+  `command_is_decode_mode`) shared by the families.
+- `detect/shell/xargs.rs` (808 lines): the GNU xargs input model (option
+  area, replacement placeholder, batch/delimiter modes, item splitting,
+  landing classification). Split from effects because the combined file
+  crossed the plan's ~1,500-line module ceiling; the model has exactly two
+  external callers (`stdin_code_consumer`, the facade's forwarded-heredoc
+  fate) and charges no analysis budget.
+- `detect/shell/egress.rs` (227 lines): fetch attribution — the
+  executed-path walk over statements, segments, compound groups, and
+  active substitutions (`tokens_fetch_egress`), the segment/group command
+  search, and `script_body_fetches` (the `-c`-body egress entry the QML
+  argv path shares).
+- `detect/shell/consumption.rs` (418 lines): download/decode execution
+  pairing — `shell_consumption_findings` and its arithmetic/group/
+  substitution recursions, `consumed_substitutions`, the
+  fetch/decoder-to-interpreter pipeline pairing, and per-line finding
+  deduplication.
+- `detect/shell/indicators.rs` (99 lines): `reverse_shell_spelling` and
+  the shared-temporary-path predicates (`segment_has_shared_temp_path`,
+  `writable_shared_temp_mode`, `chmod_relaxes_shared_temp`) — pure
+  predicates, never emitting findings themselves.
+
+Facade coupling made explicit: `ResultParts` (+ its `rule_id`/
+`semantic_value` fields), `parts`, `lower_contains`, and the four shell
+rule constants are now `pub(in crate::detect)` so the families construct
+findings without duplicating facade helpers. The heredoc-ownership
+closures, `sink_head`, `analyze_script_source`, and
+`disclose_budget_limitation` remain facade glue. `detect.rs` is now
+8,741 lines (from 11,806 at A2 completion), of which ~5,800 are test
+modules A5 will move last. Item-signature identity across the move was
+checked mechanically.
+
+Full verification gate (both feature configurations):
+
+```text
+cargo fmt --all -- --check                               # exit 0
+cargo clippy --workspace --all-targets -- -D warnings    # both configs
+cargo test --workspace                                   # both configs
+./scripts/generate-cli-assets.sh --check                 # exit 0
+scripts/determinism-canary.sh                            # exit 0
+git diff --check                                         # clean
+```
