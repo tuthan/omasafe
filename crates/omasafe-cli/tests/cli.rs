@@ -1404,6 +1404,33 @@ fn h3_script_fixture_pins_false_positive_and_false_negative() {
 }
 
 #[test]
+fn h3_heredoc_ownership_fixture_pins_continued_owner_and_grouped_data() {
+    // One fixture holding BOTH directions of the Stage A ownership review:
+    // a heredoc whose owner sits on the continued line must fire (the
+    // classifier sees the complete command), while a grouped data heredoc
+    // and a non-adjacent same-command override must stay silent.
+    let report = scan_h3_fixture("heredoc-ownership");
+    let analysis = &report["result"]["analysis"];
+    let findings = analysis["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0]["rule_id"], "oma.script.download-execute");
+    assert_eq!(findings[0]["severity"], "high");
+    // The finding pins the continued owner's unit: it starts on the `sh \`
+    // line, so a vanished positive replaced by a false positive on a guard
+    // line cannot satisfy this test.
+    assert_eq!(findings[0]["line"], 4, "{findings:?}");
+    assert!(
+        analysis["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|capability| capability["capability"] == "network-access"),
+        "{:?}",
+        analysis["capabilities"]
+    );
+}
+
+#[test]
 fn equivalence_staleness_is_disclosed_when_cached_snapshot_moves() {
     let temp = tempfile::TempDir::new().unwrap();
     fs::write(temp.path().join("Main.qml"), "Text {}\n").unwrap();

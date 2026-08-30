@@ -1,8 +1,12 @@
 //! Shell logical-source assembly: physical lines become whole logical
 //! command units, with comments applied statefully and heredoc payloads
-//! kept out of top-level command scanning. Bodies that execute out-of-band
-//! come back as isolated unit groups: separately executed programs never
-//! share a parsing unit.
+//! kept out of top-level command scanning. Heredoc headers are classified
+//! with their complete continued command — the owning word may sit on an
+//! earlier line joined by an escaped newline, an open quote, or a trailing
+//! operator — heredocs inside compound groups are captured, and later
+//! heredocs of the same command override earlier ones by command
+//! ownership. Bodies that execute out-of-band come back as isolated unit
+//! groups: separately executed programs never share a parsing unit.
 //!
 //! This module depends only on the lexer. Heredoc ownership policy — what
 //! the redirect-owning command does with the body — and the downstream
@@ -89,56 +93,86 @@ pub(in crate::detect) fn shell_logical_units(
     units
 }
 
-/// The unit-assembly loop over already-rewritten shell text. Body texts go
-/// through the same loop verbatim — a body is scanned like any other shell
-/// source, with no heredoc rewriting of its own.
-fn assemble_units(source: &str) -> Vec<(u32, String)> {
-    let mut units: Vec<(u32, String)> = Vec::new();
-    let mut text = String::new();
-    let mut start_line = 1u32;
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut in_backtick = false;
-    let mut open = false;
-    for (index, raw_line) in source.lines().enumerate() {
-        if !open {
-            start_line = index as u32 + 1;
+/// The unit-assembly state machine over already-rewritten shell text:
+/// physical lines are fed one at a time, and a completed logical unit is
+/// returned whenever a line closes one. A unit continues across escaped
+/// newlines (backslash-newline removed, no byte inserted), trailing
+/// `|`/`|&`/`&&`/`||` operators, and open quotes, backticks, or `(`/`{`
+/// groups, so a pipeline split over physical lines tokenizes whole
+/// (`curl URL \` + `| sh`, `curl URL |` + `sh`). Comments are applied
+/// statefully along the way — a `#` at a word boundary drops the rest of
+/// its line, and a backslash-newline inside a comment never continues.
+/// Body texts go through the same machine verbatim — a body is scanned
+/// like any other shell source, with no heredoc rewriting of its own.
+///
+/// The heredoc pass drives a SECOND instance over the original source so
+/// a heredoc header can be classified with its COMPLETE continued
+/// command: the owning word may sit on an earlier line (`sh \` + `<<C`),
+/// where the header line alone carries no command at all.
+#[derive(Clone)]
+struct UnitAssembler {
+    /// Assembled text of the currently open unit (empty when closed).
+    text: String,
+    start_line: u32,
+    open: bool,
+    in_single: bool,
+    in_double: bool,
+    in_backtick: bool,
+}
+
+impl UnitAssembler {
+    fn new() -> Self {
+        Self {
+            text: String::new(),
+            start_line: 1,
+            open: false,
+            in_single: false,
+            in_double: false,
+            in_backtick: false,
+        }
+    }
+
+    /// Feed one physical line (1-based `number`). Returns the completed
+    /// unit when this line closes one.
+    fn feed(&mut self, number: u32, raw_line: &str) -> Option<(u32, String)> {
+        if !self.open {
+            self.start_line = number;
         }
         let mut escaped_newline = false;
         let mut boundary = true; // a line start is a word boundary for `#`
         let mut characters = raw_line.chars().peekable();
         while let Some(character) = characters.next() {
-            if in_single {
+            if self.in_single {
                 if character == '\'' {
-                    in_single = false;
+                    self.in_single = false;
                 }
-                text.push(character);
+                self.text.push(character);
                 boundary = false;
                 continue;
             }
-            if in_backtick {
+            if self.in_backtick {
                 if character == '`' {
-                    in_backtick = false;
+                    self.in_backtick = false;
                 }
-                text.push(character);
+                self.text.push(character);
                 boundary = false;
                 continue;
             }
-            if in_double {
+            if self.in_double {
                 if character == '\\' {
                     match characters.next() {
                         // A backslash-newline continues even inside quotes.
                         None => escaped_newline = true,
                         Some(next) => {
-                            text.push(character);
-                            text.push(next);
+                            self.text.push(character);
+                            self.text.push(next);
                         }
                     }
                 } else if character == '"' {
-                    in_double = false;
-                    text.push(character);
+                    self.in_double = false;
+                    self.text.push(character);
                 } else {
-                    text.push(character);
+                    self.text.push(character);
                 }
                 boundary = false;
                 continue;
@@ -147,8 +181,8 @@ fn assemble_units(source: &str) -> Vec<(u32, String)> {
                 match characters.next() {
                     None => escaped_newline = true,
                     Some(next) => {
-                        text.push(character);
-                        text.push(next);
+                        self.text.push(character);
+                        self.text.push(next);
                     }
                 }
                 boundary = false;
@@ -159,60 +193,80 @@ fn assemble_units(source: &str) -> Vec<(u32, String)> {
             if character == '#' && boundary {
                 break;
             }
-            text.push(character);
+            self.text.push(character);
             boundary = matches!(character, ' ' | '\t' | ';' | '&' | '|' | '(');
             match character {
-                '\'' => in_single = true,
-                '"' => in_double = true,
-                '`' => in_backtick = true,
+                '\'' => self.in_single = true,
+                '"' => self.in_double = true,
+                '`' => self.in_backtick = true,
                 _ => {}
             }
         }
         if escaped_newline {
-            open = true; // the backslash-newline is removed: join directly
-            continue;
+            self.open = true; // the backslash-newline is removed: join directly
+            return None;
         }
         // The lexer, rather than raw bytes, decides whether a compound list
         // remains open. In particular `foo{` and an escaped `\\|` are words,
         // not group/pipeline syntax.
         let token_depth =
-            tokenize(&text)
+            tokenize(&self.text)
                 .iter()
                 .fold(0i32, |depth, token| match token.operator() {
                     Some("(" | "{" | "((") => depth + 1,
                     Some(")" | "}" | "))") => (depth - 1).max(0),
                     _ => depth,
                 });
-        open = in_single
-            || in_double
-            || in_backtick
+        self.open = self.in_single
+            || self.in_double
+            || self.in_backtick
             || token_depth > 0
-            || trailing_pipeline_operator(&text);
-        if open {
+            || trailing_pipeline_operator(&self.text);
+        if self.open {
             // A newline inside an open quote or backtick is body DATA: the
             // quoted text stays whole, and whatever reparses it (an eval or
             // `-c` body, a substitution interior) reads the newline as its
             // own statement separator. Inside a compound list a bare newline
             // separates statements; a grammar-required operator continuation
             // is whitespace instead.
-            if in_single || in_double || in_backtick {
-                text.push('\n');
-            } else if token_depth > 0 && !trailing_pipeline_operator(&text) {
-                text.push(';');
+            if self.in_single || self.in_double || self.in_backtick {
+                self.text.push('\n');
+            } else if token_depth > 0 && !trailing_pipeline_operator(&self.text) {
+                self.text.push(';');
             } else {
-                text.push(' ');
+                self.text.push(' ');
             }
-        } else if !text.trim().is_empty() {
-            let assembled = std::mem::take(&mut text);
-            units.push((start_line, assembled.trim_end().to_owned()));
-            in_single = false;
-            in_double = false;
-            in_backtick = false;
+            None
+        } else if !self.text.trim().is_empty() {
+            let assembled = std::mem::take(&mut self.text);
+            self.in_single = false;
+            self.in_double = false;
+            self.in_backtick = false;
+            Some((self.start_line, assembled.trim_end().to_owned()))
+        } else {
+            None
         }
     }
-    if !text.trim().is_empty() {
-        units.push((start_line, text.trim_end().to_owned()));
+
+    /// Flush a trailing open unit at the end of the source.
+    fn finish(self) -> Vec<(u32, String)> {
+        if self.text.trim().is_empty() {
+            Vec::new()
+        } else {
+            vec![(self.start_line, self.text.trim_end().to_owned())]
+        }
     }
+}
+
+fn assemble_units(source: &str) -> Vec<(u32, String)> {
+    let mut assembler = UnitAssembler::new();
+    let mut units = Vec::new();
+    for (index, raw_line) in source.lines().enumerate() {
+        if let Some(unit) = assembler.feed(index as u32 + 1, raw_line) {
+            units.push(unit);
+        }
+    }
+    units.extend(assembler.finish());
     units
 }
 
@@ -226,12 +280,16 @@ struct HeredocRedirect {
 }
 
 /// Every stdin heredoc redirection (`<<`/`<<-`) in one header line, in order.
-/// The scan skips quoted regions, escapes, and balanced parentheses so a
-/// quoted `<<`, a here-string `<<<`, or text inside `$( … )`/`( … )` never
-/// matches, and applies `redirect_operator_at` — the same classifier the
-/// lexer uses — so fd-prefixed forms (`2<<X`, other descriptors) stay data.
-/// `None` when the raw scan and the token stream disagree: the line is then
-/// left untouched rather than rewritten on a misunderstanding.
+/// The scan skips quoted regions, escapes, and command-substitution
+/// interiors so a quoted `<<`, a here-string `<<<`, or text inside
+/// `$( … )` never matches, and applies `redirect_operator_at` — the same
+/// classifier the lexer uses — so fd-prefixed forms (`2<<X`, other
+/// descriptors) stay data. Compound groups are NOT skipped: a heredoc of
+/// a grouped command is a real heredoc (`(cat <<C)` reads its body as
+/// data, `(sh <<C)` executes it), and the caller's raw-scan/token
+/// agreement check covers anything the two views disagree on. `None` when
+/// the raw scan and the token stream disagree: the line is then left
+/// untouched rather than rewritten on a misunderstanding.
 fn heredoc_redirects(line: &str, tokens: &[ShellToken]) -> Option<Vec<HeredocRedirect>> {
     let token_ops: Vec<usize> = tokens
         .iter()
@@ -278,10 +336,6 @@ fn heredoc_redirects(line: &str, tokens: &[ShellToken]) -> Option<Vec<HeredocRed
                 i += 1;
             }
             _ => {
-                if bytes[i] == b'(' {
-                    i = skip_balanced_parens(bytes, i);
-                    continue;
-                }
                 if bytes[i] == b'$' && bytes.get(i + 1) == Some(&b'(') {
                     i = skip_balanced_parens(bytes, i + 1);
                     continue;
@@ -386,6 +440,16 @@ fn delimiter_word_span(bytes: &[u8], mut i: usize) -> Option<(usize, usize)> {
 /// Delimiters are tokenized, so quotes are removed only for comparison;
 /// `<<-` accepts leading tabs on its terminator.
 ///
+/// Ownership is classified against the COMPLETE continued command, not the
+/// bare header line: a heredoc operator may sit on its own physical line
+/// while the owning word sits on an earlier one joined by an escaped
+/// newline, an open quote, or a trailing operator (`sh \` + `<<C`).
+///
+/// Later heredocs of the SAME command override earlier stdin, so only each
+/// command's last heredoc supplies its body — decided by command ownership
+/// across list and pipeline separators, not token adjacency
+/// (`sh <<A -x <<B` still runs B, not A).
+///
 /// Bodies that execute out-of-band — verbatim through an indirect
 /// stdin-to-code consumer, or as the consumer's processed input — are
 /// returned SEPARATELY (with the body's first physical line) instead of
@@ -393,7 +457,8 @@ fn delimiter_word_span(bytes: &[u8], mut i: usize) -> Option<(usize, usize)> {
 /// share a parsing unit. Removed body and terminator lines are replaced
 /// with blank lines so later units keep their physical line numbers.
 /// Unterminated heredocs are left alone: treating the rest of the file as
-/// data would hide live code after malformed input.
+/// data would hide live code after malformed input. A raw-scan/token
+/// disagreement likewise leaves the line alone.
 fn shell_source_without_heredoc_payloads(
     source: &str,
     classifies_owner: &dyn Fn(&[ShellToken], usize) -> HeredocOwner,
@@ -403,6 +468,10 @@ fn shell_source_without_heredoc_payloads(
     let mut output = Vec::new();
     let mut kept_bodies: Vec<(u32, String)> = Vec::new();
     let mut index = 0usize;
+    // Logical-unit state over the EMITTED text — original lines and
+    // rewritten headers, never heredoc bodies — so classification sees the
+    // same continued command the final assembly will.
+    let mut context = UnitAssembler::new();
     'lines: while index < lines.len() {
         let line = lines[index];
         let tokens = tokenize(line);
@@ -410,6 +479,7 @@ fn shell_source_without_heredoc_payloads(
             heredoc_redirects(line, &tokens).filter(|redirects| !redirects.is_empty())
         else {
             output.push(line.to_owned());
+            context.feed(index as u32 + 1, line);
             index += 1;
             continue;
         };
@@ -420,10 +490,19 @@ fn shell_source_without_heredoc_payloads(
                 matches!(token.operator(), Some("<<" | "<<-")).then_some(token_index)
             })
             .collect();
+        // The rewrite aligns the raw scan with the token stream one to one;
+        // anything else leaves the line untouched.
+        if redirects.len() != token_ops.len() {
+            output.push(line.to_owned());
+            context.feed(index as u32 + 1, line);
+            index += 1;
+            continue;
+        }
         let mut delimiters = Vec::with_capacity(redirects.len());
         for &op_index in &token_ops {
             let Some(word) = tokens.get(op_index + 1).and_then(ShellToken::word) else {
                 output.push(line.to_owned());
+                context.feed(index as u32 + 1, line);
                 index += 1;
                 continue 'lines;
             };
@@ -457,12 +536,38 @@ fn shell_source_without_heredoc_payloads(
         }
         if !terminated {
             output.push(line.to_owned());
+            context.feed(index as u32 + 1, line);
             index += 1;
             continue;
         }
-        let owners: Vec<HeredocOwner> = (0..redirects.len())
-            .map(|k| classifies_owner(&tokens, token_ops[k]))
+        // Ownership is classified over the JOINED continued command: probe
+        // the unit state with the raw header line, then take this line's
+        // heredoc operators from the joined stream's final ones (the prefix
+        // carries none — earlier heredocs were rewritten away).
+        let mut probe = context.clone();
+        let completed = probe.feed(index as u32 + 1, line);
+        let context_text = match completed {
+            Some((_, text)) => text,
+            None => probe.text.clone(),
+        };
+        let joined = tokenize(&context_text);
+        let joined_ops: Vec<usize> = joined
+            .iter()
+            .enumerate()
+            .filter_map(|(token_index, token)| {
+                matches!(token.operator(), Some("<<" | "<<-")).then_some(token_index)
+            })
             .collect();
+        let Some(base) = joined_ops.len().checked_sub(redirects.len()) else {
+            output.push(line.to_owned());
+            context.feed(index as u32 + 1, line);
+            index += 1;
+            continue;
+        };
+        let owners: Vec<HeredocOwner> = (0..redirects.len())
+            .map(|k| classifies_owner(&joined, joined_ops[base + k]))
+            .collect();
+        let command_of = command_ordinals(&tokens, &token_ops);
         // Dispositions decided BEFORE the header is built: `-c` attaches
         // embed the body into the header and grow it over the span's early
         // lines; every other body — data or out-of-band executed — is
@@ -490,12 +595,8 @@ fn shell_source_without_heredoc_payloads(
             .map(|_| BodyDisposition::Blank)
             .collect();
         for (k, redirect) in redirects.iter().enumerate() {
-            // Later redirects of the same command override earlier stdin, so
-            // only the last adjacent one supplies the body.
-            let last_adjacent = token_ops
-                .get(k + 1)
-                .is_none_or(|next| *next != token_ops[k] + 2);
-            if !last_adjacent {
+            // Overridden by a later heredoc of the same command.
+            if (k + 1..redirects.len()).any(|later| command_of[later] == command_of[k]) {
                 continue;
             }
             let body = bodies[k].join("\n");
@@ -563,6 +664,10 @@ fn shell_source_without_heredoc_payloads(
         // their physical line numbers whatever mix of fates the line had.
         let original_span = 1 + bodies.iter().map(Vec::len).sum::<usize>() + redirects.len();
         let mut surplus = (1 + header.matches('\n').count()).saturating_sub(1);
+        // The unit state continues from the REWRITTEN header: its trailing
+        // bytes match the original tail, and attached `-c` bodies carry
+        // balanced quotes, so later continuations join the same command.
+        context.feed(index as u32 + 1, &header);
         output.push(header);
         for body in bodies.iter() {
             let eaten = surplus.min(body.len());
@@ -575,4 +680,29 @@ fn shell_source_without_heredoc_payloads(
         index += original_span;
     }
     (output.join("\n"), kept_bodies)
+}
+
+/// Pipeline-segment ordinal of each heredoc operator on the header line:
+/// every list separator (`;`, `&&`, `||`, `&`, `|`, `|&`) starts a new
+/// command at any group depth — inside a compound group the group's own
+/// statements are separate commands — so a heredoc is overridden only by a
+/// later heredoc of the same command.
+fn command_ordinals(tokens: &[ShellToken], ops: &[usize]) -> Vec<usize> {
+    let mut ordinals = Vec::with_capacity(ops.len());
+    let mut ordinal = 0usize;
+    let mut depth = 0i32;
+    let mut next = 0usize;
+    for (index, token) in tokens.iter().enumerate() {
+        if next < ops.len() && ops[next] == index {
+            ordinals.push(ordinal);
+            next += 1;
+        }
+        match token.operator() {
+            Some("(" | "{" | "((") => depth += 1,
+            Some(")" | "}" | "))") => depth = (depth - 1).max(0),
+            Some(";" | "&&" | "||" | "&" | "|" | "|&") => ordinal += 1,
+            _ => {}
+        }
+    }
+    ordinals
 }

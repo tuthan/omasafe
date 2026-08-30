@@ -2583,3 +2583,58 @@ cargo test --workspace                                   # both configs
 scripts/determinism-canary.sh                            # exit 0
 git diff --check                                         # clean
 ```
+
+## Stage A Review Round — Four Behavioral Fixes in the Heredoc and xargs Models
+
+Status: **complete**
+
+Review of the integrated Stage A range (39b8703..7a5db6d) found four
+behavioral defects, all reproduced first, fixed, and pinned at the lowest
+responsible layer plus the end-to-end artifact layer
+(`detect::tests::round_fourteen_tests`, 14 cases) and through a new CLI
+fixture `fixtures/plugins/heredoc-ownership/` holding both directions of
+the ownership round in one plugin.
+
+1. **xargs replacement mode died under `-n1` (P1, false negative).**
+   `xargs_placeholder` cleared replacement for every later `-n`, but GNU
+   xargs preserves `-I` specifically under `-n1`/`--max-args=1` (one whole
+   item per invocation is what `-I` already means) while `-L` clears at
+   every count — probed against the local GNU xargs and mirrored exactly
+   in both `xargs_placeholder` and the landing model
+   (`set_word_batch` keeps whole-line replacement mode for `-n1`).
+   `curl URL | xargs -I{} -n1 sh -c '{}'` now fires download-execute.
+2. **Heredoc ownership was lost across continued command lines (P1, false
+   negative).** The heredoc pass tokenized each physical line, so with
+   `sh \` + `<<C` the classifier saw no owner and dropped executable code
+   as data. The unit-assembly state machine is now factored into a
+   reusable `UnitAssembler`; the heredoc pass drives a second instance
+   over the emitted text and classifies each header against its COMPLETE
+   continued command (escaped newline, open quote, or trailing operator
+   continuations), with this line's operators mapped to the joined
+   stream's final heredoc tokens.
+3. **Heredocs inside compound groups fell through as top-level code (P2,
+   false positive).** The raw heredoc scan skipped balanced parentheses
+   entirely, so `(cat <<C)` never captured its body and the payload
+   analyzed as a standalone unit. The scan now skips only
+   command-substitution interiors (`$(`) and quoted/backtick regions; a
+   raw-scan/token agreement check (count equality) guards the rewrite,
+   leaving the line alone on any disagreement. `(cat <<C)` is data,
+   `(sh <<C)` executes through the real ownership path.
+4. **Same-command heredoc override used token adjacency (P2, false
+   positive).** `sh <<A -x <<B` marked BOTH bodies executable because the
+   redirects were not adjacent. Override is now decided by command
+   ownership — a pipeline-segment ordinal per heredoc operator, where
+   every list separator at any group depth starts a new command — so only
+   a later heredoc of the same command overrides (`sh <<A; sh <<B` keeps
+   both, `sh <<A -x <<B` keeps B).
+
+Full verification gate (both feature configurations):
+
+```text
+cargo fmt --all -- --check                               # exit 0
+cargo clippy --workspace --all-targets -- -D warnings    # both configs
+cargo test --workspace                                   # both configs
+./scripts/generate-cli-assets.sh --check                 # exit 0
+scripts/determinism-canary.sh                            # exit 0
+git diff --check                                         # clean
+```

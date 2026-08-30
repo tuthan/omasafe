@@ -87,8 +87,10 @@ pub(in crate::detect) fn xargs_feeds_stdin_code(command: &ScriptCommand) -> bool
 /// survives to runtime: xargs substitutes it with each input item wherever
 /// it appears in the initial arguments. GNU xargs warns and honors the
 /// LAST of `-I`/`-L`/`-n`, so a later batch option overrides replacement
-/// (`-I{} -n2` drops it) and a later `-I` restores it. GNU `--replace`
-/// takes its value only after `=`; the bare form defaults to `{}`.
+/// (`-I{} -n2` drops it) and a later `-I` restores it — except that
+/// `-n1`/`--max-args=1` preserve replacement, since one whole item per
+/// invocation is what `-I` already means. GNU `--replace` takes its value
+/// only after `=`; the bare form defaults to `{}`.
 fn xargs_placeholder(command: &ScriptCommand, wrapped: usize) -> Option<String> {
     let mut placeholder: Option<String> = None;
     let mut index = 0usize;
@@ -104,7 +106,22 @@ fn xargs_placeholder(command: &ScriptCommand, wrapped: usize) -> Option<String> 
                         None => Some("{}".to_owned()),
                     };
                 }
-                "max-args" | "max-lines" => placeholder = None,
+                "max-args" => {
+                    // GNU xargs honors the LAST of `-I`/`-L`/`-n`, but
+                    // replacement mode specifically survives `-n1`
+                    // (`--max-args=1`): one item per invocation is what
+                    // `-I` already means, so the placeholder stays live
+                    // (`xargs -I{} -n1 sh -c '{}'` runs the input). Any
+                    // other count, and `-L` at every count, drops it.
+                    let count = long
+                        .split_once('=')
+                        .map(|(_, value)| value)
+                        .map_or_else(|| command.args.get(index + 1).copied(), Some);
+                    if count != Some("1") {
+                        placeholder = None;
+                    }
+                }
+                "max-lines" => placeholder = None,
                 _ => {}
             }
         } else if arg.len() > 1 && arg.starts_with('-') {
@@ -116,7 +133,16 @@ fn xargs_placeholder(command: &ScriptCommand, wrapped: usize) -> Option<String> 
                         command.args.get(index + 1).map(|value| value.to_string())
                     };
                 }
-                b'n' | b'L' => placeholder = None,
+                flag @ (b'n' | b'L') => {
+                    let count = if arg.len() > 2 {
+                        Some(&arg[2..])
+                    } else {
+                        command.args.get(index + 1).copied()
+                    };
+                    if !(flag == b'n' && count == Some("1")) {
+                        placeholder = None;
+                    }
+                }
                 _ => {}
             }
         }
@@ -450,10 +476,23 @@ impl XargsLanding {
     /// `-n N`: N items per invocation. GNU xargs warns and honors the
     /// LAST of `-I`/`-L`/`-n`: over a line mode word batching replaces it,
     /// while over word/delimiter modes it only retunes the batch size.
+    /// Over the `-I` replacement mode, `-n1` specifically changes nothing
+    /// (GNU preserves replacement under `-n1`): whole lines stay whole.
     fn set_word_batch(&mut self, count: &str) {
         let Ok(n) = count.parse::<usize>() else {
             return;
         };
+        if n == 1
+            && matches!(
+                self.items,
+                XargsItems::Lines {
+                    split: false,
+                    per_invocation: 1,
+                }
+            )
+        {
+            return;
+        }
         match &mut self.items {
             XargsItems::Word { per_invocation } | XargsItems::Whole { per_invocation, .. } => {
                 *per_invocation = Some(n.max(1));
