@@ -2520,3 +2520,66 @@ cargo test --workspace                                   # both configs
 scripts/determinism-canary.sh                            # exit 0
 git diff --check                                         # clean
 ```
+
+## Plan A5 — Test Modules Moved Out of `detect.rs`
+
+Status: **complete**
+
+The test modules (Stage A step "move tests last") left `detect.rs` for a
+behavior-split tree under `detect/tests/`, compiled only in test builds via
+`#[cfg(test)] mod tests;` on the facade. Module bodies moved verbatim with
+two mechanical adjustments:
+
+- every module's `use super::*;` (the facade namespace) became
+  `use crate::detect::*;` — private facade items remain reachable because
+  the test tree is a descendant of `detect`, so no production visibility
+  was widened for tests;
+- the facade `include_str!` for the A1 golden corpus was re-anchored to
+  the moved file (`../golden/fixture-corpus.txt`); the fixture corpus file
+  itself did not move.
+
+One rename for clarity: the original catch-all `mod tests` (the S3
+rule-contract suite) is now `mod rule_contracts`, and its five
+`super::tests::analyze_with` callers (integration and golden tests) were
+updated. The shared `s4_family_tests` runner module kept its name, so the
+sibling `use super::s4_family_tests::{rule_ids, run};` imports are
+untouched. The h3_script_tests module's direct facade references
+(`classify_heredoc_owner`, `forwarded_body_fate`,
+`shell::source::shell_logical_units`) became `crate::detect::` paths.
+
+Ordering note: the maintenance plan's pull-request sequence puts the
+QML/JS and Python frontend extraction (step 6) before this test move
+(step 7). The test move was performed first; it does not block the
+frontend extraction, which keeps working through the facade re-imports.
+
+Layout:
+
+```text
+detect/tests/
+  mod.rs                  # declarations only
+  s4_family_tests.rs      # shared corpus runner helpers
+  rule_contracts.rs       # S3 rule contracts (AST + lexical parity)
+  integration_tests.rs    # analyze_inventory / report shape
+  s4_boundary_tests.rs    # S4 priority surfaces
+  h2_reference_tests.rs   # reference sinks and typed rejections
+  h3_script_tests.rs      # H3 shell families end-to-end
+  golden_tests.rs         # A1 characterization golden
+  round_twelve_tests.rs   # round-12 reopen battery
+  round_thirteen_tests.rs # round-13 regressions
+```
+
+`detect.rs` is now 2,919 lines (from 11,806 at Stage A start) — pure
+production code. The `#[test]` inventory is unchanged (164 in the detect
+tree; per-suite counts identical in both feature configurations:
+201 parser-backed / 191 lexical, with the same 13 workspace suites).
+
+Full verification gate (both feature configurations):
+
+```text
+cargo fmt --all -- --check                               # exit 0
+cargo clippy --workspace --all-targets -- -D warnings    # both configs
+cargo test --workspace                                   # both configs
+./scripts/generate-cli-assets.sh --check                 # exit 0
+scripts/determinism-canary.sh                            # exit 0
+git diff --check                                         # clean
+```
