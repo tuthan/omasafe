@@ -2523,6 +2523,16 @@ results and fail-closed budget behavior across the effect, egress, and
 consumption callers. The remaining work is to cache the full finding summary,
 then have those consumers operate directly on the typed IR nodes.
 
+## Stage B — Direct IR Egress Consumption (2026-08-31)
+
+Status: **in progress — direct command egress slice complete**
+
+`Statement` now retains typed reachability derived from the existing outcome
+model. Shell egress consumes `ShellProgram` command nodes for direct `curl` and
+`wget` detection, including wrapper-unwrapped commands and nested
+subshell/brace bodies. The existing token walk remains the bounded fallback for
+command and process substitutions and static `-c`/`eval` bodies.
+
 ## Review Round Three — Heredoc Body Boundaries and Invalid xargs Counts (2026-08-31)
 
 Status: **complete**

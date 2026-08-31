@@ -18,11 +18,11 @@ use crate::detect::shell::command::{
 };
 use crate::detect::shell::consumption::shell_consumption_findings;
 use crate::detect::shell::effects::{segment_stdin_reaches_interpreter, segment_stdout_preserved};
-use crate::detect::shell::egress::tokens_fetch_egress;
+use crate::detect::shell::egress::{tokens_fetch_egress, unit_has_direct_fetch};
 use crate::detect::shell::interpreter::{
     InterpreterFamily, InterpreterMode, interpreter_family, interpreter_mode,
 };
-use crate::detect::shell::ir::ShellProgram;
+use crate::detect::shell::ir::{LogicalUnit, ShellProgram};
 use crate::detect::shell::lexer::{ShellToken, tokenize};
 use crate::detect::shell::source::shell_logical_units;
 use crate::detect::shell::syntax::{conditional_statements, pipeline_segments};
@@ -244,6 +244,7 @@ pub(in crate::detect) fn analyze_script_source(source: &str, kind: PayloadKind) 
                     line,
                     &tokens,
                     &kind,
+                    None,
                     &mut outcome,
                     &mut budget_exhausted,
                 );
@@ -257,6 +258,7 @@ pub(in crate::detect) fn analyze_script_source(source: &str, kind: PayloadKind) 
                     unit.source(),
                     unit.tokens(),
                     &kind,
+                    Some(unit),
                     &mut outcome,
                     &mut budget_exhausted,
                 );
@@ -279,6 +281,7 @@ fn analyze_script_unit(
     line: &str,
     tokens: &[ShellToken],
     kind: &PayloadKind,
+    shell_unit: Option<&LogicalUnit>,
     outcome: &mut FileOutcome,
     budget_exhausted: &mut bool,
 ) {
@@ -318,7 +321,9 @@ fn analyze_script_unit(
     // substitution is attributed. The budget bounds substitution and group
     // recursion over untrusted text.
     let mut budget = ShellBudget::new();
-    if tokens_fetch_egress(tokens, &mut budget) {
+    let token_fetch_egress = tokens_fetch_egress(tokens, &mut budget);
+    let ir_direct_fetch = shell_unit.is_some_and(unit_has_direct_fetch);
+    if token_fetch_egress || ir_direct_fetch {
         outcome.capabilities.push(occurrence(
             Capability::NetworkAccess,
             language,

@@ -9,11 +9,12 @@ use super::budget::MAX_SHELL_ANALYSIS_DEPTH;
 use super::command::{
     ScriptCommand, command_arguments, command_basename, env_split_string_command,
     is_env_assignment, is_redirect_operator, segment_commands, skip_command_prefixes,
-    skip_wrapper_options,
+    skip_wrapper_options, statement_outcomes,
 };
 use super::lexer::{ShellToken, SubstKind};
 use super::syntax::{
-    GroupKind, conditional_statements, matching_group_close, pipeline_negated, pipeline_segments,
+    GroupKind, Outcomes, conditional_statements, matching_group_close, pipeline_negated,
+    pipeline_segments,
 };
 
 /// The list operator that controls whether a statement may run.
@@ -125,6 +126,10 @@ pub(in crate::detect) struct Pipeline {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::detect) struct Statement {
     pub(in crate::detect) guard: Guard,
+    /// Whether at least one status path reaches this statement. Keeping this
+    /// beside the typed guard lets detector walks skip statically dead
+    /// branches without returning to raw control operators.
+    pub(in crate::detect) reachable: bool,
     pub(in crate::detect) pipelines: Vec<Pipeline>,
 }
 
@@ -182,16 +187,19 @@ fn parse_unit(start_line: u32, source: String) -> LogicalUnit {
 }
 
 fn parse_statements(tokens: &[ShellToken], depth: usize) -> Vec<Statement> {
+    let mut outcomes = Outcomes::ANY;
     conditional_statements(tokens)
         .into_iter()
         .map(|(statement, guard)| {
+            let reachable = outcomes.executes(guard);
             let commands: Vec<CommandNode> = pipeline_segments(statement)
                 .into_iter()
                 .filter(|segment| !segment.is_empty())
                 .map(|segment| parse_command_node(segment, depth))
                 .collect();
-            Statement {
+            let parsed = Statement {
                 guard: Guard::from_operator(guard),
+                reachable,
                 pipelines: if commands.is_empty() {
                     Vec::new()
                 } else {
@@ -200,7 +208,9 @@ fn parse_statements(tokens: &[ShellToken], depth: usize) -> Vec<Statement> {
                         commands,
                     }]
                 },
-            }
+            };
+            outcomes = outcomes.advance(guard, statement_outcomes(statement));
+            parsed
         })
         .collect()
 }

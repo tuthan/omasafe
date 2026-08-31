@@ -9,6 +9,7 @@ use super::budget::ShellBudget;
 use super::command::{ScriptCommand, segment_commands, statement_outcomes};
 use super::effects::command_fetches;
 use super::interpreter::static_command_body;
+use super::ir::{CommandNode, LogicalUnit, Statement};
 use super::lexer::{ShellToken, SubstKind, Substitution, tokenize};
 use super::syntax::{
     GroupKind, Outcomes, conditional_statements, grouped_token_ranges, matching_group_close,
@@ -83,6 +84,33 @@ pub(in crate::detect) fn tokens_fetch_egress(
         return false;
     }
     executed_list_fetch_egress(tokens, budget)
+}
+
+/// Direct command-position fetches are read from the typed shell IR. Nested
+/// substitutions and static bodies still use the token fallback because
+/// their re-parsed text is not yet stored as child IR programs.
+pub(in crate::detect) fn unit_has_direct_fetch(unit: &LogicalUnit) -> bool {
+    statements_have_direct_fetch(&unit.statements)
+}
+
+fn statements_have_direct_fetch(statements: &[Statement]) -> bool {
+    statements.iter().any(|statement| {
+        statement.reachable
+            && statement
+                .pipelines
+                .iter()
+                .any(|pipeline| pipeline.commands.iter().any(node_has_direct_fetch))
+    })
+}
+
+fn node_has_direct_fetch(node: &CommandNode) -> bool {
+    match node {
+        CommandNode::Simple(command) => matches!(command.head.as_str(), "curl" | "wget"),
+        CommandNode::Subshell { body, .. } | CommandNode::BraceGroup { body, .. } => {
+            statements_have_direct_fetch(body)
+        }
+        CommandNode::Arithmetic { .. } | CommandNode::Opaque { .. } => false,
+    }
 }
 
 /// Analyze a re-parsed shell body with the shared bounded cache. The cache is
@@ -240,6 +268,7 @@ pub(in crate::detect) fn script_body_fetches(script: &str) -> (bool, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::detect::shell::ir::ShellProgram;
 
     #[test]
     fn body_egress_summaries_are_reused_for_positive_and_negative_results() {
@@ -260,5 +289,25 @@ mod tests {
         assert!(!body_fetches_egress("echo safe", &mut budget));
         assert_eq!(budget.nodes, nodes_after_safe);
         assert!(!budget.exhausted());
+    }
+
+    #[test]
+    fn typed_ir_direct_fetches_honor_guards_and_compounds() {
+        let cases = [
+            ("false && curl https://example.test/dead", false),
+            ("false || curl https://example.test/live", true),
+            ("sudo -n curl https://example.test/wrapped", true),
+            ("(false && wget https://example.test/dead)", false),
+            ("echo 'curl https://example.test/data'", false),
+        ];
+
+        for (source, expected) in cases {
+            let program = ShellProgram::from_units(vec![(1, source.to_owned())]);
+            assert_eq!(
+                unit_has_direct_fetch(&program.units()[0]),
+                expected,
+                "typed direct-fetch result for {source:?}"
+            );
+        }
     }
 }
