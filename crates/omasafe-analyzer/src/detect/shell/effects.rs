@@ -177,6 +177,26 @@ pub(in crate::detect) fn ir_command_effects(
     })
 }
 
+/// Whether a typed command's behavior depends on the stdin it inherits from
+/// its parent. This intentionally ignores the command site's own redirects;
+/// callers use the answer to compose those redirects with a child summary.
+pub(in crate::detect) fn ir_command_depends_on_inherited_stdin(
+    command: &IrCommand,
+    budget: &mut ShellBudget,
+) -> bool {
+    with_ir_script_command(command, |script_command| {
+        command_effects_with_body_summary(
+            script_command,
+            false,
+            false,
+            command.body.as_ref(),
+            budget,
+        )
+        .stdin
+            != StdinEffect::Unread
+    })
+}
+
 fn with_ir_script_command<T>(command: &IrCommand, f: impl FnOnce(&ScriptCommand) -> T) -> T {
     let args: Vec<&str> = command
         .args
