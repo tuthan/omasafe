@@ -2520,8 +2520,8 @@ retained.
 
 A focused test pins reuse (no second node charge) for positive and negative
 results and fail-closed budget behavior across the effect, egress, and
-consumption callers. The remaining work is to cache the full finding summary,
-then have those consumers operate directly on the typed IR nodes.
+consumption callers. The later finding-tag cache and typed consumer migrations
+are recorded in the subsequent Stage B entries.
 
 ## Stage B — Direct IR Egress Consumption (2026-08-31)
 
@@ -2560,6 +2560,18 @@ which consumes IR reachability for parse-only consumers, guarded branches,
 wrappers, forwarding compounds, and output redirects. Compound producers,
 substitutions, and static re-parsed bodies remain on the bounded token fallback
 until their child programs are stored in the IR.
+
+## Stage B — Static Body Finding Summaries (2026-08-31)
+
+Status: **in progress — completed finding-tag cache slice**
+
+Repeated static `-c`/`eval` bodies now cache the complete shell consumption
+finding tag set after a bounded walk. Cached tags are recreated with the current
+line and download-rule context, so the cache is independent of source
+locations, caller anchoring, and the existing stdin/egress/live-output slots.
+Partial walks are never retained, and an exhausted budget cannot reuse a prior
+finding result. Focused tests cover positive download/decode results, negative
+bodies, re-anchoring, and fail-closed exhaustion.
 
 ## Review Round Three — Heredoc Body Boundaries and Invalid xargs Counts (2026-08-31)
 

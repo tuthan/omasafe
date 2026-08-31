@@ -17,11 +17,21 @@ pub(in crate::detect) struct CachedStdinSummary {
     pub(in crate::detect) forwards_stdin_body: bool,
 }
 
+#[derive(Clone, Copy)]
+pub(in crate::detect) struct CachedFindingSummary {
+    pub(in crate::detect) download_execute: bool,
+    pub(in crate::detect) decode_execute: bool,
+    pub(in crate::detect) reverse_shell: bool,
+    pub(in crate::detect) shared_temp_indicator: bool,
+    pub(in crate::detect) shared_temp_controlled: bool,
+}
+
 struct BodySummaryCacheEntry {
     body: String,
     stdin: Option<CachedStdinSummary>,
     fetch_egress: Option<bool>,
     live_fetch_stdout: Option<bool>,
+    findings: Option<CachedFindingSummary>,
 }
 
 pub(in crate::detect) struct ShellBudget {
@@ -65,7 +75,7 @@ impl ShellBudget {
         if !self.can_cache_body(body) {
             return;
         }
-        self.insert_body_summary(body, Some(summary), None, None);
+        self.insert_body_summary(body, Some(summary), None, None, None);
     }
 
     pub(in crate::detect) fn cached_fetch_egress(&self, body: &str) -> Option<bool> {
@@ -86,7 +96,7 @@ impl ShellBudget {
         if !self.can_cache_body(body) {
             return;
         }
-        self.insert_body_summary(body, None, Some(fetches), None);
+        self.insert_body_summary(body, None, Some(fetches), None, None);
     }
 
     pub(in crate::detect) fn cached_live_fetch_stdout(&self, body: &str) -> Option<bool> {
@@ -109,7 +119,35 @@ impl ShellBudget {
         if !self.can_cache_body(body) {
             return;
         }
-        self.insert_body_summary(body, None, None, Some(reaches_stdout));
+        self.insert_body_summary(body, None, None, Some(reaches_stdout), None);
+    }
+
+    pub(in crate::detect) fn cached_finding_summary(
+        &self,
+        body: &str,
+    ) -> Option<CachedFindingSummary> {
+        self.body_summaries
+            .iter()
+            .find_map(|entry| (entry.body == body).then_some(entry.findings).flatten())
+    }
+
+    pub(in crate::detect) fn cache_finding_summary(
+        &mut self,
+        body: &str,
+        summary: CachedFindingSummary,
+    ) {
+        if let Some(entry) = self
+            .body_summaries
+            .iter_mut()
+            .find(|entry| entry.body == body)
+        {
+            entry.findings = Some(summary);
+            return;
+        }
+        if !self.can_cache_body(body) {
+            return;
+        }
+        self.insert_body_summary(body, None, None, None, Some(summary));
     }
 
     /// Keep the cache bounded by both entry count and source bytes. Bodies
@@ -133,6 +171,7 @@ impl ShellBudget {
         stdin: Option<CachedStdinSummary>,
         fetch_egress: Option<bool>,
         live_fetch_stdout: Option<bool>,
+        findings: Option<CachedFindingSummary>,
     ) {
         self.body_summary_bytes += body.len();
         self.body_summaries.push(BodySummaryCacheEntry {
@@ -140,6 +179,7 @@ impl ShellBudget {
             stdin,
             fetch_egress,
             live_fetch_stdout,
+            findings,
         });
     }
 
