@@ -8,7 +8,7 @@ use super::budget::ShellBudget;
 use super::command::{segment_commands, skip_command_prefixes, statement_outcomes};
 use super::effects::{
     EgressEffect, StdoutEffect, body_live_fetch_stdout, command_decodes, command_fetches,
-    ir_command_effects, ir_node_reaches_interpreter, ir_node_stdout_preserved,
+    ir_command_decodes, ir_command_effects, ir_node_reaches_interpreter, ir_node_stdout_preserved,
     pipeline_has_live_producer, segment_has_live_producer, segment_stdin_reaches_interpreter,
     stdout_reaches,
 };
@@ -52,6 +52,17 @@ pub(in crate::detect) fn shell_consumption_findings(
                 download_rule,
                 number,
                 "download-execute",
+                Confidence::LexicalFallback,
+            ),
+        );
+    }
+    if shell_unit.is_some_and(|unit| typed_decoder_reaches_interpreter(unit, budget)) {
+        push_finding(
+            found,
+            parts(
+                SCRIPT_DECODE_EXECUTE_RULE,
+                number,
+                "decode-execute",
                 Confidence::LexicalFallback,
             ),
         );
@@ -272,19 +283,32 @@ fn typed_fetch_reaches_interpreter(unit: &LogicalUnit, budget: &mut ShellBudget)
         .iter()
         .filter(|statement| statement.reachable)
         .flat_map(|statement| statement.pipelines.iter())
-        .any(|pipeline| typed_pipeline_fetch_reaches_interpreter(pipeline, budget))
+        .any(|pipeline| {
+            typed_pipeline_reaches_interpreter(pipeline, budget, typed_node_has_live_fetch)
+        })
 }
 
-fn typed_pipeline_fetch_reaches_interpreter(
+fn typed_decoder_reaches_interpreter(unit: &LogicalUnit, budget: &mut ShellBudget) -> bool {
+    unit.statements
+        .iter()
+        .filter(|statement| statement.reachable)
+        .flat_map(|statement| statement.pipelines.iter())
+        .any(|pipeline| {
+            typed_pipeline_reaches_interpreter(pipeline, budget, typed_node_has_live_decoder)
+        })
+}
+
+fn typed_pipeline_reaches_interpreter(
     pipeline: &super::ir::Pipeline,
     budget: &mut ShellBudget,
+    producer_predicate: fn(&CommandNode, &mut ShellBudget) -> bool,
 ) -> bool {
     for consumer in 1..pipeline.commands.len() {
         if !ir_node_reaches_interpreter(&pipeline.commands[consumer], budget) {
             continue;
         }
         for producer in 0..consumer {
-            if !typed_node_has_live_fetch(&pipeline.commands[producer], budget) {
+            if !producer_predicate(&pipeline.commands[producer], budget) {
                 continue;
             }
             if pipeline.commands[producer + 1..consumer]
@@ -304,6 +328,13 @@ fn typed_node_has_live_fetch(node: &CommandNode, budget: &mut ShellBudget) -> bo
     };
     let effects = ir_command_effects(command, budget);
     effects.egress == EgressEffect::NetworkFetch && effects.stdout != StdoutEffect::Redirected
+}
+
+fn typed_node_has_live_decoder(node: &CommandNode, budget: &mut ShellBudget) -> bool {
+    let CommandNode::Simple(command) = node else {
+        return false;
+    };
+    ir_command_decodes(command) && ir_node_stdout_preserved(node, budget)
 }
 
 /// Consumption families inside an arithmetic expansion: the expression's
@@ -520,6 +551,31 @@ mod tests {
                 typed_fetch_reaches_interpreter(&program.units()[0], &mut budget),
                 expected,
                 "typed fetch-consumer result for {source:?}"
+            );
+            assert!(!budget.exhausted(), "typed walk exhausted for {source:?}");
+        }
+    }
+
+    #[test]
+    fn typed_decoder_consumers_honor_modes_guards_and_output_redirects() {
+        let cases = [
+            ("base64 -d | sh", true),
+            ("xxd -r | bash", true),
+            ("openssl enc -d | sh", true),
+            ("base64 -d | sh -n", false),
+            ("base64 -d >decoded | sh", false),
+            ("false && base64 -d | sh", false),
+            ("base64 -d | (echo safe; sh)", true),
+            ("base64 -d | (false && sh)", false),
+        ];
+
+        for (source, expected) in cases {
+            let program = ShellProgram::from_units(vec![(1, source.to_owned())]);
+            let mut budget = ShellBudget::new();
+            assert_eq!(
+                typed_decoder_reaches_interpreter(&program.units()[0], &mut budget),
+                expected,
+                "typed decoder-consumer result for {source:?}"
             );
             assert!(!budget.exhausted(), "typed walk exhausted for {source:?}");
         }

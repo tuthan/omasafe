@@ -2549,6 +2549,18 @@ Layer tests cover interpreter modes, dynamic `eval`, forwarding and draining
 groups, guarded branches, and redirect ownership in both feature
 configurations.
 
+## Stage B — Direct IR Decoder Pairing (2026-08-31)
+
+Status: **in progress — typed decoder/producer slice complete**
+
+Decode-execute pairing now reuses typed command nodes for direct decoder
+classification (`base64`, `base32`, `xxd`, and `openssl`) and shared stdout
+effects. Direct fetch and decoder producers share the same typed pipeline walk,
+which consumes IR reachability for parse-only consumers, guarded branches,
+wrappers, forwarding compounds, and output redirects. Compound producers,
+substitutions, and static re-parsed bodies remain on the bounded token fallback
+until their child programs are stored in the IR.
+
 ## Review Round Three — Heredoc Body Boundaries and Invalid xargs Counts (2026-08-31)
 
 Status: **complete**

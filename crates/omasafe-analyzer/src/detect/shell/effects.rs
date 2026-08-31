@@ -161,6 +161,14 @@ pub(in crate::detect) fn ir_command_effects(
     command: &IrCommand,
     budget: &mut ShellBudget,
 ) -> CommandEffects {
+    let stdout_redirected = ir_redirects_move_stdout(&command.redirects);
+    let stdin_redirected = ir_redirects_move_stdin(&command.redirects);
+    with_ir_script_command(command, |script_command| {
+        command_effects_with_redirects(script_command, stdout_redirected, stdin_redirected, budget)
+    })
+}
+
+fn with_ir_script_command<T>(command: &IrCommand, f: impl FnOnce(&ScriptCommand) -> T) -> T {
     let args: Vec<&str> = command
         .args
         .iter()
@@ -176,9 +184,7 @@ pub(in crate::detect) fn ir_command_effects(
         args,
         arg_dynamic,
     };
-    let stdout_redirected = ir_redirects_move_stdout(&command.redirects);
-    let stdin_redirected = ir_redirects_move_stdin(&command.redirects);
-    command_effects_with_redirects(&script_command, stdout_redirected, stdin_redirected, budget)
+    f(&script_command)
 }
 
 fn command_effects_with_redirects(
@@ -429,6 +435,12 @@ pub(in crate::detect) fn command_decodes(command: &ScriptCommand) -> bool {
         "xxd" => command.args.contains(&"-r"),
         _ => false,
     }
+}
+
+/// Apply the decoder classifier to a typed command node without rebuilding
+/// command position or losing word provenance.
+pub(in crate::detect) fn ir_command_decodes(command: &IrCommand) -> bool {
+    with_ir_script_command(command, command_decodes)
 }
 
 /// Decoder mode shared by finding production and stdin forwarding. GNU
