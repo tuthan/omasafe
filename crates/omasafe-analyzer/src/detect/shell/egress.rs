@@ -10,7 +10,8 @@ use super::command::{
     ScriptCommand, redirect_moves_stdout_away, segment_commands, statement_outcomes,
 };
 use super::effects::{
-    EgressEffect, StdoutEffect, command_fetches, ir_command_effects, ir_node_stdout_preserved,
+    CommandEffects, EgressEffect, StdoutEffect, command_fetches, ir_command_effects,
+    ir_node_stdout_preserved,
 };
 use super::interpreter::static_command_body;
 use super::ir::{CommandNode, LogicalUnit, ShellProgram, Statement};
@@ -202,12 +203,23 @@ pub(in crate::detect) fn node_has_live_fetch_stdout(
     node: &CommandNode,
     budget: &mut ShellBudget,
 ) -> bool {
+    node_has_live_fetch_stdout_with_effects(node, budget, None)
+}
+
+/// Typed live-fetch output with an optional command summary supplied by the
+/// caller. The pipeline dataflow pass uses this to avoid recalculating a
+/// simple node's command effects.
+pub(in crate::detect) fn node_has_live_fetch_stdout_with_effects(
+    node: &CommandNode,
+    budget: &mut ShellBudget,
+    supplied_effects: Option<CommandEffects>,
+) -> bool {
     if !budget.spend(1) {
         return false;
     }
     match node {
         CommandNode::Simple(command) => {
-            let effects = ir_command_effects(command, budget);
+            let effects = supplied_effects.unwrap_or_else(|| ir_command_effects(command, budget));
             if effects.stdout == StdoutEffect::Redirected {
                 return false;
             }

