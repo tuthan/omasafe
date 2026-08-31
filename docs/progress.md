@@ -2614,6 +2614,34 @@ scripts/determinism-canary.sh                            # exit 0
 git diff --check                                         # clean
 ```
 
+## Stage B — Typed Child Programs and IR Walk Closure (2026-08-31)
+
+Status: **complete**
+
+The typed shell IR now owns bounded child programs for static shell bodies
+(`-c`/`eval`) and command/process substitutions. Child programs retain the
+same logical-unit boundaries, guards, pipeline nodes, redirects, word
+provenance, and nested ownership as their parents, so effects, egress, and
+download/decode pairing can summarize the parsed representation without
+re-tokenizing the same body. Finding-tag summaries continue to use the
+per-analysis bounded cache and re-anchor at the caller's line.
+
+Typed live-fetch output and decoder walks now compose through static child
+programs, while typed command effects consume IR-owned redirects and child
+stdin summaries. Unsupported shell control structures are represented as
+explicit non-command control-flow nodes (`if`, `while`, `until`, `for`, and
+`case`, plus their reserved delimiters) rather than flattened argv. The
+existing token path remains a bounded compatibility fallback for arithmetic
+substitution details, unsupported syntax, and children withheld at the
+depth ceiling; it is never treated as a complete typed summary after budget
+exhaustion.
+
+Layer coverage now includes child-body ownership, static-body fetch/decoder
+composition, guarded and redirected pipelines, control-flow preservation,
+malformed/UTF-8 input safety, and cache re-anchoring. The Stage B code slices
+are committed as `fa886e2` and `7464bba`; the full two-configuration
+verification gate below is the closure gate for this stage.
+
 ## Plan A4 — Detector Family Extraction
 
 Status: **complete**
