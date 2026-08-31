@@ -322,7 +322,7 @@ fn analyze_script_unit(
     // recursion over untrusted text.
     let mut budget = ShellBudget::new();
     let token_fetch_egress = tokens_fetch_egress(tokens, &mut budget);
-    let ir_direct_fetch = shell_unit.is_some_and(unit_has_direct_fetch);
+    let ir_direct_fetch = shell_unit.is_some_and(|unit| unit_has_direct_fetch(unit, &mut budget));
     if token_fetch_egress || ir_direct_fetch {
         outcome.capabilities.push(occurrence(
             Capability::NetworkAccess,

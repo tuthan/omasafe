@@ -6,10 +6,14 @@
 //! substitutions — plus the segment/group command search it is built on.
 
 use super::budget::ShellBudget;
-use super::command::{ScriptCommand, segment_commands, statement_outcomes};
-use super::effects::command_fetches;
+use super::command::{
+    ScriptCommand, redirect_moves_stdout_away, segment_commands, statement_outcomes,
+};
+use super::effects::{
+    EgressEffect, StdoutEffect, command_fetches, ir_command_effects, ir_node_stdout_preserved,
+};
 use super::interpreter::static_command_body;
-use super::ir::{CommandNode, LogicalUnit, Statement};
+use super::ir::{CommandNode, LogicalUnit, ShellProgram, Statement};
 use super::lexer::{ShellToken, SubstKind, Substitution, tokenize};
 use super::syntax::{
     GroupKind, Outcomes, conditional_statements, grouped_token_ranges, matching_group_close,
@@ -86,31 +90,160 @@ pub(in crate::detect) fn tokens_fetch_egress(
     executed_list_fetch_egress(tokens, budget)
 }
 
-/// Direct command-position fetches are read from the typed shell IR. Nested
-/// substitutions and static bodies still use the token fallback because
-/// their re-parsed text is not yet stored as child IR programs.
-pub(in crate::detect) fn unit_has_direct_fetch(unit: &LogicalUnit) -> bool {
-    statements_have_direct_fetch(&unit.statements)
+/// Direct command-position fetches are read from the typed shell IR,
+/// including child programs owned by static bodies and substitutions.
+/// Unsupported or depth-capped children remain on the token fallback.
+pub(in crate::detect) fn unit_has_direct_fetch(
+    unit: &LogicalUnit,
+    budget: &mut ShellBudget,
+) -> bool {
+    statements_have_direct_fetch(&unit.statements, budget)
 }
 
-fn statements_have_direct_fetch(statements: &[Statement]) -> bool {
+fn statements_have_direct_fetch(statements: &[Statement], budget: &mut ShellBudget) -> bool {
     statements.iter().any(|statement| {
         statement.reachable
-            && statement
-                .pipelines
-                .iter()
-                .any(|pipeline| pipeline.commands.iter().any(node_has_direct_fetch))
+            && statement.pipelines.iter().any(|pipeline| {
+                pipeline
+                    .commands
+                    .iter()
+                    .any(|node| node_has_direct_fetch(node, budget))
+            })
     })
 }
 
-fn node_has_direct_fetch(node: &CommandNode) -> bool {
-    match node {
-        CommandNode::Simple(command) => matches!(command.head.as_str(), "curl" | "wget"),
-        CommandNode::Subshell { body, .. } | CommandNode::BraceGroup { body, .. } => {
-            statements_have_direct_fetch(body)
-        }
-        CommandNode::Arithmetic { .. } | CommandNode::Opaque { .. } => false,
+fn node_has_direct_fetch(node: &CommandNode, budget: &mut ShellBudget) -> bool {
+    if !budget.spend(1) {
+        return false;
     }
+    match node {
+        CommandNode::Simple(command) => {
+            matches!(command.head.as_str(), "curl" | "wget")
+                || command
+                    .body
+                    .as_ref()
+                    .and_then(|body| body.program.as_deref())
+                    .is_some_and(|program| program_has_direct_fetch(program, budget))
+                || command.args.iter().any(|word| {
+                    word.substitutions.iter().any(|substitution| {
+                        substitution
+                            .program
+                            .as_deref()
+                            .is_some_and(|program| program_has_direct_fetch(program, budget))
+                    })
+                })
+        }
+        CommandNode::Subshell { body, .. } | CommandNode::BraceGroup { body, .. } => {
+            statements_have_direct_fetch(body, budget)
+        }
+        CommandNode::Arithmetic { .. }
+        | CommandNode::ControlFlow { .. }
+        | CommandNode::Opaque { .. } => false,
+    }
+}
+
+fn node_stdout_redirected(node: &CommandNode) -> bool {
+    let redirects = match node {
+        CommandNode::Simple(command) => &command.redirects,
+        CommandNode::Subshell { redirects, .. }
+        | CommandNode::BraceGroup { redirects, .. }
+        | CommandNode::Arithmetic { redirects, .. }
+        | CommandNode::ControlFlow { redirects, .. }
+        | CommandNode::Opaque { redirects, .. } => redirects,
+    };
+    redirects.iter().any(|redirect| {
+        redirect_moves_stdout_away(
+            &redirect.operator,
+            redirect
+                .target
+                .as_ref()
+                .map_or("", |target| target.value.as_str()),
+        )
+    })
+}
+
+fn program_has_direct_fetch(program: &ShellProgram, budget: &mut ShellBudget) -> bool {
+    program
+        .units()
+        .iter()
+        .any(|unit| statements_have_direct_fetch(&unit.statements, budget))
+}
+
+/// Whether a typed child program emits a live fetch response on its own
+/// stdout. This is the child-IR equivalent of `body_live_fetch_stdout`; it
+/// composes typed pipeline forwarding without tokenizing the body again.
+pub(in crate::detect) fn ir_program_live_fetch_stdout(
+    program: &ShellProgram,
+    budget: &mut ShellBudget,
+) -> bool {
+    if !budget.spend(1) {
+        return false;
+    }
+    program.units().iter().any(|unit| {
+        unit.statements
+            .iter()
+            .filter(|statement| statement.reachable)
+            .any(|statement| {
+                statement.pipelines.iter().any(|pipeline| {
+                    (0..pipeline.commands.len()).any(|producer| {
+                        node_has_live_fetch_stdout(&pipeline.commands[producer], budget)
+                            && pipeline.commands[producer + 1..]
+                                .iter()
+                                .all(|node| ir_node_stdout_preserved(node, budget))
+                    })
+                })
+            })
+    })
+}
+
+/// Typed live-fetch output for one pipeline node, including a static body or
+/// a compound group's own child statements.
+pub(in crate::detect) fn node_has_live_fetch_stdout(
+    node: &CommandNode,
+    budget: &mut ShellBudget,
+) -> bool {
+    if !budget.spend(1) {
+        return false;
+    }
+    match node {
+        CommandNode::Simple(command) => {
+            let effects = ir_command_effects(command, budget);
+            if effects.stdout == StdoutEffect::Redirected {
+                return false;
+            }
+            effects.egress == EgressEffect::NetworkFetch
+                || command
+                    .body
+                    .as_ref()
+                    .and_then(|body| body.program.as_deref())
+                    .is_some_and(|program| ir_program_live_fetch_stdout(program, budget))
+        }
+        CommandNode::Subshell { body, .. } | CommandNode::BraceGroup { body, .. } => {
+            if node_stdout_redirected(node) {
+                return false;
+            }
+            statements_live_fetch_stdout(body, budget)
+        }
+        CommandNode::Arithmetic { .. }
+        | CommandNode::ControlFlow { .. }
+        | CommandNode::Opaque { .. } => false,
+    }
+}
+
+fn statements_live_fetch_stdout(statements: &[Statement], budget: &mut ShellBudget) -> bool {
+    statements
+        .iter()
+        .filter(|statement| statement.reachable)
+        .any(|statement| {
+            statement.pipelines.iter().any(|pipeline| {
+                (0..pipeline.commands.len()).any(|producer| {
+                    node_has_live_fetch_stdout(&pipeline.commands[producer], budget)
+                        && pipeline.commands[producer + 1..]
+                            .iter()
+                            .all(|node| ir_node_stdout_preserved(node, budget))
+                })
+            })
+        })
 }
 
 /// Analyze a re-parsed shell body with the shared bounded cache. The cache is
@@ -299,12 +432,15 @@ mod tests {
             ("sudo -n curl https://example.test/wrapped", true),
             ("(false && wget https://example.test/dead)", false),
             ("echo 'curl https://example.test/data'", false),
+            ("sh -c 'curl https://example.test/body'", true),
+            ("echo \"$(wget https://example.test/sub)\"", true),
         ];
 
         for (source, expected) in cases {
             let program = ShellProgram::from_units(vec![(1, source.to_owned())]);
+            let mut budget = ShellBudget::new();
             assert_eq!(
-                unit_has_direct_fetch(&program.units()[0]),
+                unit_has_direct_fetch(&program.units()[0], &mut budget),
                 expected,
                 "typed direct-fetch result for {source:?}"
             );

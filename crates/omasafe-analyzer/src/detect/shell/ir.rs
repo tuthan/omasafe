@@ -115,6 +115,20 @@ pub(in crate::detect) struct ExecutedBody {
     pub(in crate::detect) program: Option<Box<ShellProgram>>,
 }
 
+/// Control-flow syntax that is intentionally preserved as structure until a
+/// dedicated branch/loop model is reviewed. It must not be guessed into an
+/// ordinary command's argv, because doing so can make a skipped branch look
+/// executable to a detector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::detect) enum ControlFlowKind {
+    If,
+    While,
+    Until,
+    For,
+    Case,
+    Reserved,
+}
+
 /// A command node in a pipeline. Compound commands are explicit so their
 /// bodies cannot be flattened into the surrounding command's argv.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -130,6 +144,11 @@ pub(in crate::detect) enum CommandNode {
     },
     Arithmetic {
         expression: Vec<Word>,
+        redirects: Vec<Redirect>,
+    },
+    ControlFlow {
+        kind: ControlFlowKind,
+        words: Vec<Word>,
         redirects: Vec<Redirect>,
     },
     /// Unmatched or otherwise unsupported command-position syntax is kept as
@@ -280,6 +299,17 @@ fn parse_command_node(segment: &[ShellToken], depth: usize) -> CommandNode {
         };
     }
 
+    if let Some(kind) = control_flow_kind(segment) {
+        return CommandNode::ControlFlow {
+            kind,
+            words: segment
+                .iter()
+                .filter_map(|token| word_from_token_at_depth(token, depth))
+                .collect(),
+            redirects: redirects_at_depth_zero(segment, depth),
+        };
+    }
+
     let commands = segment_commands(segment);
     let Some(last) = commands.last() else {
         return opaque_node(segment, depth);
@@ -337,6 +367,22 @@ fn compound_open(segment: &[ShellToken]) -> Option<(usize, GroupKind)> {
     None
 }
 
+fn control_flow_kind(segment: &[ShellToken]) -> Option<ControlFlowKind> {
+    let mut index = 0usize;
+    skip_command_prefixes(segment, &mut index);
+    match segment.get(index).and_then(ShellToken::word)? {
+        "if" => Some(ControlFlowKind::If),
+        "while" => Some(ControlFlowKind::While),
+        "until" => Some(ControlFlowKind::Until),
+        "for" => Some(ControlFlowKind::For),
+        "case" => Some(ControlFlowKind::Case),
+        "then" | "elif" | "else" | "fi" | "do" | "done" | "in" | "esac" => {
+            Some(ControlFlowKind::Reserved)
+        }
+        _ => None,
+    }
+}
+
 /// Collect redirects that belong to the command node itself. Redirects in a
 /// nested compound body are left with that body's node.
 fn redirects_at_depth_zero(segment: &[ShellToken], depth: usize) -> Vec<Redirect> {
@@ -351,9 +397,9 @@ fn redirects_at_depth_zero(segment: &[ShellToken], depth: usize) -> Vec<Redirect
                 operator if nesting == 0 && is_redirect_operator(operator) => {
                     redirects.push(Redirect {
                         operator: operator.to_owned(),
-                        target: segment.get(index + 1).and_then(|token| {
-                            word_from_token_at_depth(token, depth.max(0) as usize)
-                        }),
+                        target: segment
+                            .get(index + 1)
+                            .and_then(|token| word_from_token_at_depth(token, depth)),
                     });
                     index += 1; // the target is data, not another redirect
                 }
@@ -502,7 +548,7 @@ fn word_from_value(value: &str, dynamic: bool) -> Word {
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, CommandNode, Guard, ShellProgram, Word, WordProvenance};
+    use super::{Command, CommandNode, ControlFlowKind, Guard, ShellProgram, Word, WordProvenance};
     use crate::detect::shell::lexer::SubstKind;
 
     #[test]
@@ -612,5 +658,57 @@ mod tests {
         assert_eq!(echo.args[1].substitutions.len(), 1);
         assert_eq!(echo.args[1].substitutions[0].kind, SubstKind::Process);
         assert!(echo.args[1].substitutions[0].program.is_some());
+    }
+
+    #[test]
+    fn preserves_control_words_as_non_command_nodes() {
+        let program = ShellProgram::from_units(vec![
+            (
+                1,
+                "if false; then curl https://example.test/dead; fi".to_owned(),
+            ),
+            (
+                2,
+                "for item in one; do wget https://example.test/dead; done".to_owned(),
+            ),
+        ]);
+
+        let first_unit = &program.units()[0];
+        assert!(matches!(
+            first_unit.statements[0].pipelines[0].commands[0],
+            CommandNode::ControlFlow {
+                kind: ControlFlowKind::If,
+                ..
+            }
+        ));
+        assert!(matches!(
+            first_unit.statements[1].pipelines[0].commands[0],
+            CommandNode::ControlFlow {
+                kind: ControlFlowKind::Reserved,
+                ..
+            }
+        ));
+
+        let second_unit = &program.units()[1];
+        assert!(matches!(
+            second_unit.statements[0].pipelines[0].commands[0],
+            CommandNode::ControlFlow {
+                kind: ControlFlowKind::For,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn malformed_and_unicode_shell_text_stays_bounded_and_typed() {
+        for source in [
+            "echo '🙂' | sh -c 'printf \"✓\"'; (",
+            "$(unterminated \\\n+             echo \"é\"",
+            "{ printf '\\xff'; } > /tmp/é",
+        ] {
+            let program = ShellProgram::from_units(vec![(1, source.to_owned())]);
+            assert_eq!(program.units().len(), 1);
+            assert!(!program.units()[0].statements.is_empty());
+        }
     }
 }

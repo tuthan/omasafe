@@ -15,7 +15,9 @@ use super::interpreter::{
     InterpreterFamily, InterpreterMode, command_is_interpreter, interpreter_family,
     interpreter_mode, static_command_body,
 };
-use super::ir::{Command as IrCommand, CommandNode, Redirect as IrRedirect, WordProvenance};
+use super::ir::{
+    Command as IrCommand, CommandNode, ExecutedBody, Redirect as IrRedirect, WordProvenance,
+};
 use super::lexer::{ShellToken, SubstKind, tokenize};
 use super::syntax::{GroupKind, Outcomes, conditional_statements, pipeline_segments};
 use super::xargs::xargs_feeds_stdin_code;
@@ -154,17 +156,24 @@ pub(in crate::detect) fn command_effects(
     )
 }
 
-/// Apply the same command-site summary to a typed IR command. Redirects and
-/// argument provenance come from the IR node, so callers do not need to
-/// reconstruct a token segment to answer stdin-consumption questions.
+/// Apply the same command-site summary to a typed IR command. Redirects,
+/// argument provenance, and available static child summaries come from the
+/// IR node, so callers do not need to reconstruct a token segment.
 pub(in crate::detect) fn ir_command_effects(
     command: &IrCommand,
     budget: &mut ShellBudget,
 ) -> CommandEffects {
     let stdout_redirected = ir_redirects_move_stdout(&command.redirects);
     let stdin_redirected = ir_redirects_move_stdin(&command.redirects);
+    let body = command.body.as_ref();
     with_ir_script_command(command, |script_command| {
-        command_effects_with_redirects(script_command, stdout_redirected, stdin_redirected, budget)
+        command_effects_with_body_summary(
+            script_command,
+            stdout_redirected,
+            stdin_redirected,
+            body,
+            budget,
+        )
     })
 }
 
@@ -193,6 +202,16 @@ fn command_effects_with_redirects(
     stdin_redirected: bool,
     budget: &mut ShellBudget,
 ) -> CommandEffects {
+    command_effects_with_body_summary(command, stdout_redirected, stdin_redirected, None, budget)
+}
+
+fn command_effects_with_body_summary(
+    command: &ScriptCommand,
+    stdout_redirected: bool,
+    stdin_redirected: bool,
+    typed_body: Option<&ExecutedBody>,
+    budget: &mut ShellBudget,
+) -> CommandEffects {
     let mut effects = CommandEffects {
         stdout: if stdout_redirected {
             StdoutEffect::Redirected
@@ -207,28 +226,20 @@ fn command_effects_with_redirects(
     // inherited pipe bytes can reach it. This early guard prevents a
     // redirected `sh` or `xargs` from becoming a false code sink.
     if stdin_redirected {
-        if static_command_body(command).is_some() {
+        if typed_body.is_some() || static_command_body(command).is_some() {
             effects.execution = ExecutionEffect::ExecutesStaticBody;
         }
         return effects;
     }
 
+    if let Some(body) = typed_body {
+        let summary = body_summary_from_ir(body, budget);
+        return apply_static_body_effects(effects, summary, stdout_redirected);
+    }
+
     if let Some(body) = static_command_body(command) {
         let summary = static_body_summary(&body, budget);
-        effects.execution = if summary.consumes_stdin_as_code {
-            ExecutionEffect::ExecutesStdin
-        } else {
-            ExecutionEffect::ExecutesStaticBody
-        };
-        if summary.consumes_stdin_as_code || summary.drains_stdin {
-            effects.stdin = StdinEffect::Consumed;
-        } else if summary.forwards_stdin_body {
-            effects.stdin = StdinEffect::ForwardedDerivedData;
-            if !stdout_redirected {
-                effects.stdout = StdoutEffect::ForwardedInput;
-            }
-        }
-        return effects;
+        return apply_static_body_effects(effects, summary, stdout_redirected);
     }
 
     if command_is_interpreter(command) {
@@ -277,6 +288,75 @@ fn command_effects_with_redirects(
         effects.stdout = StdoutEffect::DerivedData;
     }
     effects
+}
+
+fn apply_static_body_effects(
+    mut effects: CommandEffects,
+    summary: ShellSummary,
+    stdout_redirected: bool,
+) -> CommandEffects {
+    effects.execution = if summary.consumes_stdin_as_code {
+        ExecutionEffect::ExecutesStdin
+    } else {
+        ExecutionEffect::ExecutesStaticBody
+    };
+    if summary.consumes_stdin_as_code || summary.drains_stdin {
+        effects.stdin = StdinEffect::Consumed;
+    } else if summary.forwards_stdin_body {
+        effects.stdin = StdinEffect::ForwardedDerivedData;
+        if !stdout_redirected {
+            effects.stdout = StdoutEffect::ForwardedInput;
+        }
+    }
+    effects
+}
+
+/// Summarize a parsed child program without tokenizing its source again.
+/// The outer `enter` accounts for the executed body; compound helpers charge
+/// their own typed statement work and nested recursion below that boundary.
+fn body_summary_from_ir(body: &ExecutedBody, budget: &mut ShellBudget) -> ShellSummary {
+    if budget.exhausted() {
+        return ShellSummary::SILENT;
+    }
+    if let Some(summary) = budget.cached_stdin_summary(&body.source) {
+        return ShellSummary {
+            consumes_stdin_as_code: summary.consumes_stdin_as_code,
+            drains_stdin: summary.drains_stdin,
+            forwards_stdin_body: summary.forwards_stdin_body,
+        };
+    }
+    let Some(program) = body.program.as_deref() else {
+        return static_body_summary(&body.source, budget);
+    };
+    if !budget.enter() {
+        return ShellSummary::SILENT;
+    }
+    let mut consumes_stdin_as_code = false;
+    let mut drains_stdin = false;
+    let mut forwards_stdin_body = false;
+    for unit in program.units() {
+        let (consumes, drains) = ir_group_stdin_reaches_interpreter(&unit.statements, budget);
+        consumes_stdin_as_code |= consumes;
+        drains_stdin |= drains;
+        forwards_stdin_body |= ir_group_forwards_stdin(&unit.statements, budget);
+    }
+    budget.leave();
+    let summary = ShellSummary {
+        consumes_stdin_as_code,
+        drains_stdin,
+        forwards_stdin_body,
+    };
+    if !budget.exhausted() {
+        budget.cache_stdin_summary(
+            &body.source,
+            CachedStdinSummary {
+                consumes_stdin_as_code,
+                drains_stdin,
+                forwards_stdin_body,
+            },
+        );
+    }
+    summary
 }
 
 fn ir_redirects_move_stdout(redirects: &[IrRedirect]) -> bool {
@@ -795,6 +875,7 @@ pub(in crate::detect) fn ir_node_stdin_effect(
         CommandNode::Subshell { redirects, .. }
         | CommandNode::BraceGroup { redirects, .. }
         | CommandNode::Arithmetic { redirects, .. }
+        | CommandNode::ControlFlow { redirects, .. }
         | CommandNode::Opaque { redirects, .. } => redirects,
     };
     if ir_redirects_move_stdin(redirects) {
@@ -805,7 +886,9 @@ pub(in crate::detect) fn ir_node_stdin_effect(
         CommandNode::Subshell { body, .. } | CommandNode::BraceGroup { body, .. } => {
             ir_group_stdin_effect(body, budget)
         }
-        CommandNode::Arithmetic { .. } | CommandNode::Opaque { .. } => StdinEffect::Unread,
+        CommandNode::Arithmetic { .. }
+        | CommandNode::ControlFlow { .. }
+        | CommandNode::Opaque { .. } => StdinEffect::Unread,
     }
 }
 
@@ -837,6 +920,7 @@ pub(in crate::detect) fn ir_node_reaches_interpreter(
         CommandNode::Subshell { redirects, .. }
         | CommandNode::BraceGroup { redirects, .. }
         | CommandNode::Arithmetic { redirects, .. }
+        | CommandNode::ControlFlow { redirects, .. }
         | CommandNode::Opaque { redirects, .. } => redirects,
     };
     if ir_redirects_move_stdin(redirects) {
@@ -850,16 +934,26 @@ pub(in crate::detect) fn ir_node_reaches_interpreter(
         CommandNode::Subshell { body, .. } | CommandNode::BraceGroup { body, .. } => {
             ir_group_reaches_interpreter(body, budget)
         }
-        CommandNode::Arithmetic { .. } | CommandNode::Opaque { .. } => false,
+        CommandNode::Arithmetic { .. }
+        | CommandNode::ControlFlow { .. }
+        | CommandNode::Opaque { .. } => false,
     }
 }
 
 fn ir_group_reaches_interpreter(body: &[super::ir::Statement], budget: &mut ShellBudget) -> bool {
+    ir_group_stdin_reaches_interpreter(body, budget).0
+}
+
+fn ir_group_stdin_reaches_interpreter(
+    body: &[super::ir::Statement],
+    budget: &mut ShellBudget,
+) -> (bool, bool) {
     if !budget.spend(ir_body_work(body)) || !budget.enter() {
-        return false;
+        return (false, false);
     }
     let mut pipe_alive = true;
     let mut reached = false;
+    let mut drained = false;
     for statement in body.iter().filter(|statement| statement.reachable) {
         for pipeline in &statement.pipelines {
             if pipeline.commands.is_empty() {
@@ -881,11 +975,12 @@ fn ir_group_reaches_interpreter(body: &[super::ir::Statement], budget: &mut Shel
             }
             if pipe_alive && effects[0] != StdinEffect::Unread {
                 pipe_alive = false;
+                drained = true;
             }
         }
     }
     budget.leave();
-    reached
+    (reached, drained)
 }
 
 fn ir_group_forwards_stdin(body: &[super::ir::Statement], budget: &mut ShellBudget) -> bool {
@@ -935,6 +1030,7 @@ pub(in crate::detect) fn ir_node_stdout_preserved(
         CommandNode::Subshell { redirects, .. }
         | CommandNode::BraceGroup { redirects, .. }
         | CommandNode::Arithmetic { redirects, .. }
+        | CommandNode::ControlFlow { redirects, .. }
         | CommandNode::Opaque { redirects, .. } => redirects,
     };
     if ir_redirects_move_stdout(redirects) {
@@ -947,7 +1043,9 @@ pub(in crate::detect) fn ir_node_stdout_preserved(
         CommandNode::Subshell { body, .. } | CommandNode::BraceGroup { body, .. } => {
             ir_group_forwards_stdin(body, budget)
         }
-        CommandNode::Arithmetic { .. } | CommandNode::Opaque { .. } => false,
+        CommandNode::Arithmetic { .. }
+        | CommandNode::ControlFlow { .. }
+        | CommandNode::Opaque { .. } => false,
     }
 }
 

