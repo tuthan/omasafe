@@ -120,9 +120,7 @@ struct UnitAssembler {
     text: String,
     start_line: u32,
     open: bool,
-    in_single: bool,
-    in_double: bool,
-    in_backtick: bool,
+    lex: ShellLexState,
 }
 
 impl UnitAssembler {
@@ -131,10 +129,21 @@ impl UnitAssembler {
             text: String::new(),
             start_line: 1,
             open: false,
-            in_single: false,
-            in_double: false,
-            in_backtick: false,
+            lex: ShellLexState::default(),
         }
+    }
+
+    /// Preview a physical line with the same quote/comment/escape state that
+    /// `feed` will use, without changing this assembler's state or text.
+    fn preview_line(&self, raw_line: &str) -> ScannedLine {
+        let mut lex = self.lex.clone();
+        lex.scan_line(raw_line)
+    }
+
+    /// Start a stateful heredoc-header walk at the assembler's current
+    /// lexical position.
+    fn line_scanner(&self) -> ShellLexState {
+        self.lex.clone()
     }
 
     /// Feed one physical line (1-based `number`). Returns the completed
@@ -143,71 +152,9 @@ impl UnitAssembler {
         if !self.open {
             self.start_line = number;
         }
-        let mut escaped_newline = false;
-        let mut boundary = true; // a line start is a word boundary for `#`
-        let mut characters = raw_line.chars().peekable();
-        while let Some(character) = characters.next() {
-            if self.in_single {
-                if character == '\'' {
-                    self.in_single = false;
-                }
-                self.text.push(character);
-                boundary = false;
-                continue;
-            }
-            if self.in_backtick {
-                if character == '`' {
-                    self.in_backtick = false;
-                }
-                self.text.push(character);
-                boundary = false;
-                continue;
-            }
-            if self.in_double {
-                if character == '\\' {
-                    match characters.next() {
-                        // A backslash-newline continues even inside quotes.
-                        None => escaped_newline = true,
-                        Some(next) => {
-                            self.text.push(character);
-                            self.text.push(next);
-                        }
-                    }
-                } else if character == '"' {
-                    self.in_double = false;
-                    self.text.push(character);
-                } else {
-                    self.text.push(character);
-                }
-                boundary = false;
-                continue;
-            }
-            if character == '\\' {
-                match characters.next() {
-                    None => escaped_newline = true,
-                    Some(next) => {
-                        self.text.push(character);
-                        self.text.push(next);
-                    }
-                }
-                boundary = false;
-                continue;
-            }
-            // A `#` at a word boundary comments out the rest of the line —
-            // including any trailing backslash continuation.
-            if character == '#' && boundary {
-                break;
-            }
-            self.text.push(character);
-            boundary = matches!(character, ' ' | '\t' | ';' | '&' | '|' | '(');
-            match character {
-                '\'' => self.in_single = true,
-                '"' => self.in_double = true,
-                '`' => self.in_backtick = true,
-                _ => {}
-            }
-        }
-        if escaped_newline {
+        let scan = self.lex.scan_line(raw_line);
+        self.text.push_str(&scan.text);
+        if scan.escaped_newline {
             self.open = true; // the backslash-newline is removed: join directly
             return None;
         }
@@ -222,11 +169,8 @@ impl UnitAssembler {
                     Some(")" | "}" | "))") => (depth - 1).max(0),
                     _ => depth,
                 });
-        self.open = self.in_single
-            || self.in_double
-            || self.in_backtick
-            || token_depth > 0
-            || trailing_pipeline_operator(&self.text);
+        self.open =
+            self.lex.has_open_quote() || token_depth > 0 || trailing_pipeline_operator(&self.text);
         if self.open {
             // A newline inside an open quote or backtick is body DATA: the
             // quoted text stays whole, and whatever reparses it (an eval or
@@ -234,7 +178,7 @@ impl UnitAssembler {
             // own statement separator. Inside a compound list a bare newline
             // separates statements; a grammar-required operator continuation
             // is whitespace instead.
-            if self.in_single || self.in_double || self.in_backtick {
+            if self.lex.has_open_quote() {
                 self.text.push('\n');
             } else if token_depth > 0 && !trailing_pipeline_operator(&self.text) {
                 self.text.push(';');
@@ -244,9 +188,7 @@ impl UnitAssembler {
             None
         } else if !self.text.trim().is_empty() {
             let assembled = std::mem::take(&mut self.text);
-            self.in_single = false;
-            self.in_double = false;
-            self.in_backtick = false;
+            self.lex = ShellLexState::default();
             Some((self.start_line, assembled.trim_end().to_owned()))
         } else {
             None
@@ -287,6 +229,164 @@ struct HeredocRedirect {
     strip_tabs: bool,
 }
 
+/// Quote/comment state shared by logical-unit assembly and heredoc-header
+/// scanning. A header scanner starts from the owning assembler's state, so a
+/// quote opened on an earlier physical line cannot hide a later redirect.
+#[derive(Clone)]
+struct ShellLexState {
+    in_single: bool,
+    in_double: bool,
+    in_backtick: bool,
+    boundary: bool,
+}
+
+impl Default for ShellLexState {
+    fn default() -> Self {
+        Self {
+            in_single: false,
+            in_double: false,
+            in_backtick: false,
+            boundary: true,
+        }
+    }
+}
+
+struct ScannedLine {
+    /// The line after comments and a real backslash-newline have been
+    /// removed, exactly as `UnitAssembler` appends it.
+    text: String,
+    escaped_newline: bool,
+    redirects: Vec<HeredocRedirect>,
+}
+
+impl ShellLexState {
+    fn has_open_quote(&self) -> bool {
+        self.in_single || self.in_double || self.in_backtick
+    }
+
+    /// Scan one physical line, carrying quote state in `self`. Redirects are
+    /// collected only in unquoted shell text; command-substitution interiors
+    /// are skipped for redirect collection just as the old raw scan did.
+    fn scan_line(&mut self, line: &str) -> ScannedLine {
+        let bytes = line.as_bytes();
+        let mut text = String::new();
+        let mut redirects = Vec::new();
+        let mut escaped_newline = false;
+        // A real backslash-newline removes both bytes, so the next physical
+        // line inherits the boundary immediately before the backslash. For
+        // every other newline, the next line starts at a fresh word boundary.
+        let mut boundary = self.boundary;
+        let mut substitution_end = 0usize;
+        let mut i = 0usize;
+
+        while i < bytes.len() {
+            let byte = bytes[i];
+            if self.in_single {
+                let width = line[i..].chars().next().map_or(1, char::len_utf8);
+                text.push_str(&line[i..i + width]);
+                if byte == b'\'' {
+                    self.in_single = false;
+                }
+                boundary = false;
+                i += width;
+                continue;
+            }
+            if self.in_backtick {
+                let width = line[i..].chars().next().map_or(1, char::len_utf8);
+                text.push_str(&line[i..i + width]);
+                if byte == b'`' {
+                    self.in_backtick = false;
+                }
+                boundary = false;
+                i += width;
+                continue;
+            }
+            if self.in_double {
+                if byte == b'\\' {
+                    text.push('\\');
+                    i += 1;
+                    if i == bytes.len() {
+                        text.pop();
+                        escaped_newline = true;
+                        break;
+                    }
+                    let width = line[i..].chars().next().map_or(1, char::len_utf8);
+                    text.push_str(&line[i..i + width]);
+                    i += width;
+                } else {
+                    let width = line[i..].chars().next().map_or(1, char::len_utf8);
+                    text.push_str(&line[i..i + width]);
+                    if byte == b'"' {
+                        self.in_double = false;
+                    }
+                    i += width;
+                }
+                boundary = false;
+                continue;
+            }
+            if byte == b'\\' {
+                text.push('\\');
+                i += 1;
+                if i == bytes.len() {
+                    text.pop();
+                    escaped_newline = true;
+                    break;
+                }
+                let width = line[i..].chars().next().map_or(1, char::len_utf8);
+                text.push_str(&line[i..i + width]);
+                i += width;
+                boundary = false;
+                continue;
+            }
+            // A `#` at a word boundary comments out the rest of the line —
+            // including any trailing backslash continuation.
+            if byte == b'#' && boundary {
+                break;
+            }
+            // A command substitution is shell text of its own. It cannot
+            // introduce a heredoc for this source pass, but its bytes remain
+            // in the assembled text and are handled by the normal lexer.
+            let in_command_substitution = i < substitution_end;
+            if !in_command_substitution && byte == b'$' && bytes.get(i + 1) == Some(&b'(') {
+                substitution_end = skip_balanced_parens(bytes, i + 1);
+            }
+            if !in_command_substitution && byte == b'<' {
+                let mut operator_start = i;
+                while operator_start > 0 && bytes[operator_start - 1].is_ascii_digit() {
+                    operator_start -= 1;
+                }
+                if let Some((op, next)) = redirect_operator_at(bytes, operator_start)
+                    && (op == "<<" || op == "<<-")
+                    && let Some((_, end)) = delimiter_word_span(bytes, next)
+                {
+                    redirects.push(HeredocRedirect {
+                        span: (operator_start, end),
+                        strip_tabs: op == "<<-",
+                    });
+                }
+            }
+            let width = line[i..].chars().next().map_or(1, char::len_utf8);
+            text.push_str(&line[i..i + width]);
+            boundary = matches!(byte, b' ' | b'\t' | b';' | b'&' | b'|' | b'(');
+            match byte {
+                b'\'' => self.in_single = true,
+                b'"' => self.in_double = true,
+                b'`' => self.in_backtick = true,
+                _ => {}
+            }
+            i += width;
+        }
+
+        self.boundary = if escaped_newline { boundary } else { true };
+
+        ScannedLine {
+            text,
+            escaped_newline,
+            redirects,
+        }
+    }
+}
+
 /// One heredoc redirection of a whole logical unit: which physical line of
 /// the unit carries it (0-based from the unit's first line), the raw span
 /// within that line, `<<-`'s tab stripping, and the tokenized delimiter
@@ -296,87 +396,6 @@ struct UnitHeredoc {
     span: (usize, usize),
     strip_tabs: bool,
     delimiter: String,
-}
-
-/// Every stdin heredoc redirection (`<<`/`<<-`) in one header line, in order.
-/// The scan skips quoted regions, escapes, and command-substitution
-/// interiors so a quoted `<<`, a here-string `<<<`, or text inside
-/// `$( … )` never matches, and applies `redirect_operator_at` — the same
-/// classifier the lexer uses — so fd-prefixed forms (`2<<X`, other
-/// descriptors) stay data. Compound groups are NOT skipped: a heredoc of
-/// a grouped command is a real heredoc (`(cat <<C)` reads its body as
-/// data, `(sh <<C)` executes it), and the caller's raw-scan/token
-/// agreement check covers anything the two views disagree on. `None` when
-/// the raw scan and the token stream disagree: the line is then left
-/// untouched rather than rewritten on a misunderstanding.
-fn heredoc_redirects(line: &str, tokens: &[ShellToken]) -> Option<Vec<HeredocRedirect>> {
-    let token_ops: Vec<usize> = tokens
-        .iter()
-        .enumerate()
-        .filter_map(|(index, token)| {
-            matches!(token.operator(), Some("<<" | "<<-")).then_some(index)
-        })
-        .collect();
-    if token_ops.is_empty() {
-        return Some(Vec::new());
-    }
-    let bytes = line.as_bytes();
-    let mut redirects = Vec::new();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => i += 2,
-            b'\'' => {
-                i += 1;
-                while i < bytes.len() && bytes[i] != b'\'' {
-                    i += 1;
-                }
-                i += 1;
-            }
-            b'`' => {
-                i += 1;
-                while i < bytes.len() && bytes[i] != b'`' {
-                    i += 1;
-                }
-                i += 1;
-            }
-            b'"' => {
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'\\' {
-                        i += 2;
-                        continue;
-                    }
-                    if bytes[i] == b'"' {
-                        break;
-                    }
-                    i += 1;
-                }
-                i += 1;
-            }
-            _ => {
-                if bytes[i] == b'$' && bytes.get(i + 1) == Some(&b'(') {
-                    i = skip_balanced_parens(bytes, i + 1);
-                    continue;
-                }
-                if let Some((op, next)) = redirect_operator_at(bytes, i) {
-                    if op == "<<" || op == "<<-" {
-                        let (_, end) = delimiter_word_span(bytes, next)?;
-                        redirects.push(HeredocRedirect {
-                            span: (i, end),
-                            strip_tabs: op == "<<-",
-                        });
-                        i = end;
-                    } else {
-                        i = next;
-                    }
-                    continue;
-                }
-                i += 1;
-            }
-        }
-    }
-    Some(redirects)
 }
 
 /// Just past the `)` matching the `(` at `open` (or the end of input when
@@ -413,64 +432,6 @@ fn skip_balanced_parens(bytes: &[u8], open: usize) -> usize {
         i += 1;
     }
     bytes.len()
-}
-
-/// Whether the newline ending `line` reads a pending heredoc's body: bash
-/// collects bodies at the first newline that is neither escaped nor inside
-/// quotes/backticks — a trailing pipeline operator or an open compound
-/// group does NOT postpone it (`cat <<C |` reads the next line as body
-/// data, and the pipeline's next stage follows the terminator). A `#`
-/// comment ends the line, including any trailing backslash.
-fn newline_terminates_heredoc_header(line: &str) -> bool {
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut in_backtick = false;
-    let mut boundary = true; // a line start is a word boundary for `#`
-    let mut characters = line.chars().peekable();
-    while let Some(character) = characters.next() {
-        if in_single {
-            if character == '\'' {
-                in_single = false;
-            }
-            boundary = false;
-            continue;
-        }
-        if in_backtick {
-            if character == '`' {
-                in_backtick = false;
-            }
-            boundary = false;
-            continue;
-        }
-        if in_double {
-            if character == '\\' {
-                characters.next();
-            } else if character == '"' {
-                in_double = false;
-            }
-            boundary = false;
-            continue;
-        }
-        match character {
-            '\\' => {
-                if characters.next().is_none() {
-                    return false; // escaped newline: the body waits
-                }
-                boundary = false;
-            }
-            '#' if boundary => return true, // a comment ends the line
-            _ => {
-                boundary = matches!(character, ' ' | '\t' | ';' | '&' | '|' | '(');
-                match character {
-                    '\'' => in_single = true,
-                    '"' => in_double = true,
-                    '`' => in_backtick = true,
-                    _ => {}
-                }
-            }
-        }
-    }
-    !in_single && !in_double && !in_backtick
 }
 
 /// The raw delimiter word just past a heredoc operator: quoted runs and
@@ -559,8 +520,7 @@ fn shell_source_without_heredoc_payloads(
     let mut context = UnitAssembler::new();
     'lines: while index < lines.len() {
         let line = lines[index];
-        let tokens = tokenize(line);
-        if !heredoc_redirects(line, &tokens).is_some_and(|scan| !scan.is_empty()) {
+        if context.preview_line(line).redirects.is_empty() {
             output.push(line.to_owned());
             context.feed(index as u32 + 1, line);
             index += 1;
@@ -572,14 +532,24 @@ fn shell_source_without_heredoc_payloads(
         // it, and the command's continuation (the pipeline stage, the
         // group's closing parenthesis) follows the terminator line.
         let mut boundary = index;
-        while !newline_terminates_heredoc_header(lines[boundary]) {
+        let mut header_scanner = context.line_scanner();
+        let mut line_scans = Vec::new();
+        loop {
+            let scan = header_scanner.scan_line(lines[boundary]);
+            let terminates = !scan.escaped_newline && !header_scanner.has_open_quote();
+            line_scans.push(scan);
+            if terminates {
+                break;
+            }
             if boundary + 1 == lines.len() {
                 // EOF inside an escaped/quoted header: the command never
                 // reaches its newline, so no body follows — leave the rest
-                // of the file alone.
-                for &rest in lines[index..].iter() {
+                // of the file alone. The assembler is advanced with the
+                // actual source line numbers so later diagnostics stay
+                // anchored.
+                for (offset, &rest) in lines[index..].iter().enumerate() {
                     output.push(rest.to_owned());
-                    context.feed(index as u32 + 1, rest);
+                    context.feed(index as u32 + 1 + offset as u32, rest);
                     index += 1;
                 }
                 continue 'lines;
@@ -591,28 +561,26 @@ fn shell_source_without_heredoc_payloads(
         // scan with the token stream one to one on EVERY header line;
         // anything else leaves the whole header alone.
         let mut unit_redirects: Vec<UnitHeredoc> = Vec::new();
-        for (offset, line_index) in (index..=boundary).enumerate() {
+        for (offset, (line_index, scan)) in (index..=boundary).zip(line_scans).enumerate() {
             let unit_line = lines[line_index];
-            let unit_tokens = tokenize(unit_line);
-            let unit_ops: Vec<usize> = unit_tokens
-                .iter()
-                .enumerate()
-                .filter_map(|(token_index, token)| {
-                    matches!(token.operator(), Some("<<" | "<<-")).then_some(token_index)
-                })
-                .collect();
-            let Some(unit_scan) = heredoc_redirects(unit_line, &unit_tokens)
-                .filter(|scan| scan.len() == unit_ops.len())
-            else {
-                for (offset, &rest) in lines[index..=boundary].iter().enumerate() {
-                    output.push(rest.to_owned());
-                    context.feed(index as u32 + 1 + offset as u32, rest);
-                }
-                index = boundary + 1;
-                continue 'lines;
-            };
-            for (&token_index, redirect) in unit_ops.iter().zip(&unit_scan) {
-                let Some(word) = unit_tokens.get(token_index + 1).and_then(ShellToken::word) else {
+            for redirect in scan.redirects {
+                let snippet = &unit_line[redirect.span.0..redirect.span.1];
+                let snippet_tokens = tokenize(snippet);
+                let Some(operator_index) = snippet_tokens
+                    .iter()
+                    .position(|token| matches!(token.operator(), Some("<<" | "<<-")))
+                else {
+                    for (offset, &rest) in lines[index..=boundary].iter().enumerate() {
+                        output.push(rest.to_owned());
+                        context.feed(index as u32 + 1 + offset as u32, rest);
+                    }
+                    index = boundary + 1;
+                    continue 'lines;
+                };
+                let Some(delimiter) = snippet_tokens
+                    .get(operator_index + 1)
+                    .and_then(ShellToken::word)
+                else {
                     for (offset, &rest) in lines[index..=boundary].iter().enumerate() {
                         output.push(rest.to_owned());
                         context.feed(index as u32 + 1 + offset as u32, rest);
@@ -624,7 +592,7 @@ fn shell_source_without_heredoc_payloads(
                     line: offset,
                     span: redirect.span,
                     strip_tabs: redirect.strip_tabs,
-                    delimiter: word.to_owned(),
+                    delimiter: delimiter.to_owned(),
                 });
             }
         }

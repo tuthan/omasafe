@@ -842,6 +842,9 @@ fn xargs_option_area_is_valid(command: &ScriptCommand, wrapped: usize) -> bool {
                     }
                     rejects_count(value)
                 }
+                // GNU `--max-lines[=N]` has an optional argument: the bare
+                // form means one line and does not consume the next word.
+                "max-lines" => glued.is_some_and(|value| rejects_count(Some(value))),
                 // `-P 0` is unlimited parallelism, not a rejection.
                 "max-procs" => {
                     let value = glued.map_or_else(|| command.args.get(index + 1).copied(), Some);
