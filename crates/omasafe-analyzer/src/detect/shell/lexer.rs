@@ -12,7 +12,7 @@ use crate::detect::model::balanced_bracket_span;
 /// presents its output as a filename operand, and arithmetic expansion
 /// (`$(( … ))`) evaluates variables into a number — only genuine command
 /// substitutions nested inside it run anything.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::detect) enum SubstKind {
     Command,
     Process,
@@ -22,7 +22,7 @@ pub(in crate::detect) enum SubstKind {
 /// One active (non-single-quoted) substitution embedded in a word, keeping
 /// the raw interior text so its command can be re-tokenised for egress and
 /// consumption attribution.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::detect) struct Substitution {
     pub(in crate::detect) kind: SubstKind,
     pub(in crate::detect) inner: String,
@@ -34,7 +34,7 @@ pub(in crate::detect) struct Substitution {
 /// unquoted control/redirection text. Operators are recognised only when
 /// unquoted, so a quoted or escaped `;`/`|`/`>` is part of a word and never
 /// splits a statement or reads as a redirect.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::detect) enum ShellToken {
     Word {
         value: String,

@@ -2462,6 +2462,31 @@ scripts/determinism-canary.sh                            # exit 0
 git diff --check                                         # clean
 ```
 
+## Plan Step 8 — Typed Shell IR Foundation (2026-08-31)
+
+Status: **in progress — foundation slice complete**
+
+The first Stage B slice adds `detect/shell/ir.rs`, a bounded typed owner for
+each shell logical unit. It records list guards, pipeline stages, explicit
+subshell/brace/arithmetic nodes, command-position wrappers, command redirects,
+and word provenance (`Static`, parameter/command/process/arithmetic
+expansion, or `Mixed`). The shell frontend now builds this representation once
+per assembled unit and supplies its IR-owned token stream to the existing
+detector families, preserving their behavior while establishing the boundary
+for later effect summaries.
+
+The IR uses the existing `MAX_SHELL_ANALYSIS_DEPTH` ceiling before descending
+into nested compound bodies. This keeps the new parser safe on the same
+12,000-level adversarial nesting case that the detector budget covers; the
+fallback is an opaque node rather than an unbounded recursive walk. Structural
+tests cover guards, pipelines, compound preservation, redirects, and word
+provenance.
+
+Verification: both feature configurations pass workspace tests and clippy with
+`-D warnings`; CLI asset generation, the determinism canary, formatting, and
+`git diff --check` also pass. Centralized command effects and migration of
+detectors to consume typed nodes remain the next Stage B slices.
+
 ## Review Round Three — Heredoc Body Boundaries and Invalid xargs Counts (2026-08-31)
 
 Status: **complete**

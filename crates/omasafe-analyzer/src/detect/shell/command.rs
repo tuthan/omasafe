@@ -122,7 +122,7 @@ pub(in crate::detect) fn env_split_string_command(
     })
 }
 
-fn is_env_assignment(token: &str) -> bool {
+pub(in crate::detect) fn is_env_assignment(token: &str) -> bool {
     let Some(equals) = token.find('=') else {
         return false;
     };
