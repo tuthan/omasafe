@@ -164,7 +164,7 @@ pub(in crate::detect) fn ir_command_effects(
     let stdout_redirected = ir_redirects_move_stdout(&command.redirects);
     let stdin_redirected = ir_redirects_move_stdin(&command.redirects);
     let body = command.body.as_ref();
-    with_ir_script_command(command, |script_command| {
+    let mut effects = with_ir_script_command(command, |script_command| {
         command_effects_with_body_summary(
             script_command,
             stdout_redirected,
@@ -172,7 +172,16 @@ pub(in crate::detect) fn ir_command_effects(
             body,
             budget,
         )
-    })
+    });
+    if !matches!(
+        effects.execution,
+        ExecutionEffect::ExecutesStdin | ExecutionEffect::ExecutesTaintedArgument
+    ) && ir_command_consumes_stdin_substitution(command, budget)
+    {
+        effects.stdin = StdinEffect::Consumed;
+        effects.execution = ExecutionEffect::ExecutesTaintedArgument;
+    }
+    effects
 }
 
 /// Whether a typed command's behavior depends on the stdin it inherits from
@@ -377,6 +386,26 @@ fn body_summary_from_ir(body: &ExecutedBody, budget: &mut ShellBudget) -> ShellS
     summary
 }
 
+fn ir_command_consumes_stdin_substitution(command: &IrCommand, budget: &mut ShellBudget) -> bool {
+    let eval = command.head == "eval";
+    command.args.iter().any(|word| {
+        word.substitutions.iter().any(|substitution| {
+            if substitution.kind != SubstKind::Command {
+                return false;
+            }
+            let Some(program) = substitution.program.as_deref() else {
+                return false;
+            };
+            let body = ExecutedBody {
+                source: substitution.source.clone(),
+                program: Some(Box::new(program.clone())),
+            };
+            let summary = body_summary_from_ir(&body, budget);
+            summary.consumes_stdin_as_code || (eval && summary.forwards_stdin_body)
+        })
+    })
+}
+
 fn ir_redirects_move_stdout(redirects: &[IrRedirect]) -> bool {
     redirects.iter().any(|redirect| {
         redirect_moves_stdout_away(
@@ -437,10 +466,10 @@ pub(in crate::detect) fn tokens_live_fetch_stdout(
 }
 
 /// Explicit stdin-to-code consumers beyond interpreters: `source
-/// /dev/stdin` (and the `.` spelling, whose basename is empty) executes the
+/// /dev/stdin` (and the `.` spelling) executes the
 /// pipe directly, and `xargs` hands its input words to the wrapped command.
 fn stdin_code_consumer(command: &ScriptCommand) -> bool {
-    if matches!(command.head, "source" | "") {
+    if matches!(command.head, "source" | ".") {
         return command
             .args
             .first()
@@ -819,7 +848,10 @@ fn group_stdin_reaches_interpreter(group: &[ShellToken], budget: &mut ShellBudge
             }
             // The group's pipe survives the statement only if its leading
             // command never read it.
-            if pipe_alive && effects[0] != StdinEffect::Unread {
+            if pipe_alive
+                && effects[0] != StdinEffect::Unread
+                && !depth_zero_redirect_moves_stdin_away(segments[0])
+            {
                 pipe_alive = false;
                 drained = true;
             }
@@ -867,7 +899,10 @@ fn group_forwards_stdin(group: &[ShellToken], budget: &mut ShellBudget) -> bool 
             if data {
                 forwards = true;
             }
-            if pipe_alive && effects[0] != StdinEffect::Unread {
+            if pipe_alive
+                && effects[0] != StdinEffect::Unread
+                && !depth_zero_redirect_moves_stdin_away(segments[0])
+            {
                 pipe_alive = false;
             }
         }
@@ -893,7 +928,10 @@ pub(in crate::detect) fn ir_node_stdin_effect(
         CommandNode::Subshell { redirects, .. }
         | CommandNode::BraceGroup { redirects, .. }
         | CommandNode::Arithmetic { redirects, .. }
-        | CommandNode::ControlFlow { redirects, .. }
+        | CommandNode::If { redirects, .. }
+        | CommandNode::Loop { redirects, .. }
+        | CommandNode::For { redirects, .. }
+        | CommandNode::Case { redirects, .. }
         | CommandNode::Opaque { redirects, .. } => redirects,
     };
     if ir_redirects_move_stdin(redirects) {
@@ -904,10 +942,131 @@ pub(in crate::detect) fn ir_node_stdin_effect(
         CommandNode::Subshell { body, .. } | CommandNode::BraceGroup { body, .. } => {
             ir_group_stdin_effect(body, budget)
         }
-        CommandNode::Arithmetic { .. }
-        | CommandNode::ControlFlow { .. }
-        | CommandNode::Opaque { .. } => StdinEffect::Unread,
+        CommandNode::Arithmetic { .. } | CommandNode::Opaque { .. } => StdinEffect::Unread,
+        CommandNode::If {
+            condition,
+            then_body,
+            elif_branches,
+            else_body,
+            ..
+        } => control_stdin_effect(
+            condition,
+            then_body,
+            elif_branches
+                .iter()
+                .flat_map(|branch| branch.body.iter())
+                .chain(else_body.iter()),
+            budget,
+        ),
+        CommandNode::Loop {
+            condition, body, ..
+        } => control_stdin_effect(condition, body, std::iter::empty(), budget),
+        CommandNode::For { body, .. } => {
+            control_stdin_effect(&[], body, std::iter::empty(), budget)
+        }
+        CommandNode::Case { branches, .. } => control_stdin_effect(
+            &[],
+            &[],
+            branches.iter().flat_map(|branch| branch.body.iter()),
+            budget,
+        ),
     }
+}
+
+fn control_stdin_effect<'a>(
+    condition: &[super::ir::Statement],
+    body: &[super::ir::Statement],
+    extra: impl Iterator<Item = &'a super::ir::Statement>,
+    budget: &mut ShellBudget,
+) -> StdinEffect {
+    for statements in [condition, body] {
+        let effect = ir_group_stdin_effect(statements, budget);
+        if effect != StdinEffect::Unread {
+            return effect;
+        }
+    }
+    for statement in extra {
+        let effect = ir_group_stdin_effect(std::slice::from_ref(statement), budget);
+        if effect != StdinEffect::Unread {
+            return effect;
+        }
+    }
+    StdinEffect::Unread
+}
+
+fn control_reaches_interpreter(
+    condition: &[super::ir::Statement],
+    then_body: &[super::ir::Statement],
+    elif_branches: &[super::ir::Branch],
+    else_body: &[super::ir::Statement],
+    budget: &mut ShellBudget,
+) -> bool {
+    statements_reach_interpreter(condition, budget)
+        || statements_reach_interpreter(then_body, budget)
+        || elif_branches.iter().any(|branch| {
+            statements_reach_interpreter(&branch.condition, budget)
+                || statements_reach_interpreter(&branch.body, budget)
+        })
+        || statements_reach_interpreter(else_body, budget)
+}
+
+fn statements_reach_interpreter(
+    statements: &[super::ir::Statement],
+    budget: &mut ShellBudget,
+) -> bool {
+    statements
+        .iter()
+        .filter(|statement| statement.reachable.is_reachable())
+        .any(|statement| {
+            statement.pipelines.iter().any(|pipeline| {
+                pipeline
+                    .commands
+                    .iter()
+                    .any(|node| ir_node_reaches_interpreter(node, budget))
+            })
+        })
+}
+
+fn control_forwards_stdin(
+    then_body: &[super::ir::Statement],
+    elif_branches: &[super::ir::Branch],
+    else_body: &[super::ir::Statement],
+    budget: &mut ShellBudget,
+) -> bool {
+    statements_forward_stdin(then_body, budget)
+        || elif_branches
+            .iter()
+            .any(|branch| statements_forward_stdin(&branch.body, budget))
+        || statements_forward_stdin(else_body, budget)
+}
+
+fn statements_forward_stdin(statements: &[super::ir::Statement], budget: &mut ShellBudget) -> bool {
+    statements
+        .iter()
+        .filter(|statement| statement.reachable.is_reachable())
+        .any(|statement| {
+            statement.pipelines.iter().any(|pipeline| {
+                !pipeline.commands.is_empty()
+                    && pipeline.commands.iter().all(|node| {
+                        ir_node_stdin_effect(node, budget) == StdinEffect::ForwardedDerivedData
+                    })
+            })
+        })
+}
+
+fn node_redirects_stdin(node: &CommandNode) -> bool {
+    let redirects = match node {
+        CommandNode::Simple(command) => &command.redirects,
+        CommandNode::Subshell { redirects, .. }
+        | CommandNode::BraceGroup { redirects, .. }
+        | CommandNode::Arithmetic { redirects, .. }
+        | CommandNode::If { redirects, .. }
+        | CommandNode::Loop { redirects, .. }
+        | CommandNode::For { redirects, .. }
+        | CommandNode::Case { redirects, .. }
+        | CommandNode::Opaque { redirects, .. } => redirects,
+    };
+    ir_redirects_move_stdin(redirects)
 }
 
 fn ir_group_stdin_effect(body: &[super::ir::Statement], budget: &mut ShellBudget) -> StdinEffect {
@@ -916,7 +1075,7 @@ fn ir_group_stdin_effect(body: &[super::ir::Statement], budget: &mut ShellBudget
     }
     let effect = body
         .iter()
-        .filter(|statement| statement.reachable)
+        .filter(|statement| statement.reachable.is_reachable())
         .filter_map(|statement| statement.pipelines.first())
         .filter_map(|pipeline| pipeline.commands.first())
         .map(|node| ir_node_stdin_effect(node, budget))
@@ -938,7 +1097,10 @@ pub(in crate::detect) fn ir_node_reaches_interpreter(
         CommandNode::Subshell { redirects, .. }
         | CommandNode::BraceGroup { redirects, .. }
         | CommandNode::Arithmetic { redirects, .. }
-        | CommandNode::ControlFlow { redirects, .. }
+        | CommandNode::If { redirects, .. }
+        | CommandNode::Loop { redirects, .. }
+        | CommandNode::For { redirects, .. }
+        | CommandNode::Case { redirects, .. }
         | CommandNode::Opaque { redirects, .. } => redirects,
     };
     if ir_redirects_move_stdin(redirects) {
@@ -952,9 +1114,24 @@ pub(in crate::detect) fn ir_node_reaches_interpreter(
         CommandNode::Subshell { body, .. } | CommandNode::BraceGroup { body, .. } => {
             ir_group_reaches_interpreter(body, budget)
         }
-        CommandNode::Arithmetic { .. }
-        | CommandNode::ControlFlow { .. }
-        | CommandNode::Opaque { .. } => false,
+        CommandNode::Arithmetic { .. } | CommandNode::Opaque { .. } => false,
+        CommandNode::If {
+            condition,
+            then_body,
+            elif_branches,
+            else_body,
+            ..
+        } => control_reaches_interpreter(condition, then_body, elif_branches, else_body, budget),
+        CommandNode::Loop {
+            condition, body, ..
+        } => {
+            statements_reach_interpreter(condition, budget)
+                || statements_reach_interpreter(body, budget)
+        }
+        CommandNode::For { body, .. } => statements_reach_interpreter(body, budget),
+        CommandNode::Case { branches, .. } => branches
+            .iter()
+            .any(|branch| statements_reach_interpreter(&branch.body, budget)),
     }
 }
 
@@ -972,7 +1149,10 @@ fn ir_group_stdin_reaches_interpreter(
     let mut pipe_alive = true;
     let mut reached = false;
     let mut drained = false;
-    for statement in body.iter().filter(|statement| statement.reachable) {
+    for statement in body
+        .iter()
+        .filter(|statement| statement.reachable.is_reachable())
+    {
         for pipeline in &statement.pipelines {
             if pipeline.commands.is_empty() {
                 continue;
@@ -991,7 +1171,10 @@ fn ir_group_stdin_reaches_interpreter(
                     data &= effects[index] == StdinEffect::ForwardedDerivedData;
                 }
             }
-            if pipe_alive && effects[0] != StdinEffect::Unread {
+            if pipe_alive
+                && effects[0] != StdinEffect::Unread
+                && !node_redirects_stdin(&pipeline.commands[0])
+            {
                 pipe_alive = false;
                 drained = true;
             }
@@ -1007,7 +1190,10 @@ fn ir_group_forwards_stdin(body: &[super::ir::Statement], budget: &mut ShellBudg
     }
     let mut pipe_alive = true;
     let mut forwards = false;
-    for statement in body.iter().filter(|statement| statement.reachable) {
+    for statement in body
+        .iter()
+        .filter(|statement| statement.reachable.is_reachable())
+    {
         for pipeline in &statement.pipelines {
             if pipeline.commands.is_empty() {
                 continue;
@@ -1024,7 +1210,10 @@ fn ir_group_forwards_stdin(body: &[super::ir::Statement], budget: &mut ShellBudg
             {
                 forwards = true;
             }
-            if pipe_alive && effects[0] != StdinEffect::Unread {
+            if pipe_alive
+                && effects[0] != StdinEffect::Unread
+                && !node_redirects_stdin(&pipeline.commands[0])
+            {
                 pipe_alive = false;
             }
         }
@@ -1048,7 +1237,10 @@ pub(in crate::detect) fn ir_node_stdout_preserved(
         CommandNode::Subshell { redirects, .. }
         | CommandNode::BraceGroup { redirects, .. }
         | CommandNode::Arithmetic { redirects, .. }
-        | CommandNode::ControlFlow { redirects, .. }
+        | CommandNode::If { redirects, .. }
+        | CommandNode::Loop { redirects, .. }
+        | CommandNode::For { redirects, .. }
+        | CommandNode::Case { redirects, .. }
         | CommandNode::Opaque { redirects, .. } => redirects,
     };
     if ir_redirects_move_stdout(redirects) {
@@ -1061,9 +1253,19 @@ pub(in crate::detect) fn ir_node_stdout_preserved(
         CommandNode::Subshell { body, .. } | CommandNode::BraceGroup { body, .. } => {
             ir_group_forwards_stdin(body, budget)
         }
-        CommandNode::Arithmetic { .. }
-        | CommandNode::ControlFlow { .. }
-        | CommandNode::Opaque { .. } => false,
+        CommandNode::Arithmetic { .. } | CommandNode::Opaque { .. } => false,
+        CommandNode::If {
+            then_body,
+            elif_branches,
+            else_body,
+            ..
+        } => control_forwards_stdin(then_body, elif_branches, else_body, budget),
+        CommandNode::Loop { body, .. } | CommandNode::For { body, .. } => {
+            statements_forward_stdin(body, budget)
+        }
+        CommandNode::Case { branches, .. } => branches
+            .iter()
+            .any(|branch| statements_forward_stdin(&branch.body, budget)),
     }
 }
 

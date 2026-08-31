@@ -13,7 +13,7 @@
 //! fate of a forwarded body are injected by the facade as classifiers, so
 //! the source layer stays free of interpreter and command modeling.
 
-use super::lexer::{ShellToken, redirect_operator_at, tokenize};
+use super::lexer::{ShellToken, control_flow_depth, redirect_operator_at, tokenize};
 
 /// Internal line marker used for removed heredoc bodies and terminators. It
 /// preserves physical line numbers without letting artificial blank lines
@@ -161,16 +161,19 @@ impl UnitAssembler {
         // The lexer, rather than raw bytes, decides whether a compound list
         // remains open. In particular `foo{` and an escaped `\\|` are words,
         // not group/pipeline syntax.
-        let token_depth =
-            tokenize(&self.text)
-                .iter()
-                .fold(0i32, |depth, token| match token.operator() {
-                    Some("(" | "{" | "((") => depth + 1,
-                    Some(")" | "}" | "))") => (depth - 1).max(0),
-                    _ => depth,
-                });
-        self.open =
-            self.lex.has_open_quote() || token_depth > 0 || trailing_pipeline_operator(&self.text);
+        let tokens = tokenize(&self.text);
+        let control_depth = control_flow_depth(&tokens);
+        let token_depth = tokens
+            .iter()
+            .fold(0i32, |depth, token| match token.operator() {
+                Some("(" | "{" | "((") => depth + 1,
+                Some(")" | "}" | "))") => (depth - 1).max(0),
+                _ => depth,
+            });
+        self.open = self.lex.has_open_quote()
+            || token_depth > 0
+            || control_depth > 0
+            || trailing_pipeline_operator(&self.text);
         if self.open {
             // A newline inside an open quote or backtick is body DATA: the
             // quoted text stays whole, and whatever reparses it (an eval or
@@ -180,7 +183,9 @@ impl UnitAssembler {
             // is whitespace instead.
             if self.lex.has_open_quote() {
                 self.text.push('\n');
-            } else if token_depth > 0 && !trailing_pipeline_operator(&self.text) {
+            } else if (token_depth > 0 || control_depth > 0)
+                && !trailing_pipeline_operator(&self.text)
+            {
                 self.text.push(';');
             } else {
                 self.text.push(' ');

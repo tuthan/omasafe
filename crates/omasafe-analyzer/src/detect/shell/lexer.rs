@@ -229,6 +229,38 @@ pub(in crate::detect) fn tokenize(input: &str) -> Vec<ShellToken> {
     tokens
 }
 
+/// Approximate control-block depth for the logical-source assembler. Control
+/// keywords are recognized only at command starts, so an argument such as
+/// `echo if` cannot keep the following physical line attached. Group and
+/// substitution punctuation remains ordinary lexer structure here; the
+/// parser performs the full grammar-aware split later.
+pub(in crate::detect) fn control_flow_depth(tokens: &[ShellToken]) -> i32 {
+    let mut depth = 0i32;
+    let mut command_start = true;
+    for token in tokens {
+        match token {
+            ShellToken::Operator(operator) => match operator.as_str() {
+                ";" | "&&" | "||" | "&" | "|" | "|&" | "(" | "{" => {
+                    command_start = true;
+                }
+                ")" | "}" => command_start = true,
+                _ => {}
+            },
+            ShellToken::Word { value, .. } => {
+                if command_start {
+                    match value.as_str() {
+                        "if" | "while" | "until" | "for" | "case" => depth += 1,
+                        "fi" | "done" | "esac" => depth = (depth - 1).max(0),
+                        _ => {}
+                    }
+                }
+                command_start = matches!(value.as_str(), "then" | "elif" | "else" | "do" | "in");
+            }
+        }
+    }
+    depth
+}
+
 /// Close of an arithmetic command opened by the `((` at `start`: the `))`
 /// pair that returns paren depth to the opening pair, honouring nesting and
 /// quotes (`(( (1+2)*3 ))` closes at the end, while `((a) && echo b)` never

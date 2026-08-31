@@ -2642,6 +2642,54 @@ malformed/UTF-8 input safety, and cache re-anchoring. The Stage B code slices
 are committed as `fa886e2` and `7464bba`; the full two-configuration
 verification gate below is the closure gate for this stage.
 
+## Stage B — Reopened Closure: Dataflow, Provenance, and Control Flow (2026-08-31)
+
+Status: **complete**
+
+Stage B was reopened after the initial child-program closure to fix two
+behavioral regressions and complete the typed ownership boundary:
+
+1. `3bea9df` — decoder output now carries both stdout reachability and
+   dependence on inherited stdin. Parent `sh -c`/`eval` redirects compose
+   correctly: stdout redirects suppress output, stdin redirects suppress only
+   stdin-dependent decoders, stderr-only redirects remain live, and
+   file-backed decoders remain live. The requested `sh -c` and `eval` matrices
+   are covered.
+2. `2b5d64d` — fetch and decoder liveness now use one left-to-right typed
+   pipeline pass with one effect summary per node. A 1,001-stage benign
+   pipeline stays within a linear budget bound and still preserves a later
+   `(curl URL | sh)` finding. Raw compatibility walks are limited to opaque or
+   depth-capped children; typed consumed-substitution handling covers `eval`,
+   source, and process substitutions.
+3. `36f3c7f` — word provenance is an additive cause bitset collected by the
+   lexer with quote context. Mixed causes such as parameter plus command
+   substitution, unquoted field splitting, globbing, tilde, brace, and
+   arithmetic expansion remain distinguishable; quoted expansions do not gain
+   field-splitting provenance.
+4. `4b3e73a` — control flow is represented by structured `If`, `Loop`, `For`,
+   and `Case` nodes with `Always`/`Never`/`Maybe` reachability. Multiline
+   control units, child `-c`/`eval` programs, and substitution programs share
+   the logical-unit/heredoc frontend. Typed group, arithmetic, branch, and
+   child walks now own their findings.
+
+Verification:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+cargo test --workspace                         # 250 analyzer, 75 CLI
+cargo test --workspace --no-default-features   # 240 analyzer, 75 CLI
+./scripts/generate-cli-assets.sh --check
+./scripts/determinism-canary.sh
+python3 scripts/test_corpus_tooling.py
+git diff --check
+```
+
+A differential scan of all 15 checked-in plugin fixtures against
+`8c99b12` (default feature configuration) produced identical analysis and
+exit results for every fixture. Stage B is closed again.
+
 ## Plan A4 — Detector Family Extraction
 
 Status: **complete**

@@ -16,7 +16,10 @@ use super::effects::{
     ir_node_reaches_interpreter, ir_node_stdout_preserved, pipeline_has_live_producer,
     segment_has_live_producer, segment_stdin_reaches_interpreter, stdout_reaches,
 };
-use super::egress::{node_has_live_fetch_stdout, node_has_live_fetch_stdout_with_effects};
+use super::egress::{
+    ir_program_live_fetch_stdout, node_has_live_fetch_stdout,
+    node_has_live_fetch_stdout_with_effects,
+};
 use super::indicators::{
     chmod_relaxes_shared_temp, reverse_shell_spelling, segment_has_shared_temp_path,
 };
@@ -81,6 +84,7 @@ pub(in crate::detect) fn shell_consumption_findings(
         }
     }
     let use_legacy_pairing = shell_unit.is_none() || typed_pairing.is_some_and(|pairing| pairing.2);
+    let use_legacy_structural_walk = use_legacy_pairing;
     let mut outcomes = Outcomes::ANY;
     for (statement, guard) in conditional_statements(tokens) {
         if statement.is_empty() {
@@ -94,7 +98,11 @@ pub(in crate::detect) fn shell_consumption_findings(
         // execute — `eval`'s command substitutions and an interpreter's
         // process substitutions — re-parsed with the same command-position
         // rules.
-        let consumed = consumed_substitutions(statement);
+        let consumed = if use_legacy_structural_walk {
+            consumed_substitutions(statement)
+        } else {
+            Vec::new()
+        };
 
         // Download-execute: a fetch-tool command feeding an interpreter
         // through the pipeline, or heading a consumed span.
@@ -184,96 +192,104 @@ pub(in crate::detect) fn shell_consumption_findings(
             }
         }
 
-        // Static bodies execute with the statement: an interpreter's `-c`
-        // body or an `eval` argument is real shell text, so every family
-        // applies inside it too (`eval 'curl URL | sh'` and
-        // `sh -c 'curl URL | sh'` run the pipeline now). Runtime-derived
-        // bodies are outside the static slice.
-        for segment in pipeline_segments(statement) {
-            for command in segment_commands(segment) {
-                let Some(body) = static_command_body(&command) else {
-                    continue;
-                };
-                for finding in
-                    cached_body_consumption_findings(&body, number, download_rule, budget)
-                {
-                    push_finding(found, finding);
-                }
-            }
-        }
-
-        // A subshell or brace group executes its interior as its own
-        // statement list, so the same families apply inside it instead of
-        // the group's separators merely being hidden from this pass. An
-        // arithmetic command evaluates its interior as an expression whose
-        // words are never commands — but genuine command substitutions
-        // nested in it DO execute (`(( $(curl URL | sh) + 1 ))`).
-        for (kind, group) in grouped_token_ranges(statement) {
-            match kind {
-                GroupKind::List => {
-                    if budget.enter() {
-                        shell_consumption_findings(
-                            group,
-                            None,
-                            number,
-                            download_rule,
-                            found,
-                            budget,
-                        );
-                        budget.leave();
-                    }
-                }
-                GroupKind::Arithmetic => {
-                    if budget.enter() {
-                        tokens_arithmetic_consumption(group, number, download_rule, found, budget);
-                        budget.leave();
+        if use_legacy_structural_walk {
+            // Static bodies execute with the statement: an interpreter's `-c`
+            // body or an `eval` argument is real shell text, so every family
+            // applies inside it too (`eval 'curl URL | sh'` and
+            // `sh -c 'curl URL | sh'` run the pipeline now). Runtime-derived
+            // bodies are outside the static slice.
+            for segment in pipeline_segments(statement) {
+                for command in segment_commands(segment) {
+                    let Some(body) = static_command_body(&command) else {
+                        continue;
+                    };
+                    for finding in
+                        cached_body_consumption_findings(&body, number, download_rule, budget)
+                    {
+                        push_finding(found, finding);
                     }
                 }
             }
-        }
 
-        // A command or process substitution ALWAYS executes its interior —
-        // only whether its resulting OUTPUT is further consumed depends on
-        // the outer head (consumed_substitutions). The families therefore
-        // also apply inside it directly: `payload=$(curl URL | sh)` runs
-        // the pipeline now. Words inside groups are reached by the group
-        // recursion above; only the statement's own depth is walked here.
-        let mut depth = 0i32;
-        for token in statement {
-            match token {
-                ShellToken::Operator(op) => match op.as_str() {
-                    "(" | "{" | "((" => depth += 1,
-                    ")" | "}" | "))" => depth = (depth - 1).max(0),
-                    _ => {}
-                },
-                ShellToken::Word { substitutions, .. } if depth == 0 => {
-                    for substitution in substitutions {
-                        match substitution.kind {
-                            SubstKind::Command | SubstKind::Process => {
-                                if !budget.enter() {
-                                    break;
-                                }
-                                shell_consumption_findings(
-                                    &tokenize(&substitution.inner),
-                                    None,
-                                    number,
-                                    download_rule,
-                                    found,
-                                    budget,
-                                );
-                                budget.leave();
-                            }
-                            SubstKind::Arithmetic => arithmetic_consumption_findings(
-                                &substitution.inner,
+            // A subshell or brace group executes its interior as its own
+            // statement list, so the same families apply inside it instead of
+            // the group's separators merely being hidden from this pass. An
+            // arithmetic command evaluates its interior as an expression whose
+            // words are never commands — but genuine command substitutions
+            // nested in it DO execute (`(( $(curl URL | sh) + 1 ))`).
+            for (kind, group) in grouped_token_ranges(statement) {
+                match kind {
+                    GroupKind::List => {
+                        if budget.enter() {
+                            shell_consumption_findings(
+                                group,
+                                None,
                                 number,
                                 download_rule,
                                 found,
                                 budget,
-                            ),
+                            );
+                            budget.leave();
+                        }
+                    }
+                    GroupKind::Arithmetic => {
+                        if budget.enter() {
+                            tokens_arithmetic_consumption(
+                                group,
+                                number,
+                                download_rule,
+                                found,
+                                budget,
+                            );
+                            budget.leave();
                         }
                     }
                 }
-                _ => {}
+            }
+
+            // A command or process substitution ALWAYS executes its interior —
+            // only whether its resulting OUTPUT is further consumed depends on
+            // the outer head (consumed_substitutions). The families therefore
+            // also apply inside it directly: `payload=$(curl URL | sh)` runs
+            // the pipeline now. Words inside groups are reached by the group
+            // recursion above; only the statement's own depth is walked here.
+            let mut depth = 0i32;
+            for token in statement {
+                match token {
+                    ShellToken::Operator(op) => match op.as_str() {
+                        "(" | "{" | "((" => depth += 1,
+                        ")" | "}" | "))" => depth = (depth - 1).max(0),
+                        _ => {}
+                    },
+                    ShellToken::Word { substitutions, .. } if depth == 0 => {
+                        for substitution in substitutions {
+                            match substitution.kind {
+                                SubstKind::Command | SubstKind::Process => {
+                                    if !budget.enter() {
+                                        break;
+                                    }
+                                    shell_consumption_findings(
+                                        &tokenize(&substitution.inner),
+                                        None,
+                                        number,
+                                        download_rule,
+                                        found,
+                                        budget,
+                                    );
+                                    budget.leave();
+                                }
+                                SubstKind::Arithmetic => arithmetic_consumption_findings(
+                                    &substitution.inner,
+                                    number,
+                                    download_rule,
+                                    found,
+                                    budget,
+                                ),
+                            }
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
 
@@ -292,7 +308,10 @@ fn typed_child_consumption_findings(
     budget: &mut ShellBudget,
 ) -> Vec<ResultParts> {
     let mut found = Vec::new();
-    for statement in statements.iter().filter(|statement| statement.reachable) {
+    for statement in statements
+        .iter()
+        .filter(|statement| statement.reachable.is_reachable())
+    {
         for pipeline in &statement.pipelines {
             for node in &pipeline.commands {
                 typed_node_child_findings(node, number, download_rule, budget, &mut found);
@@ -300,6 +319,48 @@ fn typed_child_consumption_findings(
         }
     }
     found
+}
+
+fn append_typed_statement_findings(
+    statements: &[super::ir::Statement],
+    number: u32,
+    download_rule: &'static str,
+    budget: &mut ShellBudget,
+    found: &mut Vec<ResultParts>,
+) {
+    for statement in statements
+        .iter()
+        .filter(|statement| statement.reachable.is_reachable())
+    {
+        for pipeline in &statement.pipelines {
+            let (download_execute, decode_execute, _) = typed_pipeline_pairing(pipeline, budget);
+            if download_execute {
+                push_finding(
+                    found,
+                    parts(
+                        download_rule,
+                        number,
+                        "download-execute",
+                        Confidence::LexicalFallback,
+                    ),
+                );
+            }
+            if decode_execute {
+                push_finding(
+                    found,
+                    parts(
+                        SCRIPT_DECODE_EXECUTE_RULE,
+                        number,
+                        "decode-execute",
+                        Confidence::LexicalFallback,
+                    ),
+                );
+            }
+            for node in &pipeline.commands {
+                typed_node_child_findings(node, number, download_rule, budget, found);
+            }
+        }
+    }
 }
 
 fn typed_node_child_findings(
@@ -314,29 +375,139 @@ fn typed_node_child_findings(
             if let Some(body) = &command.body {
                 append_child_program_findings(body, number, download_rule, budget, found);
             }
-            for word in &command.args {
-                for substitution in &word.substitutions {
-                    if matches!(substitution.kind, SubstKind::Command | SubstKind::Process) {
-                        let body = ExecutedBody {
-                            source: substitution.source.clone(),
-                            program: substitution.program.clone(),
-                        };
-                        append_child_program_findings(&body, number, download_rule, budget, found);
-                    }
+            for wrapper in &command.wrappers {
+                for word in &wrapper.args {
+                    append_word_child_findings(word, number, download_rule, budget, found);
                 }
             }
-        }
-        CommandNode::Subshell { body, .. } | CommandNode::BraceGroup { body, .. } => {
-            found.extend(typed_child_consumption_findings(
-                body,
+            for word in &command.args {
+                append_word_child_findings(word, number, download_rule, budget, found);
+            }
+            append_typed_consumed_substitution_findings(
+                command,
                 number,
                 download_rule,
                 budget,
-            ));
+                found,
+            );
         }
-        CommandNode::Arithmetic { .. }
-        | CommandNode::ControlFlow { .. }
-        | CommandNode::Opaque { .. } => {}
+        CommandNode::Subshell { body, .. } | CommandNode::BraceGroup { body, .. } => {
+            append_typed_statement_findings(body, number, download_rule, budget, found);
+        }
+        CommandNode::Arithmetic { expression, .. } => {
+            for word in expression {
+                append_word_child_findings(word, number, download_rule, budget, found);
+            }
+        }
+        CommandNode::If {
+            condition,
+            then_body,
+            elif_branches,
+            else_body,
+            ..
+        } => {
+            append_typed_statement_findings(condition, number, download_rule, budget, found);
+            append_typed_statement_findings(then_body, number, download_rule, budget, found);
+            for branch in elif_branches {
+                append_typed_statement_findings(
+                    &branch.condition,
+                    number,
+                    download_rule,
+                    budget,
+                    found,
+                );
+                append_typed_statement_findings(&branch.body, number, download_rule, budget, found);
+            }
+            append_typed_statement_findings(else_body, number, download_rule, budget, found);
+        }
+        CommandNode::Loop {
+            condition, body, ..
+        } => {
+            append_typed_statement_findings(condition, number, download_rule, budget, found);
+            append_typed_statement_findings(body, number, download_rule, budget, found);
+        }
+        CommandNode::For { body, .. } => {
+            append_typed_statement_findings(body, number, download_rule, budget, found)
+        }
+        CommandNode::Case { word, branches, .. } => {
+            append_word_child_findings(word, number, download_rule, budget, found);
+            for branch in branches {
+                append_typed_statement_findings(&branch.body, number, download_rule, budget, found);
+            }
+        }
+        CommandNode::Opaque { .. } => {}
+    }
+}
+
+fn append_word_child_findings(
+    word: &super::ir::Word,
+    number: u32,
+    download_rule: &'static str,
+    budget: &mut ShellBudget,
+    found: &mut Vec<ResultParts>,
+) {
+    for substitution in &word.substitutions {
+        if matches!(substitution.kind, SubstKind::Command | SubstKind::Process) {
+            let body = ExecutedBody {
+                source: substitution.source.clone(),
+                program: substitution.program.clone(),
+            };
+            append_child_program_findings(&body, number, download_rule, budget, found);
+        }
+    }
+}
+
+fn append_typed_consumed_substitution_findings(
+    command: &super::ir::Command,
+    number: u32,
+    download_rule: &'static str,
+    budget: &mut ShellBudget,
+    found: &mut Vec<ResultParts>,
+) {
+    let consumes_command_substitution = command.head == "eval";
+    let consumes_process_substitution = INTERPRETER_BASENAMES.contains(&command.head.as_str())
+        || command.head == "source"
+        || command.head == ".";
+    if !consumes_command_substitution && !consumes_process_substitution {
+        return;
+    }
+
+    for word in &command.args {
+        for substitution in &word.substitutions {
+            let consumed = match substitution.kind {
+                SubstKind::Command => consumes_command_substitution,
+                SubstKind::Process => consumes_process_substitution,
+                SubstKind::Arithmetic => false,
+            };
+            if !consumed {
+                continue;
+            }
+            let Some(program) = substitution.program.as_deref() else {
+                continue;
+            };
+            if ir_program_live_fetch_stdout(program, budget) {
+                push_finding(
+                    found,
+                    parts(
+                        download_rule,
+                        number,
+                        "download-execute",
+                        Confidence::LexicalFallback,
+                    ),
+                );
+            }
+            if typed_program_executes_decoder(program, budget) {
+                push_finding(
+                    found,
+                    parts(
+                        SCRIPT_DECODE_EXECUTE_RULE,
+                        number,
+                        "decode-execute",
+                        Confidence::LexicalFallback,
+                    ),
+                );
+            }
+        }
     }
 }
 
@@ -423,7 +594,7 @@ fn typed_unit_pairing(unit: &LogicalUnit, budget: &mut ShellBudget) -> (bool, bo
     for statement in unit
         .statements
         .iter()
-        .filter(|statement| statement.reachable)
+        .filter(|statement| statement.reachable.is_reachable())
     {
         for pipeline in &statement.pipelines {
             let (download, decode, fallback) = typed_pipeline_pairing(pipeline, budget);
@@ -519,12 +690,16 @@ fn summarize_node_once(node: &CommandNode, budget: &mut ShellBudget) -> NodeSumm
             produces_decoder: false,
             needs_legacy_fallback: false,
         },
-        CommandNode::Arithmetic { .. } | CommandNode::ControlFlow { .. } => NodeSummary {
-            executes_stdin: false,
-            forwards_stdin: false,
-            produces_fetch: false,
+        CommandNode::If { .. }
+        | CommandNode::Loop { .. }
+        | CommandNode::For { .. }
+        | CommandNode::Case { .. }
+        | CommandNode::Arithmetic { .. } => NodeSummary {
+            executes_stdin: ir_node_reaches_interpreter(node, budget),
+            forwards_stdin: ir_node_stdout_preserved(node, budget),
+            produces_fetch: node_has_live_fetch_stdout(node, budget),
             produces_decoder: false,
-            needs_legacy_fallback: true,
+            needs_legacy_fallback: false,
         },
         CommandNode::Opaque { .. } => NodeSummary {
             executes_stdin: false,
@@ -568,9 +743,26 @@ fn typed_node_decoder_output(
             }
         }
         CommandNode::Subshell { .. } | CommandNode::BraceGroup { .. } => DecoderOutput::NONE,
-        CommandNode::Arithmetic { .. }
-        | CommandNode::ControlFlow { .. }
-        | CommandNode::Opaque { .. } => DecoderOutput::NONE,
+        CommandNode::If {
+            condition,
+            then_body,
+            elif_branches,
+            else_body,
+            ..
+        } => typed_control_decoder_output(condition, then_body, elif_branches, else_body, budget),
+        CommandNode::Loop {
+            condition, body, ..
+        } => typed_statement_decoder_output(condition, budget)
+            .or_else(|| typed_statement_decoder_output(body, budget))
+            .unwrap_or(DecoderOutput::NONE),
+        CommandNode::For { body, .. } => {
+            typed_statement_decoder_output(body, budget).unwrap_or(DecoderOutput::NONE)
+        }
+        CommandNode::Case { branches, .. } => branches
+            .iter()
+            .find_map(|branch| typed_statement_decoder_output(&branch.body, budget))
+            .unwrap_or(DecoderOutput::NONE),
+        CommandNode::Arithmetic { .. } | CommandNode::Opaque { .. } => DecoderOutput::NONE,
     }
 }
 
@@ -580,7 +772,10 @@ fn node_stdin_redirected(node: &CommandNode) -> bool {
         CommandNode::Subshell { redirects, .. }
         | CommandNode::BraceGroup { redirects, .. }
         | CommandNode::Arithmetic { redirects, .. }
-        | CommandNode::ControlFlow { redirects, .. }
+        | CommandNode::If { redirects, .. }
+        | CommandNode::Loop { redirects, .. }
+        | CommandNode::For { redirects, .. }
+        | CommandNode::Case { redirects, .. }
         | CommandNode::Opaque { redirects, .. } => redirects,
     };
     redirects.iter().any(|redirect| {
@@ -602,7 +797,7 @@ fn typed_program_decoder_output(program: &ShellProgram, budget: &mut ShellBudget
         for statement in unit
             .statements
             .iter()
-            .filter(|statement| statement.reachable)
+            .filter(|statement| statement.reachable.is_reachable())
         {
             for pipeline in &statement.pipelines {
                 for producer in 0..pipeline.commands.len() {
@@ -620,6 +815,71 @@ fn typed_program_decoder_output(program: &ShellProgram, budget: &mut ShellBudget
         }
     }
     DecoderOutput::NONE
+}
+
+fn typed_program_executes_decoder(program: &ShellProgram, budget: &mut ShellBudget) -> bool {
+    program.units().iter().any(|unit| {
+        unit.statements
+            .iter()
+            .filter(|statement| statement.reachable.is_reachable())
+            .any(|statement| {
+                statement.pipelines.iter().any(|pipeline| {
+                    let (_, decode_execute, _) = typed_pipeline_pairing(pipeline, budget);
+                    decode_execute
+                        || (0..pipeline.commands.len()).any(|producer| {
+                            let output = typed_node_decoder_output(
+                                &pipeline.commands[producer],
+                                budget,
+                                None,
+                            );
+                            output.reaches_stdout
+                                && pipeline.commands[producer + 1..]
+                                    .iter()
+                                    .all(|node| ir_node_stdout_preserved(node, budget))
+                        })
+                })
+            })
+    })
+}
+
+fn typed_control_decoder_output(
+    condition: &[super::ir::Statement],
+    then_body: &[super::ir::Statement],
+    elif_branches: &[super::ir::Branch],
+    else_body: &[super::ir::Statement],
+    budget: &mut ShellBudget,
+) -> DecoderOutput {
+    typed_statement_decoder_output(condition, budget)
+        .or_else(|| typed_statement_decoder_output(then_body, budget))
+        .or_else(|| {
+            elif_branches
+                .iter()
+                .find_map(|branch| typed_statement_decoder_output(&branch.body, budget))
+        })
+        .or_else(|| typed_statement_decoder_output(else_body, budget))
+        .unwrap_or(DecoderOutput::NONE)
+}
+
+fn typed_statement_decoder_output(
+    statements: &[super::ir::Statement],
+    budget: &mut ShellBudget,
+) -> Option<DecoderOutput> {
+    statements
+        .iter()
+        .filter(|statement| statement.reachable.is_reachable())
+        .find_map(|statement| {
+            statement.pipelines.iter().find_map(|pipeline| {
+                (0..pipeline.commands.len()).find_map(|producer| {
+                    let output =
+                        typed_node_decoder_output(&pipeline.commands[producer], budget, None);
+                    (output.reaches_stdout
+                        && pipeline.commands[producer + 1..]
+                            .iter()
+                            .all(|node| ir_node_stdout_preserved(node, budget)))
+                    .then_some(output)
+                })
+            })
+        })
 }
 
 /// Walk a static shell body once per analysis and cache its complete finding

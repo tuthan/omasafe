@@ -447,6 +447,9 @@ pub(in crate::detect) fn compound_position(
 /// Basename of a command token, tolerating prefixed punctuation left in a
 /// value by a substitution head (`$(curl`, `/usr/bin/nc`).
 pub(in crate::detect) fn command_basename(token: &str) -> &str {
+    if token == "." {
+        return token;
+    }
     let trimmed = token.trim_start_matches(|character: char| !character.is_ascii_alphanumeric());
     trimmed.rsplit('/').next().unwrap_or(trimmed)
 }

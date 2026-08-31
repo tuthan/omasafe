@@ -103,7 +103,7 @@ pub(in crate::detect) fn unit_has_direct_fetch(
 
 fn statements_have_direct_fetch(statements: &[Statement], budget: &mut ShellBudget) -> bool {
     statements.iter().any(|statement| {
-        statement.reachable
+        statement.reachable.is_reachable()
             && statement.pipelines.iter().any(|pipeline| {
                 pipeline
                     .commands
@@ -137,9 +137,39 @@ fn node_has_direct_fetch(node: &CommandNode, budget: &mut ShellBudget) -> bool {
         CommandNode::Subshell { body, .. } | CommandNode::BraceGroup { body, .. } => {
             statements_have_direct_fetch(body, budget)
         }
-        CommandNode::Arithmetic { .. }
-        | CommandNode::ControlFlow { .. }
-        | CommandNode::Opaque { .. } => false,
+        CommandNode::Arithmetic { .. } | CommandNode::Opaque { .. } => false,
+        CommandNode::If {
+            condition,
+            then_body,
+            elif_branches,
+            else_body,
+            ..
+        } => {
+            statements_have_direct_fetch(condition, budget)
+                || statements_have_direct_fetch(then_body, budget)
+                || elif_branches.iter().any(|branch| {
+                    statements_have_direct_fetch(&branch.condition, budget)
+                        || statements_have_direct_fetch(&branch.body, budget)
+                })
+                || statements_have_direct_fetch(else_body, budget)
+        }
+        CommandNode::Loop {
+            condition, body, ..
+        } => {
+            statements_have_direct_fetch(condition, budget)
+                || statements_have_direct_fetch(body, budget)
+        }
+        CommandNode::For { body, .. } => statements_have_direct_fetch(body, budget),
+        CommandNode::Case { word, branches, .. } => {
+            word.substitutions.iter().any(|substitution| {
+                substitution
+                    .program
+                    .as_deref()
+                    .is_some_and(|program| program_has_direct_fetch(program, budget))
+            }) || branches
+                .iter()
+                .any(|branch| statements_have_direct_fetch(&branch.body, budget))
+        }
     }
 }
 
@@ -149,7 +179,10 @@ fn node_stdout_redirected(node: &CommandNode) -> bool {
         CommandNode::Subshell { redirects, .. }
         | CommandNode::BraceGroup { redirects, .. }
         | CommandNode::Arithmetic { redirects, .. }
-        | CommandNode::ControlFlow { redirects, .. }
+        | CommandNode::If { redirects, .. }
+        | CommandNode::Loop { redirects, .. }
+        | CommandNode::For { redirects, .. }
+        | CommandNode::Case { redirects, .. }
         | CommandNode::Opaque { redirects, .. } => redirects,
     };
     redirects.iter().any(|redirect| {
@@ -183,7 +216,7 @@ pub(in crate::detect) fn ir_program_live_fetch_stdout(
     program.units().iter().any(|unit| {
         unit.statements
             .iter()
-            .filter(|statement| statement.reachable)
+            .filter(|statement| statement.reachable.is_reachable())
             .any(|statement| {
                 statement.pipelines.iter().any(|pipeline| {
                     (0..pipeline.commands.len()).any(|producer| {
@@ -236,16 +269,34 @@ pub(in crate::detect) fn node_has_live_fetch_stdout_with_effects(
             }
             statements_live_fetch_stdout(body, budget)
         }
-        CommandNode::Arithmetic { .. }
-        | CommandNode::ControlFlow { .. }
-        | CommandNode::Opaque { .. } => false,
+        CommandNode::Arithmetic { .. } | CommandNode::Opaque { .. } => false,
+        CommandNode::If {
+            condition,
+            then_body,
+            elif_branches,
+            else_body,
+            ..
+        } => {
+            statements_live_fetch_stdout(condition, budget)
+                || statements_live_fetch_stdout(then_body, budget)
+                || elif_branches
+                    .iter()
+                    .any(|branch| statements_live_fetch_stdout(&branch.body, budget))
+                || statements_live_fetch_stdout(else_body, budget)
+        }
+        CommandNode::Loop { body, .. } | CommandNode::For { body, .. } => {
+            statements_live_fetch_stdout(body, budget)
+        }
+        CommandNode::Case { branches, .. } => branches
+            .iter()
+            .any(|branch| statements_live_fetch_stdout(&branch.body, budget)),
     }
 }
 
 fn statements_live_fetch_stdout(statements: &[Statement], budget: &mut ShellBudget) -> bool {
     statements
         .iter()
-        .filter(|statement| statement.reachable)
+        .filter(|statement| statement.reachable.is_reachable())
         .any(|statement| {
             statement.pipelines.iter().any(|pipeline| {
                 (0..pipeline.commands.len()).any(|producer| {

