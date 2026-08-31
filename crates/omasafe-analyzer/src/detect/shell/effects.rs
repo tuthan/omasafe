@@ -5,7 +5,7 @@
 //! xargs input model, and the fetch/decode command classifications the
 //! detector families share.
 
-use super::budget::ShellBudget;
+use super::budget::{CachedBodySummary, ShellBudget};
 use super::command::{
     ScriptCommand, compound_position, depth_zero_redirect_moves_stdin_away,
     depth_zero_redirect_moves_stdout, segment_commands, statement_outcomes,
@@ -79,6 +79,7 @@ impl CommandEffects {
 /// What a statically known shell body (an interpreter `-c` body, an `eval`
 /// argument) does with its inherited stdin, computed by the same walks that
 /// read inline pipelines. Every field fails closed on an exhausted budget.
+#[derive(Clone, Copy)]
 struct ShellSummary {
     /// The body executes inherited stdin as code (`sh -c sh`).
     consumes_stdin_as_code: bool,
@@ -100,6 +101,16 @@ impl ShellSummary {
 
 /// Analyse one static shell body, charging one depth level for the reparse.
 fn static_body_summary(body: &str, budget: &mut ShellBudget) -> ShellSummary {
+    if budget.exhausted() {
+        return ShellSummary::SILENT;
+    }
+    if let Some(summary) = budget.cached_body_summary(body) {
+        return ShellSummary {
+            consumes_stdin_as_code: summary.consumes_stdin_as_code,
+            drains_stdin: summary.drains_stdin,
+            forwards_stdin_body: summary.forwards_stdin_body,
+        };
+    }
     if !budget.enter() {
         return ShellSummary::SILENT;
     }
@@ -107,11 +118,22 @@ fn static_body_summary(body: &str, budget: &mut ShellBudget) -> ShellSummary {
     let (consumes_stdin_as_code, drains_stdin) = group_stdin_reaches_interpreter(&tokens, budget);
     let forwards_stdin_body = group_forwards_stdin(&tokens, budget);
     budget.leave();
-    ShellSummary {
+    let summary = ShellSummary {
         consumes_stdin_as_code,
         drains_stdin,
         forwards_stdin_body,
+    };
+    if !budget.exhausted() {
+        budget.cache_body_summary(
+            body,
+            CachedBodySummary {
+                consumes_stdin_as_code,
+                drains_stdin,
+                forwards_stdin_body,
+            },
+        );
     }
+    summary
 }
 
 /// Summarize one simple command site. This is the single command-level
@@ -916,5 +938,34 @@ mod tests {
             );
             assert_eq!(effects.egress, egress, "egress effect for {source:?}");
         }
+    }
+
+    #[test]
+    fn static_body_summaries_are_reused_within_one_budget() {
+        let mut budget = ShellBudget::new();
+        let first = static_body_summary("cat", &mut budget);
+        let nodes_after_first = budget.nodes;
+        let second = static_body_summary("cat", &mut budget);
+
+        assert_eq!(
+            (
+                first.consumes_stdin_as_code,
+                first.drains_stdin,
+                first.forwards_stdin_body,
+            ),
+            (
+                second.consumes_stdin_as_code,
+                second.drains_stdin,
+                second.forwards_stdin_body,
+            )
+        );
+        assert_eq!(budget.nodes, nodes_after_first);
+        assert!(!budget.exhausted());
+
+        assert!(!budget.spend(usize::MAX));
+        let exhausted = static_body_summary("cat", &mut budget);
+        assert!(!exhausted.consumes_stdin_as_code);
+        assert!(!exhausted.drains_stdin);
+        assert!(!exhausted.forwards_stdin_body);
     }
 }

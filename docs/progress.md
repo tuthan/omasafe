@@ -2489,7 +2489,7 @@ detectors to consume typed nodes remain the next Stage B slices.
 
 ## Plan Step 9 — Centralized Command Effects (2026-08-31)
 
-Status: **in progress — command-site summary slice complete**
+Status: **complete — command-site summary slice**
 
 The next Stage B slice adds a typed `CommandEffects` summary in
 `detect/shell/effects.rs`. Interpreter modes, static shell bodies, `eval`,
@@ -2504,6 +2504,22 @@ removed. Focused table-driven tests cover stdin scripts, static bodies,
 parse-only mode, redirects, xargs executable text, transformers, and direct
 fetches. Full detector migration to the IR-owned command nodes and bounded
 summary caching remain subsequent Stage B work.
+
+## Stage B — Parse Once, Summarize Once (2026-08-31)
+
+Status: **in progress — bounded effect-summary cache complete**
+
+`ShellBudget` now owns a per-analysis cache for static shell bodies. Repeated
+`-c`/`eval` effect walks reuse the same bounded `ShellSummary` instead of
+re-tokenizing and recursively re-walking identical text. The cache is capped
+at 64 entries and 64 KiB of body text, skips oversized bodies, and never
+reuses a cached result after the shared budget is exhausted; incomplete
+summaries are not retained.
+
+A focused test pins both reuse (no second node charge) and fail-closed budget
+behavior. The remaining work is to extend the cached summary across egress
+and consumption findings, then have those consumers operate directly on the
+typed IR nodes.
 
 ## Review Round Three — Heredoc Body Boundaries and Invalid xargs Counts (2026-08-31)
 
