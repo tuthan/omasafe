@@ -83,70 +83,97 @@ pub(in crate::detect) fn xargs_feeds_stdin_code(command: &ScriptCommand) -> bool
     true
 }
 
+/// A GNU xargs count: `strtol`-style — an optional leading `+`, leading
+/// zeros, then decimal digits, so `01` and `+1` are both 1. Anything else
+/// is a usage error at runtime, and a failed xargs run executes no input.
+fn xargs_count(value: &str) -> Option<usize> {
+    let digits = value.strip_prefix('+').unwrap_or(value);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<usize>().ok()
+}
+
 /// The `-I`/`--replace` placeholder of this xargs invocation, when one
 /// survives to runtime: xargs substitutes it with each input item wherever
 /// it appears in the initial arguments. GNU xargs warns and honors the
 /// LAST of `-I`/`-L`/`-n`, so a later batch option overrides replacement
 /// (`-I{} -n2` drops it) and a later `-I` restores it — except that
-/// `-n1`/`--max-args=1` preserve replacement, since one whole item per
-/// invocation is what `-I` already means. GNU `--replace` takes its value
-/// only after `=`; the bare form defaults to `{}`.
+/// `-n1` in every numeric spelling (`-n01`, `--max-args=+1`) preserves
+/// replacement, since one whole item per invocation is what `-I` already
+/// means. Valued options consume their separate value word even when it
+/// LOOKS like an option (`xargs -I -n` takes `-n` as the replstr); GNU
+/// `--replace` takes its value only after `=`, the bare form defaulting
+/// to `{}`.
 fn xargs_placeholder(command: &ScriptCommand, wrapped: usize) -> Option<String> {
     let mut placeholder: Option<String> = None;
     let mut index = 0usize;
     while index < wrapped {
         let arg = &command.args[index];
+        let mut advance = 1usize;
         if let Some(long) = arg.strip_prefix("--") {
-            match long.split('=').next().unwrap_or(long) {
+            let (name, glued) = long
+                .split_once('=')
+                .map(|(name, value)| (name, Some(value)))
+                .unwrap_or((long, None));
+            match name {
                 "replace" => {
-                    placeholder = match long.split_once('=') {
-                        Some((_, value)) if !value.is_empty() => Some(value.to_owned()),
+                    // GNU `--replace[=STR]` never consumes the next word.
+                    placeholder = match glued {
                         // `--replace=` replaces nothing.
-                        Some(_) => None,
+                        Some("") => None,
+                        Some(value) => Some(value.to_owned()),
                         None => Some("{}".to_owned()),
                     };
                 }
                 "max-args" => {
-                    // GNU xargs honors the LAST of `-I`/`-L`/`-n`, but
-                    // replacement mode specifically survives `-n1`
-                    // (`--max-args=1`): one item per invocation is what
-                    // `-I` already means, so the placeholder stays live
-                    // (`xargs -I{} -n1 sh -c '{}'` runs the input). Any
+                    // Replacement mode specifically survives a numeric one
+                    // (`xargs -I{} -n01 sh -c '{}'` runs the input); any
                     // other count, and `-L` at every count, drops it.
-                    let count = long
-                        .split_once('=')
-                        .map(|(_, value)| value)
-                        .map_or_else(|| command.args.get(index + 1).copied(), Some);
-                    if count != Some("1") {
+                    let count = glued.map_or_else(|| command.args.get(index + 1).copied(), Some);
+                    if xargs_count(count.unwrap_or_default()) != Some(1) {
                         placeholder = None;
                     }
+                    if glued.is_none() {
+                        advance = 2; // the separate count word
+                    }
                 }
-                "max-lines" => placeholder = None,
+                "max-lines" => {
+                    placeholder = None;
+                    if glued.is_none() {
+                        advance = 2;
+                    }
+                }
                 _ => {}
             }
         } else if arg.len() > 1 && arg.starts_with('-') {
-            match arg.as_bytes()[1] {
-                b'I' => {
-                    placeholder = if arg.len() > 2 {
-                        Some(arg[2..].to_owned())
+            let flags = &arg[1..];
+            match flags.chars().next() {
+                Some('I') => {
+                    placeholder = if flags.len() > 1 {
+                        Some(flags[1..].to_owned())
                     } else {
+                        // The separate replacement word is consumed even
+                        // when it looks like an option.
+                        advance = 2;
                         command.args.get(index + 1).map(|value| value.to_string())
                     };
                 }
-                flag @ (b'n' | b'L') => {
-                    let count = if arg.len() > 2 {
-                        Some(&arg[2..])
+                Some(flag @ ('n' | 'L')) => {
+                    let count = if flags.len() > 1 {
+                        Some(&flags[1..])
                     } else {
+                        advance = 2;
                         command.args.get(index + 1).copied()
                     };
-                    if !(flag == b'n' && count == Some("1")) {
+                    if !(flag == 'n' && xargs_count(count.unwrap_or_default()) == Some(1)) {
                         placeholder = None;
                     }
                 }
                 _ => {}
             }
         }
-        index += 1;
+        index += advance;
     }
     placeholder
 }
@@ -479,7 +506,7 @@ impl XargsLanding {
     /// Over the `-I` replacement mode, `-n1` specifically changes nothing
     /// (GNU preserves replacement under `-n1`): whole lines stay whole.
     fn set_word_batch(&mut self, count: &str) {
-        let Ok(n) = count.parse::<usize>() else {
+        let Some(n) = xargs_count(count) else {
             return;
         };
         if n == 1
@@ -508,12 +535,13 @@ impl XargsLanding {
     /// `-L N`: N logical lines per invocation, each still word-split. The
     /// last of `-I`/`-L`/`-n` wins, so this replaces any earlier mode.
     fn set_line_batch(&mut self, count: &str) {
-        if let Ok(n) = count.parse::<usize>() {
-            self.items = XargsItems::Lines {
-                split: true,
-                per_invocation: n.max(1),
-            };
-        }
+        let Some(n) = xargs_count(count) else {
+            return;
+        };
+        self.items = XargsItems::Lines {
+            split: true,
+            per_invocation: n.max(1),
+        };
     }
 
     /// `-0`/`-d`: delimiter-driven item splitting. A `-n` given earlier

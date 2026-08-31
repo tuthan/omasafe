@@ -1431,6 +1431,43 @@ fn h3_heredoc_ownership_fixture_pins_continued_owner_and_grouped_data() {
 }
 
 #[test]
+fn h3_continued_headers_fixture_pins_bodies_after_the_whole_command() {
+    // One fixture holding BOTH directions of the continued-header review:
+    // the bodies of a backslash-continued data pipeline begin only after
+    // the whole command ends, so the curl line stays cat food (silent),
+    // while both heredocs of one continued interpreter command execute —
+    // the second body's decode rule proves the continued tail ran.
+    let report = scan_h3_fixture("heredoc-continued-headers");
+    let analysis = &report["result"]["analysis"];
+    let findings = analysis["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 2, "{findings:?}");
+    let rules: Vec<&str> = findings
+        .iter()
+        .map(|finding| finding["rule_id"].as_str().unwrap())
+        .collect();
+    assert!(rules.contains(&"oma.script.download-execute"), "{rules:?}");
+    assert!(rules.contains(&"oma.script.decode-execute"), "{rules:?}");
+    // Both rows pin the continued command's unit start, so a vanished
+    // positive replaced by a guard-line false positive cannot satisfy
+    // this test.
+    assert!(
+        findings
+            .iter()
+            .all(|finding| finding["severity"] == "high" && finding["line"] == 13),
+        "{findings:?}"
+    );
+    assert!(
+        analysis["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|capability| capability["capability"] == "network-access"),
+        "{:?}",
+        analysis["capabilities"]
+    );
+}
+
+#[test]
 fn equivalence_staleness_is_disclosed_when_cached_snapshot_moves() {
     let temp = tempfile::TempDir::new().unwrap();
     fs::write(temp.path().join("Main.qml"), "Text {}\n").unwrap();

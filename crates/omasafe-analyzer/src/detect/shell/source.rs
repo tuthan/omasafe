@@ -279,6 +279,17 @@ struct HeredocRedirect {
     strip_tabs: bool,
 }
 
+/// One heredoc redirection of a whole logical unit: which physical line of
+/// the unit carries it (0-based from the unit's first line), the raw span
+/// within that line, `<<-`'s tab stripping, and the tokenized delimiter
+/// word used for body-line matching.
+struct UnitHeredoc {
+    line: usize,
+    span: (usize, usize),
+    strip_tabs: bool,
+    delimiter: String,
+}
+
 /// Every stdin heredoc redirection (`<<`/`<<-`) in one header line, in order.
 /// The scan skips quoted regions, escapes, and command-substitution
 /// interiors so a quoted `<<`, a here-string `<<<`, or text inside
@@ -434,16 +445,20 @@ fn delimiter_word_span(bytes: &[u8], mut i: usize) -> Option<(usize, usize)> {
 /// data unless its owning command is a shell interpreter; for that one case,
 /// the body is rewritten into an equivalent `-c` body at the redirect's
 /// position so the normal bounded shell walks can inspect the executed code.
-/// Every heredoc on the line is handled — bodies are captured in
-/// redirection order, each command owns its own redirects, and pipeline
-/// tails survive the rewrite (`printf x | sh <<C | cat` keeps `| cat`).
-/// Delimiters are tokenized, so quotes are removed only for comparison;
-/// `<<-` accepts leading tabs on its terminator.
+/// Every heredoc of the whole logical command is handled — bodies are
+/// captured in redirection order, each command owns its own redirects, and
+/// pipeline tails survive the rewrite (`printf x | sh <<C | cat` keeps
+/// `| cat`). Delimiters are tokenized, so quotes are removed only for
+/// comparison; `<<-` accepts leading tabs on its terminator.
 ///
-/// Ownership is classified against the COMPLETE continued command, not the
-/// bare header line: a heredoc operator may sit on its own physical line
-/// while the owning word sits on an earlier one joined by an escaped
-/// newline, an open quote, or a trailing operator (`sh \` + `<<C`).
+/// Ownership AND body placement are decided against the COMPLETE continued
+/// command, not the bare header line: a heredoc operator may sit on its own
+/// physical line while the owning word sits on an earlier one joined by an
+/// escaped newline, an open quote, or a trailing operator (`sh \` + `<<C`),
+/// and the body only begins once the command's terminating newline is
+/// reached — a continued header like `cat <<A | \` + `cat <<B` reads both
+/// bodies after the second line, and later unit lines can carry heredocs of
+/// their own (`sh <<A; \` + `sh <<B`).
 ///
 /// Later heredocs of the SAME command override earlier stdin, so only each
 /// command's last heredoc supplies its body — decided by command ownership
@@ -458,7 +473,8 @@ fn delimiter_word_span(bytes: &[u8], mut i: usize) -> Option<(usize, usize)> {
 /// with blank lines so later units keep their physical line numbers.
 /// Unterminated heredocs are left alone: treating the rest of the file as
 /// data would hide live code after malformed input. A raw-scan/token
-/// disagreement likewise leaves the line alone.
+/// disagreement on any line of the unit likewise leaves the whole unit
+/// alone.
 fn shell_source_without_heredoc_payloads(
     source: &str,
     classifies_owner: &dyn Fn(&[ShellToken], usize) -> HeredocOwner,
@@ -475,45 +491,81 @@ fn shell_source_without_heredoc_payloads(
     'lines: while index < lines.len() {
         let line = lines[index];
         let tokens = tokenize(line);
-        let Some(redirects) =
-            heredoc_redirects(line, &tokens).filter(|redirects| !redirects.is_empty())
-        else {
-            output.push(line.to_owned());
-            context.feed(index as u32 + 1, line);
-            index += 1;
-            continue;
-        };
-        let token_ops: Vec<usize> = tokens
-            .iter()
-            .enumerate()
-            .filter_map(|(token_index, token)| {
-                matches!(token.operator(), Some("<<" | "<<-")).then_some(token_index)
-            })
-            .collect();
-        // The rewrite aligns the raw scan with the token stream one to one;
-        // anything else leaves the line untouched.
-        if redirects.len() != token_ops.len() {
+        if !heredoc_redirects(line, &tokens).is_some_and(|scan| !scan.is_empty()) {
             output.push(line.to_owned());
             context.feed(index as u32 + 1, line);
             index += 1;
             continue;
         }
-        let mut delimiters = Vec::with_capacity(redirects.len());
-        for &op_index in &token_ops {
-            let Some(word) = tokens.get(op_index + 1).and_then(ShellToken::word) else {
-                output.push(line.to_owned());
-                context.feed(index as u32 + 1, line);
-                index += 1;
+        // A heredoc body follows the COMPLETE logical command: probe the
+        // unit state to find the unit's last physical line — a continued
+        // header keeps reading lines, and those lines can carry heredocs of
+        // their own. An EOF inside the header never completes, so no body
+        // follows and the rest of the file is left alone.
+        let mut unit_end = index;
+        let mut span_probe = context.clone();
+        span_probe.feed(index as u32 + 1, line);
+        while span_probe.open {
+            if unit_end + 1 == lines.len() {
+                for &rest in lines[index..].iter() {
+                    output.push(rest.to_owned());
+                    context.feed(index as u32 + 1, rest);
+                    index += 1;
+                }
+                continue 'lines;
+            }
+            unit_end += 1;
+            span_probe.feed(unit_end as u32 + 1, lines[unit_end]);
+        }
+        // Every heredoc of the unit, in redirection order across its
+        // physical lines. The rewrite aligns the raw scan with the token
+        // stream one to one on EVERY unit line; anything else leaves the
+        // whole unit alone.
+        let mut unit_redirects: Vec<UnitHeredoc> = Vec::new();
+        for (offset, line_index) in (index..=unit_end).enumerate() {
+            let unit_line = lines[line_index];
+            let unit_tokens = tokenize(unit_line);
+            let unit_ops: Vec<usize> = unit_tokens
+                .iter()
+                .enumerate()
+                .filter_map(|(token_index, token)| {
+                    matches!(token.operator(), Some("<<" | "<<-")).then_some(token_index)
+                })
+                .collect();
+            let Some(unit_scan) = heredoc_redirects(unit_line, &unit_tokens)
+                .filter(|scan| scan.len() == unit_ops.len())
+            else {
+                for (offset, &rest) in lines[index..=unit_end].iter().enumerate() {
+                    output.push(rest.to_owned());
+                    context.feed(index as u32 + 1 + offset as u32, rest);
+                }
+                index = unit_end + 1;
                 continue 'lines;
             };
-            delimiters.push(word.to_owned());
+            for (&token_index, redirect) in unit_ops.iter().zip(&unit_scan) {
+                let Some(word) = unit_tokens.get(token_index + 1).and_then(ShellToken::word) else {
+                    for (offset, &rest) in lines[index..=unit_end].iter().enumerate() {
+                        output.push(rest.to_owned());
+                        context.feed(index as u32 + 1 + offset as u32, rest);
+                    }
+                    index = unit_end + 1;
+                    continue 'lines;
+                };
+                unit_redirects.push(UnitHeredoc {
+                    line: offset,
+                    span: redirect.span,
+                    strip_tabs: redirect.strip_tabs,
+                    delimiter: word.to_owned(),
+                });
+            }
         }
-        // Bodies are captured in redirection order: the first body follows
-        // the header, each next body starts after the previous terminator.
+        // Bodies are captured in redirection order, starting after the
+        // unit's LAST line: the first body follows the complete command,
+        // each next body starts after the previous terminator.
         let mut bodies: Vec<Vec<&str>> = Vec::new();
-        let mut cursor = index + 1;
+        let mut cursor = unit_end + 1;
         let mut terminated = true;
-        for (k, redirect) in redirects.iter().enumerate() {
+        for redirect in &unit_redirects {
             let mut body = Vec::new();
             while cursor < lines.len() {
                 let candidate = if redirect.strip_tabs {
@@ -521,7 +573,7 @@ fn shell_source_without_heredoc_payloads(
                 } else {
                     lines[cursor]
                 };
-                if candidate == delimiters[k] {
+                if candidate == redirect.delimiter {
                     break;
                 }
                 body.push(lines[cursor]);
@@ -535,21 +587,28 @@ fn shell_source_without_heredoc_payloads(
             cursor += 1; // the terminator line
         }
         if !terminated {
-            output.push(line.to_owned());
-            context.feed(index as u32 + 1, line);
-            index += 1;
+            for (offset, &rest) in lines[index..=unit_end].iter().enumerate() {
+                output.push(rest.to_owned());
+                context.feed(index as u32 + 1 + offset as u32, rest);
+            }
+            index = unit_end + 1;
             continue;
         }
         // Ownership is classified over the JOINED continued command: probe
-        // the unit state with the raw header line, then take this line's
+        // the unit state with the unit's raw lines, then take the unit's
         // heredoc operators from the joined stream's final ones (the prefix
         // carries none — earlier heredocs were rewritten away).
         let mut probe = context.clone();
-        let completed = probe.feed(index as u32 + 1, line);
-        let context_text = match completed {
-            Some((_, text)) => text,
-            None => probe.text.clone(),
-        };
+        let mut joined_unit: Option<String> = None;
+        if let Some((_, text)) = probe.feed(index as u32 + 1, line) {
+            joined_unit = Some(text);
+        }
+        for (offset, &rest) in lines[index + 1..=unit_end].iter().enumerate() {
+            if let Some((_, text)) = probe.feed(index as u32 + 2 + offset as u32, rest) {
+                joined_unit = Some(text);
+            }
+        }
+        let context_text = joined_unit.unwrap_or_else(|| probe.text.clone());
         let joined = tokenize(&context_text);
         let joined_ops: Vec<usize> = joined
             .iter()
@@ -558,16 +617,19 @@ fn shell_source_without_heredoc_payloads(
                 matches!(token.operator(), Some("<<" | "<<-")).then_some(token_index)
             })
             .collect();
-        let Some(base) = joined_ops.len().checked_sub(redirects.len()) else {
-            output.push(line.to_owned());
-            context.feed(index as u32 + 1, line);
-            index += 1;
+        let Some(base) = joined_ops.len().checked_sub(unit_redirects.len()) else {
+            for (offset, &rest) in lines[index..=unit_end].iter().enumerate() {
+                output.push(rest.to_owned());
+                context.feed(index as u32 + 1 + offset as u32, rest);
+            }
+            index = unit_end + 1;
             continue;
         };
-        let owners: Vec<HeredocOwner> = (0..redirects.len())
+        let owners: Vec<HeredocOwner> = (0..unit_redirects.len())
             .map(|k| classifies_owner(&joined, joined_ops[base + k]))
             .collect();
-        let command_of = command_ordinals(&tokens, &token_ops);
+        let ordinals = command_ordinals(&joined, &joined_ops);
+        let command_of = &ordinals[base..];
         // Dispositions decided BEFORE the header is built: `-c` attaches
         // embed the body into the header and grow it over the span's early
         // lines; every other body — data or out-of-band executed — is
@@ -583,27 +645,28 @@ fn shell_source_without_heredoc_payloads(
             Attach(Option<usize>),
         }
         // The first physical line of each body (1-based): the line after
-        // the header plus each earlier body's lines and terminators.
+        // the unit's last header line plus each earlier body's lines and
+        // terminators.
         let body_start = |k: usize| -> u32 {
-            let mut line = index as u32 + 2;
+            let mut line = unit_end as u32 + 2;
             for earlier in bodies.iter().take(k) {
                 line += earlier.len() as u32 + 1;
             }
             line
         };
-        let mut dispositions: Vec<BodyDisposition> = (0..redirects.len())
+        let mut dispositions: Vec<BodyDisposition> = (0..unit_redirects.len())
             .map(|_| BodyDisposition::Blank)
             .collect();
-        for (k, redirect) in redirects.iter().enumerate() {
+        for (k, unit_redirect) in unit_redirects.iter().enumerate() {
             // Overridden by a later heredoc of the same command.
-            if (k + 1..redirects.len()).any(|later| command_of[later] == command_of[k]) {
+            if (k + 1..unit_redirects.len()).any(|later| command_of[later] == command_of[k]) {
                 continue;
             }
             let body = bodies[k].join("\n");
             dispositions[k] = match owners[k] {
                 HeredocOwner::ExecutesStdin => BodyDisposition::Attach(None),
                 HeredocOwner::ForwardsStdin => {
-                    let tail = &line[redirect.span.1..];
+                    let tail = &lines[index + unit_redirect.line][unit_redirect.span.1..];
                     match forwarded_body_fate(tail, &body) {
                         ForwardedBodyFate::AttachAt(offset) => {
                             BodyDisposition::Attach(Some(offset))
@@ -627,48 +690,69 @@ fn shell_source_without_heredoc_payloads(
                 HeredocOwner::Data => BodyDisposition::Blank,
             };
         }
-        let mut header = String::new();
-        let mut byte_cursor = 0usize;
-        for (k, redirect) in redirects.iter().enumerate() {
-            header.push_str(&line[byte_cursor..redirect.span.0]);
-            byte_cursor = redirect.span.1;
-            let BodyDisposition::Attach(offset) = &dispositions[k] else {
-                continue; // kept and blanked bodies carry no header text
-            };
-            if !header.ends_with([' ', '\t', '(', ';', '&', '|']) {
-                header.push(' ');
-            }
-            let quoted = bodies[k].join("\n").replace('\'', "'\"'\"'");
-            match offset {
-                // A forwarding filter passes the body to its downstream
-                // consumer (`cat <<C | sh` runs the body, exactly like
-                // `sh -c '…'`); the classifier walks the whole pipeline
-                // tail with the interpreter, wrapper, redirect, and
-                // forwarding models and gives the attach point just past
-                // the consumer's head word.
-                Some(offset) => {
-                    let end = byte_cursor + offset;
-                    header.push_str(&line[byte_cursor..end]);
-                    header.push_str(&format!(" -c '{quoted}'"));
-                    byte_cursor = end;
+        // Rewrite each unit line in place: every heredoc of that line is
+        // spliced per its disposition, so a multi-line command keeps its
+        // header text on the lines it came from.
+        let unit_span = unit_end - index + 1;
+        let mut rewritten: Vec<String> = Vec::with_capacity(unit_span);
+        for offset in 0..unit_span {
+            let unit_line = lines[index + offset];
+            let mut header = String::new();
+            let mut byte_cursor = 0usize;
+            for (k, unit_redirect) in unit_redirects.iter().enumerate() {
+                if unit_redirect.line != offset {
+                    continue;
                 }
-                // The owner itself executes the body as stdin.
-                None => header.push_str(&format!("-c '{quoted}'")),
+                header.push_str(&unit_line[byte_cursor..unit_redirect.span.0]);
+                byte_cursor = unit_redirect.span.1;
+                let BodyDisposition::Attach(attach) = &dispositions[k] else {
+                    continue; // kept and blanked bodies carry no header text
+                };
+                if !header.ends_with([' ', '\t', '(', ';', '&', '|']) {
+                    header.push(' ');
+                }
+                let quoted = bodies[k].join("\n").replace('\'', "'\"'\"'");
+                match attach {
+                    // A forwarding filter passes the body to its downstream
+                    // consumer (`cat <<C | sh` runs the body, exactly like
+                    // `sh -c '…'`); the classifier walks the whole pipeline
+                    // tail with the interpreter, wrapper, redirect, and
+                    // forwarding models and gives the attach point just past
+                    // the consumer's head word.
+                    Some(attach_offset) => {
+                        let end = byte_cursor + attach_offset;
+                        header.push_str(&unit_line[byte_cursor..end]);
+                        header.push_str(&format!(" -c '{quoted}'"));
+                        byte_cursor = end;
+                    }
+                    // The owner itself executes the body as stdin.
+                    None => header.push_str(&format!("-c '{quoted}'")),
+                }
             }
+            header.push_str(&unit_line[byte_cursor..]);
+            rewritten.push(header);
         }
-        header.push_str(&line[byte_cursor..]);
         // Reproduce the original span line for line: every body section is
         // blanked (out-of-band bodies analyze from their own unit groups),
-        // and a header grown by attached `-c` bodies spans extra lines that
-        // the blank sections absorb earliest first — so later units keep
-        // their physical line numbers whatever mix of fates the line had.
-        let original_span = 1 + bodies.iter().map(Vec::len).sum::<usize>() + redirects.len();
-        let mut surplus = (1 + header.matches('\n').count()).saturating_sub(1);
-        // The unit state continues from the REWRITTEN header: its trailing
-        // bytes match the original tail, and attached `-c` bodies carry
-        // balanced quotes, so later continuations join the same command.
-        context.feed(index as u32 + 1, &header);
-        output.push(header);
+        // and rewritten headers grown by attached `-c` bodies span extra
+        // lines that the blank sections absorb earliest first — so later
+        // units keep their physical line numbers whatever mix of fates the
+        // unit had.
+        let original_span =
+            unit_span + bodies.iter().map(Vec::len).sum::<usize>() + unit_redirects.len();
+        let mut surplus = rewritten
+            .iter()
+            .map(|header| 1 + header.matches('\n').count())
+            .sum::<usize>()
+            - unit_span;
+        for (offset, header) in rewritten.into_iter().enumerate() {
+            // The unit state continues from the REWRITTEN headers: their
+            // trailing bytes match the original tails, and attached `-c`
+            // bodies carry balanced quotes, so later continuations join the
+            // same command.
+            context.feed(index as u32 + 1 + offset as u32, &header);
+            output.push(header);
+        }
         for body in bodies.iter() {
             let eaten = surplus.min(body.len());
             surplus -= eaten;

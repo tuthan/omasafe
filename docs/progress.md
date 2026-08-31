@@ -2691,3 +2691,62 @@ git diff --check                                         # clean
 Stage A is complete: `detect.rs` is a 452-line facade over ten focused
 modules; every module is under the 1,500-line bound. Stage B (the typed
 shell IR and centralized command effects) is next.
+
+## Review Round Two — Three Continued-Header and xargs-Arity Fixes (2026-08-31)
+
+Re-review of the integrated Stage A range confirmed the original four
+reproductions fixed and the facade structural gap closed, and found three
+remaining behavioral defects. Each was probed against the local GNU
+toolchain before fixing, then pinned at the analyzer layer
+(`detect::tests::round_fifteen_tests`, 7 tests) and end to end (new
+`heredoc-continued-headers` CLI fixture with both directions of the
+defect).
+
+1. **xargs counts are numbers, not spellings (P1).** `xargs_placeholder`
+   compared `-n`/`--max-args` counts to the literal string `"1"`, so GNU
+   spellings of numeric one (`-n01`, `-n +1`, `--max-args=01`,
+   `--max-args +1`) dropped the `-I` placeholder and hid
+   `curl | xargs -I{} -n01 sh -c '{}'`. A shared `xargs_count` helper now
+   parses `strtol`-style counts (optional `+`, leading zeros) and is used
+   by the placeholder precedence check, `set_word_batch`, and
+   `set_line_batch`; invalid counts (`1x`, `0`) still stay silent because
+   a failed xargs run executes no input.
+
+2. **A separate `-I` value is consumed, not rescanned (P1).** The
+   placeholder scan advanced one argument per option, so a dash-leading
+   replacement word was reinterpreted as an option
+   (`xargs -I -n sh -c '-n'` cleared the placeholder that GNU keeps).
+   The scan now honors option arity like `xargs_wrapped_command` already
+   does: bare `-I`/`-n`/`-L`/`--max-args`/`--max-lines` consume their
+   separate value word; `--replace` still never does (GNU takes its value
+   only after `=`).
+
+3. **Heredoc bodies follow the complete continued command (P2).** Body
+   capture started on the line after the header line, so a
+   backslash-continued header (`cat <<A | \` + `cat <<B`) read bodies too
+   early and missed later unit lines' heredocs entirely. The reworked
+   `shell_source_without_heredoc_payloads` now probes the unit state to
+   find the command's last physical line first, collects every heredoc of
+   the unit across its lines (with per-line raw-scan/token agreement, any
+   disagreement leaving the whole unit untouched), captures bodies after
+   that line, classifies ownership and override over the JOINED command
+   text, and rewrites each unit line in place — reproducing the original
+   span line for line with the same earliest-first blank absorption.
+   An EOF inside the header leaves the rest of the file alone.
+
+Verified before fixing: local GNU xargs preserves `-I` under `-n01`,
+`-n +1`, and `--max-args=+1` and errors on `1x`/`0`; it substitutes a
+dash-leading `-I` replstr; bash reads both bodies of
+`cat <<A | \` + `cat <<B` after the second line and executes both bodies
+of `sh <<A; \` + `sh <<B`.
+
+Full verification gate in both feature configurations:
+
+```text
+cargo fmt --all -- --check                               # exit 0
+cargo clippy --workspace --all-targets -- -D warnings    # both configs
+cargo test --workspace                                   # 222/212 analyzer, 75 CLI
+./scripts/generate-cli-assets.sh --check                 # exit 0
+scripts/determinism-canary.sh                            # exit 0
+git diff --check                                         # clean
+```
