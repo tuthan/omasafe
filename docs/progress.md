@@ -2510,16 +2510,18 @@ summary caching remain subsequent Stage B work.
 Status: **in progress — bounded effect-summary cache complete**
 
 `ShellBudget` now owns a per-analysis cache for static shell bodies. Repeated
-`-c`/`eval` effect walks reuse the same bounded `ShellSummary` instead of
-re-tokenizing and recursively re-walking identical text. The cache is capped
-at 64 entries and 64 KiB of body text, skips oversized bodies, and never
-reuses a cached result after the shared budget is exhausted; incomplete
-summaries are not retained.
+`-c`/`eval` effect walks, fetch-egress walks, and live-fetch-output walks reuse
+the same exact body text instead of re-tokenizing and recursively re-walking
+identical text. The three result slots are independent so a negative egress
+answer cannot stand in for a stdin summary. The cache is capped at 64 entries
+and 64 KiB of body text, skips oversized bodies, and never reuses a cached
+result after the shared budget is exhausted; incomplete summaries are not
+retained.
 
-A focused test pins both reuse (no second node charge) and fail-closed budget
-behavior. The remaining work is to extend the cached summary across egress
-and consumption findings, then have those consumers operate directly on the
-typed IR nodes.
+A focused test pins reuse (no second node charge) for positive and negative
+results and fail-closed budget behavior across the effect, egress, and
+consumption callers. The remaining work is to cache the full finding summary,
+then have those consumers operate directly on the typed IR nodes.
 
 ## Review Round Three — Heredoc Body Boundaries and Invalid xargs Counts (2026-08-31)
 

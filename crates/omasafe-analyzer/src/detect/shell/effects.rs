@@ -5,7 +5,7 @@
 //! xargs input model, and the fetch/decode command classifications the
 //! detector families share.
 
-use super::budget::{CachedBodySummary, ShellBudget};
+use super::budget::{CachedStdinSummary, ShellBudget};
 use super::command::{
     ScriptCommand, compound_position, depth_zero_redirect_moves_stdin_away,
     depth_zero_redirect_moves_stdout, segment_commands, statement_outcomes,
@@ -104,7 +104,7 @@ fn static_body_summary(body: &str, budget: &mut ShellBudget) -> ShellSummary {
     if budget.exhausted() {
         return ShellSummary::SILENT;
     }
-    if let Some(summary) = budget.cached_body_summary(body) {
+    if let Some(summary) = budget.cached_stdin_summary(body) {
         return ShellSummary {
             consumes_stdin_as_code: summary.consumes_stdin_as_code,
             drains_stdin: summary.drains_stdin,
@@ -124,9 +124,9 @@ fn static_body_summary(body: &str, budget: &mut ShellBudget) -> ShellSummary {
         forwards_stdin_body,
     };
     if !budget.exhausted() {
-        budget.cache_body_summary(
+        budget.cache_stdin_summary(
             body,
-            CachedBodySummary {
+            CachedStdinSummary {
                 consumes_stdin_as_code,
                 drains_stdin,
                 forwards_stdin_body,
@@ -792,12 +792,28 @@ fn command_body_produces_fetch_output(command: &ScriptCommand, budget: &mut Shel
     let Some(body) = static_command_body(command) else {
         return false;
     };
+    body_live_fetch_stdout(&body, budget)
+}
+
+/// Whether a static shell body emits a live fetch response on its own
+/// stdout. The result is cached separately from stdin effects because the
+/// two summaries answer different reachability questions.
+pub(in crate::detect) fn body_live_fetch_stdout(body: &str, budget: &mut ShellBudget) -> bool {
+    if budget.exhausted() {
+        return false;
+    }
+    if let Some(reaches_stdout) = budget.cached_live_fetch_stdout(body) {
+        return reaches_stdout;
+    }
     if !budget.enter() {
         return false;
     }
-    let found = tokens_live_fetch_stdout(&tokenize(&body), budget);
+    let reaches_stdout = tokens_live_fetch_stdout(&tokenize(body), budget);
     budget.leave();
-    found
+    if !budget.exhausted() {
+        budget.cache_live_fetch_stdout(body, reaches_stdout);
+    }
+    reaches_stdout
 }
 
 /// Whether any pipeline segment is a live producer whose stdout also flows
@@ -967,5 +983,18 @@ mod tests {
         assert!(!exhausted.consumes_stdin_as_code);
         assert!(!exhausted.drains_stdin);
         assert!(!exhausted.forwards_stdin_body);
+    }
+
+    #[test]
+    fn live_fetch_summaries_are_reused_independently() {
+        let mut budget = ShellBudget::new();
+        let first = body_live_fetch_stdout("curl https://example.test/x", &mut budget);
+        let nodes_after_first = budget.nodes;
+        let second = body_live_fetch_stdout("curl https://example.test/x", &mut budget);
+
+        assert!(first);
+        assert_eq!(second, first);
+        assert_eq!(budget.nodes, nodes_after_first);
+        assert!(!budget.exhausted());
     }
 }

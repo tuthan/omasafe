@@ -7,8 +7,8 @@
 use super::budget::ShellBudget;
 use super::command::{segment_commands, skip_command_prefixes, statement_outcomes};
 use super::effects::{
-    command_decodes, command_fetches, pipeline_has_live_producer, segment_has_live_producer,
-    segment_stdin_reaches_interpreter, stdout_reaches, tokens_live_fetch_stdout,
+    body_live_fetch_stdout, command_decodes, command_fetches, pipeline_has_live_producer,
+    segment_has_live_producer, segment_stdin_reaches_interpreter, stdout_reaches,
 };
 use super::indicators::{
     chmod_relaxes_shared_temp, reverse_shell_spelling, segment_has_shared_temp_path,
@@ -392,7 +392,7 @@ fn segment_head_word(segment: &[ShellToken]) -> Option<&str> {
 /// `eval "$(curl x | cat >/dev/null)"` collects only what `cat` leaves —
 /// nothing; `eval "$(false && curl x)"` never runs the fetch.
 fn span_has_fetch_command(span: &str, budget: &mut ShellBudget) -> bool {
-    tokens_live_fetch_stdout(&tokenize(span), budget)
+    body_live_fetch_stdout(span, budget)
 }
 
 /// A decoder command inside an executed substitution span: feeding an

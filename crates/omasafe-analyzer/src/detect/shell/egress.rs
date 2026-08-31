@@ -85,6 +85,27 @@ pub(in crate::detect) fn tokens_fetch_egress(
     executed_list_fetch_egress(tokens, budget)
 }
 
+/// Analyze a re-parsed shell body with the shared bounded cache. The cache is
+/// keyed by the exact body text and stores only completed results, so a body
+/// that exhausts the analysis budget is never reused as if it were clean.
+pub(in crate::detect) fn body_fetches_egress(body: &str, budget: &mut ShellBudget) -> bool {
+    if budget.exhausted() {
+        return false;
+    }
+    if let Some(fetches) = budget.cached_fetch_egress(body) {
+        return fetches;
+    }
+    if !budget.enter() {
+        return false;
+    }
+    let fetches = tokens_fetch_egress(&tokenize(body), budget);
+    budget.leave();
+    if !budget.exhausted() {
+        budget.cache_fetch_egress(body, fetches);
+    }
+    fetches
+}
+
 /// The conditional statement walk for egress: a statement is scanned only
 /// when some execution path reaches it, and a list group's interior is just
 /// another such list — guards are kept at EVERY nesting level, so a
@@ -127,12 +148,7 @@ fn segment_body_fetch_egress(segment: &[ShellToken], budget: &mut ShellBudget) -
         let Some(body) = static_command_body(command) else {
             return false;
         };
-        if !budget.enter() {
-            return false;
-        }
-        let found = tokens_fetch_egress(&tokenize(&body), budget);
-        budget.leave();
-        found
+        body_fetches_egress(&body, budget)
     })
 }
 
@@ -189,12 +205,7 @@ fn substitutions_fetch_egress(substitutions: &[Substitution], budget: &mut Shell
         .iter()
         .any(|substitution| match substitution.kind {
             SubstKind::Command | SubstKind::Process => {
-                if !budget.enter() {
-                    return false;
-                }
-                let found = tokens_fetch_egress(&tokenize(&substitution.inner), budget);
-                budget.leave();
-                found
+                body_fetches_egress(&substitution.inner, budget)
             }
             SubstKind::Arithmetic => arithmetic_fetch_egress(&substitution.inner, budget),
         })
@@ -222,6 +233,32 @@ fn arithmetic_fetch_egress(expression: &str, budget: &mut ShellBudget) -> bool {
 /// coverage limitation.
 pub(in crate::detect) fn script_body_fetches(script: &str) -> (bool, bool) {
     let mut budget = ShellBudget::new();
-    let fetches = tokens_fetch_egress(&tokenize(script), &mut budget);
+    let fetches = body_fetches_egress(script, &mut budget);
     (fetches, budget.exhausted())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn body_egress_summaries_are_reused_for_positive_and_negative_results() {
+        let mut budget = ShellBudget::new();
+        assert!(body_fetches_egress(
+            "curl https://example.test/x",
+            &mut budget
+        ));
+        let nodes_after_fetch = budget.nodes;
+        assert!(body_fetches_egress(
+            "curl https://example.test/x",
+            &mut budget
+        ));
+        assert_eq!(budget.nodes, nodes_after_fetch);
+
+        assert!(!body_fetches_egress("echo safe", &mut budget));
+        let nodes_after_safe = budget.nodes;
+        assert!(!body_fetches_egress("echo safe", &mut budget));
+        assert_eq!(budget.nodes, nodes_after_safe);
+        assert!(!budget.exhausted());
+    }
 }

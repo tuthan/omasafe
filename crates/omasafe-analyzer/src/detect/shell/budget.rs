@@ -11,17 +11,24 @@ const MAX_BODY_SUMMARY_ENTRIES: usize = 64;
 const MAX_BODY_SUMMARY_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy)]
-pub(in crate::detect) struct CachedBodySummary {
+pub(in crate::detect) struct CachedStdinSummary {
     pub(in crate::detect) consumes_stdin_as_code: bool,
     pub(in crate::detect) drains_stdin: bool,
     pub(in crate::detect) forwards_stdin_body: bool,
+}
+
+struct BodySummaryCacheEntry {
+    body: String,
+    stdin: Option<CachedStdinSummary>,
+    fetch_egress: Option<bool>,
+    live_fetch_stdout: Option<bool>,
 }
 
 pub(in crate::detect) struct ShellBudget {
     pub(in crate::detect) depth: u32,
     pub(in crate::detect) nodes: u32,
     pub(in crate::detect) exhausted: bool,
-    body_summaries: Vec<(String, CachedBodySummary)>,
+    body_summaries: Vec<BodySummaryCacheEntry>,
     body_summary_bytes: usize,
 }
 
@@ -36,27 +43,104 @@ impl ShellBudget {
         }
     }
 
-    pub(in crate::detect) fn cached_body_summary(&self, body: &str) -> Option<CachedBodySummary> {
+    pub(in crate::detect) fn cached_stdin_summary(&self, body: &str) -> Option<CachedStdinSummary> {
         self.body_summaries
             .iter()
-            .find_map(|(cached_body, summary)| (cached_body == body).then_some(*summary))
+            .find_map(|entry| (entry.body == body).then_some(entry.stdin).flatten())
+    }
+
+    pub(in crate::detect) fn cache_stdin_summary(
+        &mut self,
+        body: &str,
+        summary: CachedStdinSummary,
+    ) {
+        if let Some(entry) = self
+            .body_summaries
+            .iter_mut()
+            .find(|entry| entry.body == body)
+        {
+            entry.stdin = Some(summary);
+            return;
+        }
+        if !self.can_cache_body(body) {
+            return;
+        }
+        self.insert_body_summary(body, Some(summary), None, None);
+    }
+
+    pub(in crate::detect) fn cached_fetch_egress(&self, body: &str) -> Option<bool> {
+        self.body_summaries
+            .iter()
+            .find_map(|entry| (entry.body == body).then_some(entry.fetch_egress).flatten())
+    }
+
+    pub(in crate::detect) fn cache_fetch_egress(&mut self, body: &str, fetches: bool) {
+        if let Some(entry) = self
+            .body_summaries
+            .iter_mut()
+            .find(|entry| entry.body == body)
+        {
+            entry.fetch_egress = Some(fetches);
+            return;
+        }
+        if !self.can_cache_body(body) {
+            return;
+        }
+        self.insert_body_summary(body, None, Some(fetches), None);
+    }
+
+    pub(in crate::detect) fn cached_live_fetch_stdout(&self, body: &str) -> Option<bool> {
+        self.body_summaries.iter().find_map(|entry| {
+            (entry.body == body)
+                .then_some(entry.live_fetch_stdout)
+                .flatten()
+        })
+    }
+
+    pub(in crate::detect) fn cache_live_fetch_stdout(&mut self, body: &str, reaches_stdout: bool) {
+        if let Some(entry) = self
+            .body_summaries
+            .iter_mut()
+            .find(|entry| entry.body == body)
+        {
+            entry.live_fetch_stdout = Some(reaches_stdout);
+            return;
+        }
+        if !self.can_cache_body(body) {
+            return;
+        }
+        self.insert_body_summary(body, None, None, Some(reaches_stdout));
     }
 
     /// Keep the cache bounded by both entry count and source bytes. Bodies
     /// larger than the byte ceiling are cheaper to reparse than to retain,
     /// and a full cache simply skips future insertion without evicting a
     /// summary that this analysis may still reuse.
-    pub(in crate::detect) fn cache_body_summary(&mut self, body: &str, summary: CachedBodySummary) {
+    fn can_cache_body(&self, body: &str) -> bool {
         if body.is_empty()
             || body.len() > MAX_BODY_SUMMARY_BYTES
             || self.body_summaries.len() >= MAX_BODY_SUMMARY_ENTRIES
             || self.body_summary_bytes + body.len() > MAX_BODY_SUMMARY_BYTES
-            || self.cached_body_summary(body).is_some()
         {
-            return;
+            return false;
         }
+        true
+    }
+
+    fn insert_body_summary(
+        &mut self,
+        body: &str,
+        stdin: Option<CachedStdinSummary>,
+        fetch_egress: Option<bool>,
+        live_fetch_stdout: Option<bool>,
+    ) {
         self.body_summary_bytes += body.len();
-        self.body_summaries.push((body.to_owned(), summary));
+        self.body_summaries.push(BodySummaryCacheEntry {
+            body: body.to_owned(),
+            stdin,
+            fetch_egress,
+            live_fetch_stdout,
+        });
     }
 
     /// Charge one analysis step for the tokens it walks; past the budget the
