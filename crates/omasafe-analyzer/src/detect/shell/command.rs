@@ -328,7 +328,7 @@ pub(in crate::detect) fn statement_outcomes(statement: &[ShellToken]) -> Outcome
 /// pipeline. The affected descriptor is the explicit fd digits, else 1 for
 /// `>` forms and 0 for `<` forms; `&>` moves both streams; a duplication
 /// (`>&m`) keeps stdout only when duplicated onto itself.
-fn redirect_moves_stdout_away(op: &str, target: &str) -> bool {
+pub(in crate::detect) fn redirect_moves_stdout_away(op: &str, target: &str) -> bool {
     let digits_end = op.bytes().take_while(u8::is_ascii_digit).count();
     let rest = &op[digits_end..];
     if rest == "&>" || rest == "&>>" {
@@ -393,7 +393,7 @@ pub(in crate::detect) fn depth_zero_redirect_moves_stdin_away(segment: &[ShellTo
 /// compound's stdin: fd 0 moved anywhere except back onto itself
 /// (`<file`, `0</dev/null`, `<<EOF`, `<&-` starve everything inside;
 /// `2<&1` and `0<&0` do not touch stdin).
-fn redirect_moves_stdin_away(op: &str, target: &str) -> bool {
+pub(in crate::detect) fn redirect_moves_stdin_away(op: &str, target: &str) -> bool {
     let digits_end = op.bytes().take_while(u8::is_ascii_digit).count();
     let rest = &op[digits_end..];
     let default_fd = if rest.starts_with('<') { 0 } else { 1 };

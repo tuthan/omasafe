@@ -2533,6 +2533,22 @@ model. Shell egress consumes `ShellProgram` command nodes for direct `curl` and
 subshell/brace bodies. The existing token walk remains the bounded fallback for
 command and process substitutions and static `-c`/`eval` bodies.
 
+## Stage B — Direct IR Consumer Effects (2026-08-31)
+
+Status: **in progress — typed stdin-consumer slice complete**
+
+The centralized command-effect summary now accepts typed IR commands, deriving
+redirect behavior from node-owned redirects and dynamic-body behavior from word
+provenance. Typed stdin reachability walks reachable compound statements and
+pipeline forwarding, so direct fetch-to-interpreter pairing handles wrappers,
+short-circuited branches, stdin/stdout redirects, and nested consumer groups
+without reconstructing those decisions from raw tokens. Compound producers,
+substitutions, and static re-parsed bodies still use the bounded token fallback.
+
+Layer tests cover interpreter modes, dynamic `eval`, forwarding and draining
+groups, guarded branches, and redirect ownership in both feature
+configurations.
+
 ## Review Round Three — Heredoc Body Boundaries and Invalid xargs Counts (2026-08-31)
 
 Status: **complete**

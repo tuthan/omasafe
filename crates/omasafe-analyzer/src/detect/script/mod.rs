@@ -424,7 +424,14 @@ fn analyze_script_unit(
         // command position; compound groups recurse into their own lists.
         let mut found = Vec::new();
         let mut budget = ShellBudget::new();
-        shell_consumption_findings(tokens, number, download_rule, &mut found, &mut budget);
+        shell_consumption_findings(
+            tokens,
+            shell_unit,
+            number,
+            download_rule,
+            &mut found,
+            &mut budget,
+        );
         if budget.exhausted() {
             *budget_exhausted = true;
         }

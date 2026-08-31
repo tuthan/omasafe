@@ -8,12 +8,14 @@
 use super::budget::{CachedStdinSummary, ShellBudget};
 use super::command::{
     ScriptCommand, compound_position, depth_zero_redirect_moves_stdin_away,
-    depth_zero_redirect_moves_stdout, segment_commands, statement_outcomes,
+    depth_zero_redirect_moves_stdout, redirect_moves_stdin_away, redirect_moves_stdout_away,
+    segment_commands, statement_outcomes,
 };
 use super::interpreter::{
     InterpreterFamily, InterpreterMode, command_is_interpreter, interpreter_family,
     interpreter_mode, static_command_body,
 };
+use super::ir::{Command as IrCommand, CommandNode, Redirect as IrRedirect, WordProvenance};
 use super::lexer::{ShellToken, SubstKind, tokenize};
 use super::syntax::{GroupKind, Outcomes, conditional_statements, pipeline_segments};
 use super::xargs::xargs_feeds_stdin_code;
@@ -144,8 +146,47 @@ pub(in crate::detect) fn command_effects(
     segment: &[ShellToken],
     budget: &mut ShellBudget,
 ) -> CommandEffects {
-    let stdout_redirected = depth_zero_redirect_moves_stdout(segment);
-    let stdin_redirected = depth_zero_redirect_moves_stdin_away(segment);
+    command_effects_with_redirects(
+        command,
+        depth_zero_redirect_moves_stdout(segment),
+        depth_zero_redirect_moves_stdin_away(segment),
+        budget,
+    )
+}
+
+/// Apply the same command-site summary to a typed IR command. Redirects and
+/// argument provenance come from the IR node, so callers do not need to
+/// reconstruct a token segment to answer stdin-consumption questions.
+pub(in crate::detect) fn ir_command_effects(
+    command: &IrCommand,
+    budget: &mut ShellBudget,
+) -> CommandEffects {
+    let args: Vec<&str> = command
+        .args
+        .iter()
+        .map(|word| word.value.as_str())
+        .collect();
+    let arg_dynamic: Vec<bool> = command
+        .args
+        .iter()
+        .map(|word| word.provenance != WordProvenance::Static)
+        .collect();
+    let script_command = ScriptCommand {
+        head: &command.head,
+        args,
+        arg_dynamic,
+    };
+    let stdout_redirected = ir_redirects_move_stdout(&command.redirects);
+    let stdin_redirected = ir_redirects_move_stdin(&command.redirects);
+    command_effects_with_redirects(&script_command, stdout_redirected, stdin_redirected, budget)
+}
+
+fn command_effects_with_redirects(
+    command: &ScriptCommand,
+    stdout_redirected: bool,
+    stdin_redirected: bool,
+    budget: &mut ShellBudget,
+) -> CommandEffects {
     let mut effects = CommandEffects {
         stdout: if stdout_redirected {
             StdoutEffect::Redirected
@@ -230,6 +271,30 @@ pub(in crate::detect) fn command_effects(
         effects.stdout = StdoutEffect::DerivedData;
     }
     effects
+}
+
+fn ir_redirects_move_stdout(redirects: &[IrRedirect]) -> bool {
+    redirects.iter().any(|redirect| {
+        redirect_moves_stdout_away(
+            &redirect.operator,
+            redirect
+                .target
+                .as_ref()
+                .map_or("", |target| target.value.as_str()),
+        )
+    })
+}
+
+fn ir_redirects_move_stdin(redirects: &[IrRedirect]) -> bool {
+    redirects.iter().any(|redirect| {
+        redirect_moves_stdin_away(
+            &redirect.operator,
+            redirect
+                .target
+                .as_ref()
+                .map_or("", |target| target.value.as_str()),
+        )
+    })
 }
 
 fn direct_egress_effect(command: &ScriptCommand) -> EgressEffect {
@@ -705,6 +770,189 @@ fn group_forwards_stdin(group: &[ShellToken], budget: &mut ShellBudget) -> bool 
     forwards
 }
 
+/// The typed equivalent of `segment_stdin_effect`: a command node's own
+/// redirects are applied before walking a compound body's first reachable
+/// pipeline stage. This is the command-site effect used by typed consumer
+/// reachability; token walks remain responsible for re-parsed child text.
+pub(in crate::detect) fn ir_node_stdin_effect(
+    node: &CommandNode,
+    budget: &mut ShellBudget,
+) -> StdinEffect {
+    let redirects = match node {
+        CommandNode::Simple(command) => &command.redirects,
+        CommandNode::Subshell { redirects, .. }
+        | CommandNode::BraceGroup { redirects, .. }
+        | CommandNode::Arithmetic { redirects, .. }
+        | CommandNode::Opaque { redirects, .. } => redirects,
+    };
+    if ir_redirects_move_stdin(redirects) {
+        return StdinEffect::Consumed;
+    }
+    match node {
+        CommandNode::Simple(command) => ir_command_effects(command, budget).stdin,
+        CommandNode::Subshell { body, .. } | CommandNode::BraceGroup { body, .. } => {
+            ir_group_stdin_effect(body, budget)
+        }
+        CommandNode::Arithmetic { .. } | CommandNode::Opaque { .. } => StdinEffect::Unread,
+    }
+}
+
+fn ir_group_stdin_effect(body: &[super::ir::Statement], budget: &mut ShellBudget) -> StdinEffect {
+    if !budget.spend(ir_body_work(body)) || !budget.enter() {
+        return StdinEffect::Consumed;
+    }
+    let effect = body
+        .iter()
+        .filter(|statement| statement.reachable)
+        .filter_map(|statement| statement.pipelines.first())
+        .filter_map(|pipeline| pipeline.commands.first())
+        .map(|node| ir_node_stdin_effect(node, budget))
+        .find(|effect| *effect != StdinEffect::Unread)
+        .unwrap_or(StdinEffect::Unread);
+    budget.leave();
+    effect
+}
+
+/// Whether a typed command node executes inherited stdin as code. Compound
+/// groups use the same short-circuit and pipeline dataflow model as the token
+/// path, but read reachability and command effects directly from the IR.
+pub(in crate::detect) fn ir_node_reaches_interpreter(
+    node: &CommandNode,
+    budget: &mut ShellBudget,
+) -> bool {
+    let redirects = match node {
+        CommandNode::Simple(command) => &command.redirects,
+        CommandNode::Subshell { redirects, .. }
+        | CommandNode::BraceGroup { redirects, .. }
+        | CommandNode::Arithmetic { redirects, .. }
+        | CommandNode::Opaque { redirects, .. } => redirects,
+    };
+    if ir_redirects_move_stdin(redirects) {
+        return false;
+    }
+    match node {
+        CommandNode::Simple(command) => matches!(
+            ir_command_effects(command, budget).execution,
+            ExecutionEffect::ExecutesStdin | ExecutionEffect::ExecutesTaintedArgument
+        ),
+        CommandNode::Subshell { body, .. } | CommandNode::BraceGroup { body, .. } => {
+            ir_group_reaches_interpreter(body, budget)
+        }
+        CommandNode::Arithmetic { .. } | CommandNode::Opaque { .. } => false,
+    }
+}
+
+fn ir_group_reaches_interpreter(body: &[super::ir::Statement], budget: &mut ShellBudget) -> bool {
+    if !budget.spend(ir_body_work(body)) || !budget.enter() {
+        return false;
+    }
+    let mut pipe_alive = true;
+    let mut reached = false;
+    for statement in body.iter().filter(|statement| statement.reachable) {
+        for pipeline in &statement.pipelines {
+            if pipeline.commands.is_empty() {
+                continue;
+            }
+            let effects: Vec<StdinEffect> = pipeline
+                .commands
+                .iter()
+                .map(|node| ir_node_stdin_effect(node, budget))
+                .collect();
+            let mut data = pipe_alive;
+            for (index, node) in pipeline.commands.iter().enumerate() {
+                if data {
+                    reached |= ir_node_reaches_interpreter(node, budget);
+                }
+                if index + 1 < pipeline.commands.len() {
+                    data &= effects[index] == StdinEffect::ForwardedDerivedData;
+                }
+            }
+            if pipe_alive && effects[0] != StdinEffect::Unread {
+                pipe_alive = false;
+            }
+        }
+    }
+    budget.leave();
+    reached
+}
+
+fn ir_group_forwards_stdin(body: &[super::ir::Statement], budget: &mut ShellBudget) -> bool {
+    if !budget.spend(ir_body_work(body)) || !budget.enter() {
+        return false;
+    }
+    let mut pipe_alive = true;
+    let mut forwards = false;
+    for statement in body.iter().filter(|statement| statement.reachable) {
+        for pipeline in &statement.pipelines {
+            if pipeline.commands.is_empty() {
+                continue;
+            }
+            let effects: Vec<StdinEffect> = pipeline
+                .commands
+                .iter()
+                .map(|node| ir_node_stdin_effect(node, budget))
+                .collect();
+            if pipe_alive
+                && effects
+                    .iter()
+                    .all(|effect| *effect == StdinEffect::ForwardedDerivedData)
+            {
+                forwards = true;
+            }
+            if pipe_alive && effects[0] != StdinEffect::Unread {
+                pipe_alive = false;
+            }
+        }
+        if forwards {
+            break;
+        }
+    }
+    budget.leave();
+    forwards
+}
+
+/// Whether a typed intermediate node forwards inherited stdin to its stdout.
+/// This lets a typed producer/consumer walk keep redirect ownership on the
+/// node instead of asking the token layer to rediscover it.
+pub(in crate::detect) fn ir_node_stdout_preserved(
+    node: &CommandNode,
+    budget: &mut ShellBudget,
+) -> bool {
+    let redirects = match node {
+        CommandNode::Simple(command) => &command.redirects,
+        CommandNode::Subshell { redirects, .. }
+        | CommandNode::BraceGroup { redirects, .. }
+        | CommandNode::Arithmetic { redirects, .. }
+        | CommandNode::Opaque { redirects, .. } => redirects,
+    };
+    if ir_redirects_move_stdout(redirects) {
+        return false;
+    }
+    match node {
+        CommandNode::Simple(command) => {
+            ir_command_effects(command, budget).stdout == StdoutEffect::ForwardedInput
+        }
+        CommandNode::Subshell { body, .. } | CommandNode::BraceGroup { body, .. } => {
+            ir_group_forwards_stdin(body, budget)
+        }
+        CommandNode::Arithmetic { .. } | CommandNode::Opaque { .. } => false,
+    }
+}
+
+/// Charge a bounded amount for one typed body without recharging descendants;
+/// nested groups charge themselves when their node is visited.
+fn ir_body_work(body: &[super::ir::Statement]) -> usize {
+    body.iter()
+        .map(|statement| {
+            1 + statement
+                .pipelines
+                .iter()
+                .map(|pipeline| 1 + pipeline.commands.len())
+                .sum::<usize>()
+        })
+        .sum()
+}
+
 /// Whether the pipeline's stdin still reaches an interpreter when the
 /// consumer segment runs. The compound's own stdin redirection (`( … ) <
 /// /dev/null`) starves everything inside; otherwise the consumer is walked
@@ -996,5 +1244,42 @@ mod tests {
         assert_eq!(second, first);
         assert_eq!(budget.nodes, nodes_after_first);
         assert!(!budget.exhausted());
+    }
+
+    #[test]
+    fn typed_ir_command_effects_keep_redirect_and_provenance_ownership() {
+        use crate::detect::shell::ir::{CommandNode, ShellProgram, WordProvenance};
+
+        let program = ShellProgram::from_units(vec![(
+            1,
+            "sudo sh -c sh; eval \"$BODY\"; cat >out\n".to_owned(),
+        )]);
+        let unit = &program.units()[0];
+
+        let CommandNode::Simple(wrapped) = &unit.statements[0].pipelines[0].commands[0] else {
+            panic!("expected wrapped simple command");
+        };
+        let mut budget = ShellBudget::new();
+        let wrapped_effects = ir_command_effects(wrapped, &mut budget);
+        assert_eq!(wrapped_effects.stdin, StdinEffect::Consumed);
+        assert_eq!(wrapped_effects.execution, ExecutionEffect::ExecutesStdin);
+
+        let CommandNode::Simple(dynamic) = &unit.statements[1].pipelines[0].commands[0] else {
+            panic!("expected dynamic simple command");
+        };
+        assert_eq!(
+            dynamic.args[0].provenance,
+            WordProvenance::ParameterExpansion
+        );
+        let dynamic_effects = ir_command_effects(dynamic, &mut budget);
+        assert_eq!(dynamic_effects.execution, ExecutionEffect::None);
+        assert_eq!(dynamic_effects.stdin, StdinEffect::Unread);
+
+        let CommandNode::Simple(redirected) = &unit.statements[2].pipelines[0].commands[0] else {
+            panic!("expected redirected simple command");
+        };
+        let redirected_effects = ir_command_effects(redirected, &mut budget);
+        assert_eq!(redirected_effects.stdin, StdinEffect::Consumed);
+        assert_eq!(redirected_effects.stdout, StdoutEffect::Redirected);
     }
 }
