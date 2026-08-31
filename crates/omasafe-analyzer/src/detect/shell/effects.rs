@@ -15,9 +15,7 @@ use super::interpreter::{
     InterpreterFamily, InterpreterMode, command_is_interpreter, interpreter_family,
     interpreter_mode, static_command_body,
 };
-use super::ir::{
-    Command as IrCommand, CommandNode, ExecutedBody, Redirect as IrRedirect, WordProvenance,
-};
+use super::ir::{Command as IrCommand, CommandNode, ExecutedBody, Redirect as IrRedirect};
 use super::lexer::{ShellToken, SubstKind, tokenize};
 use super::syntax::{GroupKind, Outcomes, conditional_statements, pipeline_segments};
 use super::xargs::xargs_feeds_stdin_code;
@@ -206,7 +204,7 @@ fn with_ir_script_command<T>(command: &IrCommand, f: impl FnOnce(&ScriptCommand)
     let arg_dynamic: Vec<bool> = command
         .args
         .iter()
-        .map(|word| word.provenance != WordProvenance::Static)
+        .map(|word| !word.provenance.is_static())
         .collect();
     let script_command = ScriptCommand {
         head: &command.head,
@@ -1397,10 +1395,7 @@ mod tests {
         let CommandNode::Simple(dynamic) = &unit.statements[1].pipelines[0].commands[0] else {
             panic!("expected dynamic simple command");
         };
-        assert_eq!(
-            dynamic.args[0].provenance,
-            WordProvenance::ParameterExpansion
-        );
+        assert_eq!(dynamic.args[0].provenance, WordProvenance::PARAMETER);
         let dynamic_effects = ir_command_effects(dynamic, &mut budget);
         assert_eq!(dynamic_effects.execution, ExecutionEffect::None);
         assert_eq!(dynamic_effects.stdin, StdinEffect::Unread);

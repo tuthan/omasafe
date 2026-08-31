@@ -11,6 +11,7 @@ use super::command::{
     is_env_assignment, is_redirect_operator, segment_commands, skip_command_prefixes,
     skip_wrapper_options, statement_outcomes,
 };
+pub(in crate::detect) use super::lexer::WordProvenance;
 use super::lexer::{ShellToken, SubstKind};
 use super::syntax::{
     GroupKind, Outcomes, conditional_statements, matching_group_close, pipeline_negated,
@@ -45,17 +46,6 @@ impl Guard {
             Some(_) => Self::Unconditional,
         }
     }
-}
-
-/// The known runtime provenance of a shell word.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::detect) enum WordProvenance {
-    Static,
-    ParameterExpansion,
-    CommandSubstitution,
-    ProcessSubstitution,
-    ArithmeticExpansion,
-    Mixed,
 }
 
 /// A word's best-known runtime value and how that value was produced.
@@ -493,26 +483,11 @@ fn word_from_token_at_depth(token: &ShellToken, depth: usize) -> Option<Word> {
     let ShellToken::Word {
         value,
         substitutions,
-        dynamic,
+        provenance,
         ..
     } = token
     else {
         return None;
-    };
-    let provenance = if !dynamic {
-        WordProvenance::Static
-    } else if substitutions.len() != 1 {
-        if substitutions.is_empty() {
-            WordProvenance::ParameterExpansion
-        } else {
-            WordProvenance::Mixed
-        }
-    } else {
-        match substitutions[0].kind {
-            SubstKind::Command => WordProvenance::CommandSubstitution,
-            SubstKind::Process => WordProvenance::ProcessSubstitution,
-            SubstKind::Arithmetic => WordProvenance::ArithmeticExpansion,
-        }
     };
     let substitutions = substitutions
         .iter()
@@ -529,7 +504,7 @@ fn word_from_token_at_depth(token: &ShellToken, depth: usize) -> Option<Word> {
         .collect();
     Some(Word {
         value: value.clone(),
-        provenance,
+        provenance: *provenance,
         substitutions,
     })
 }
@@ -538,9 +513,9 @@ fn word_from_value(value: &str, dynamic: bool) -> Word {
     Word {
         value: value.to_owned(),
         provenance: if dynamic {
-            WordProvenance::Mixed
+            WordProvenance::PARAMETER | WordProvenance::FIELD_SPLIT
         } else {
-            WordProvenance::Static
+            WordProvenance::EMPTY
         },
         substitutions: Vec::new(),
     }
@@ -588,14 +563,8 @@ mod tests {
         let CommandNode::Simple(command) = &unit.statements[0].pipelines[0].commands[0] else {
             panic!("expected simple command");
         };
-        assert_eq!(
-            command.args[0].provenance,
-            WordProvenance::CommandSubstitution
-        );
-        assert_eq!(
-            command.args[1].provenance,
-            WordProvenance::ProcessSubstitution
-        );
+        assert_eq!(command.args[0].provenance, WordProvenance::COMMAND_SUBST);
+        assert_eq!(command.args[1].provenance, WordProvenance::PROCESS_SUBST);
         assert_eq!(command.redirects[0].operator, ">");
         assert_eq!(
             command.redirects[0]
@@ -608,7 +577,34 @@ mod tests {
         let CommandNode::Simple(echo) = &unit.statements[1].pipelines[0].commands[0] else {
             panic!("expected simple command");
         };
-        assert_eq!(echo.args[0].provenance, WordProvenance::ParameterExpansion);
+        assert_eq!(
+            echo.args[0].provenance,
+            WordProvenance::PARAMETER | WordProvenance::FIELD_SPLIT
+        );
+    }
+
+    #[test]
+    fn collects_composable_provenance_causes_with_quote_context() {
+        let program = ShellProgram::from_units(vec![(
+            1,
+            "printf '%s' ${name}$(cmd) \"$name\" \"*.sh\" *.sh ~/x {a,b} $((1+2))".to_owned(),
+        )]);
+        let CommandNode::Simple(command) =
+            &program.units()[0].statements[0].pipelines[0].commands[0]
+        else {
+            panic!("expected simple command");
+        };
+
+        assert_eq!(
+            command.args[1].provenance,
+            WordProvenance::PARAMETER | WordProvenance::COMMAND_SUBST | WordProvenance::FIELD_SPLIT
+        );
+        assert_eq!(command.args[2].provenance, WordProvenance::PARAMETER);
+        assert_eq!(command.args[3].provenance, WordProvenance::EMPTY);
+        assert_eq!(command.args[4].provenance, WordProvenance::GLOB);
+        assert_eq!(command.args[5].provenance, WordProvenance::TILDE);
+        assert_eq!(command.args[6].provenance, WordProvenance::BRACE);
+        assert_eq!(command.args[7].provenance, WordProvenance::ARITHMETIC);
     }
 
     #[test]
@@ -647,7 +643,7 @@ mod tests {
                 head: "wget".to_owned(),
                 args: vec![Word {
                     value: "https://example.test/sub".to_owned(),
-                    provenance: WordProvenance::Static,
+                    provenance: WordProvenance::EMPTY,
                     substitutions: Vec::new(),
                 }],
                 redirects: Vec::new(),

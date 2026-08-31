@@ -7,6 +7,51 @@
 
 use crate::detect::model::balanced_bracket_span;
 
+const PARAMETER_BIT: u16 = 1 << 0;
+const COMMAND_SUBST_BIT: u16 = 1 << 1;
+const PROCESS_SUBST_BIT: u16 = 1 << 2;
+const ARITHMETIC_BIT: u16 = 1 << 3;
+const GLOB_BIT: u16 = 1 << 4;
+const TILDE_BIT: u16 = 1 << 5;
+const BRACE_BIT: u16 = 1 << 6;
+const FIELD_SPLIT_BIT: u16 = 1 << 7;
+
+/// Additive causes that make a shell word runtime-dependent. The lexer owns
+/// this set because only it still knows whether an expansion or pattern was
+/// quoted when it was encountered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::detect) struct WordProvenance(u16);
+
+impl WordProvenance {
+    pub(in crate::detect) const EMPTY: Self = Self(0);
+    pub(in crate::detect) const PARAMETER: Self = Self(PARAMETER_BIT);
+    pub(in crate::detect) const COMMAND_SUBST: Self = Self(COMMAND_SUBST_BIT);
+    pub(in crate::detect) const PROCESS_SUBST: Self = Self(PROCESS_SUBST_BIT);
+    pub(in crate::detect) const ARITHMETIC: Self = Self(ARITHMETIC_BIT);
+    pub(in crate::detect) const GLOB: Self = Self(GLOB_BIT);
+    pub(in crate::detect) const TILDE: Self = Self(TILDE_BIT);
+    pub(in crate::detect) const BRACE: Self = Self(BRACE_BIT);
+    pub(in crate::detect) const FIELD_SPLIT: Self = Self(FIELD_SPLIT_BIT);
+
+    pub(in crate::detect) const fn is_static(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl std::ops::BitOr for WordProvenance {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl std::ops::BitOrAssign for WordProvenance {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
 /// A substitution's kind: command substitution (`$( … )`, backticks) expands
 /// to text a command consumes, process substitution (`<( … )`, `>( … )`)
 /// presents its output as a filename operand, and arithmetic expansion
@@ -39,6 +84,7 @@ pub(in crate::detect) enum ShellToken {
     Word {
         value: String,
         substitutions: Vec<Substitution>,
+        provenance: WordProvenance,
         /// Some fragment of the word resolves only at runtime — an unquoted
         /// or double-quoted `$`/backtick expansion, or a captured
         /// substitution — so the value is not statically known text.
@@ -289,7 +335,10 @@ fn read_word(input: &str, start: usize) -> (ShellToken, usize) {
     let mut i = start;
     let mut value: Vec<u8> = Vec::new();
     let mut substitutions: Vec<Substitution> = Vec::new();
-    let mut dynamic = false;
+    let mut provenance = WordProvenance::EMPTY;
+    let mut parameter_brace_depth = 0u32;
+    let mut brace_expansion_stack = Vec::new();
+    let mut glob_bracket_open = false;
     while i < bytes.len() {
         match bytes[i] {
             b' ' | b'\t' | b'\n' | b'\r' | b';' | b'|' | b'&' | b'(' | b')' => break,
@@ -302,7 +351,7 @@ fn read_word(input: &str, start: usize) -> (ShellToken, usize) {
                         inner: input[open..close].to_owned(),
                     });
                     value.extend_from_slice(&bytes[i..=close]);
-                    dynamic = true;
+                    provenance |= WordProvenance::PROCESS_SUBST;
                     i = close + 1;
                     continue;
                 }
@@ -326,13 +375,19 @@ fn read_word(input: &str, start: usize) -> (ShellToken, usize) {
                 }
             }
             b'"' => {
-                i = read_double_quoted(input, i + 1, &mut value, &mut substitutions, &mut dynamic)
+                i = read_double_quoted(
+                    input,
+                    i + 1,
+                    &mut value,
+                    &mut substitutions,
+                    &mut provenance,
+                )
             }
             b'$' if bytes.get(i + 1) == Some(&b'(') => {
                 match dollar_substitution(input, i + 1) {
                     Some((kind, inner, end)) => {
                         substitutions.push(Substitution { kind, inner });
-                        dynamic = true;
+                        add_substitution_provenance(&mut provenance, kind, false);
                         match kind {
                             // The expansion's runtime value is a number, so
                             // it never reads back as a command word.
@@ -343,16 +398,22 @@ fn read_word(input: &str, start: usize) -> (ShellToken, usize) {
                     }
                     None => {
                         value.push(bytes[i]);
-                        dynamic = true;
+                        provenance |= WordProvenance::COMMAND_SUBST | WordProvenance::FIELD_SPLIT;
                         i += 1;
                     }
                 }
             }
             b'$' => {
-                // A bare parameter expansion (`$body`) resolves at runtime.
+                // A braced or bare parameter expansion resolves at runtime.
+                provenance |= WordProvenance::PARAMETER | WordProvenance::FIELD_SPLIT;
                 value.push(bytes[i]);
-                dynamic = true;
-                i += 1;
+                if bytes.get(i + 1) == Some(&b'{') {
+                    value.push(b'{');
+                    parameter_brace_depth = parameter_brace_depth.saturating_add(1);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
             }
             b'`' => {
                 if let Some(rel) = input[i + 1..].find('`') {
@@ -363,13 +424,58 @@ fn read_word(input: &str, start: usize) -> (ShellToken, usize) {
                         inner: input[inner_start..inner_end].to_owned(),
                     });
                     value.extend_from_slice(&bytes[i..=inner_end]);
-                    dynamic = true;
+                    provenance |= WordProvenance::COMMAND_SUBST | WordProvenance::FIELD_SPLIT;
                     i = inner_end + 1;
                 } else {
                     value.push(bytes[i]);
-                    dynamic = true;
+                    provenance |= WordProvenance::COMMAND_SUBST | WordProvenance::FIELD_SPLIT;
                     i += 1;
                 }
+            }
+            b'~' if i == start || value.last() == Some(&b'=') => {
+                provenance |= WordProvenance::TILDE;
+                value.push(bytes[i]);
+                i += 1;
+            }
+            b'*' | b'?' => {
+                provenance |= WordProvenance::GLOB;
+                value.push(bytes[i]);
+                i += 1;
+            }
+            b'[' => {
+                glob_bracket_open = true;
+                value.push(bytes[i]);
+                i += 1;
+            }
+            b']' if glob_bracket_open => {
+                provenance |= WordProvenance::GLOB;
+                glob_bracket_open = false;
+                value.push(bytes[i]);
+                i += 1;
+            }
+            b'{' if parameter_brace_depth == 0 => {
+                brace_expansion_stack.push(false);
+                value.push(bytes[i]);
+                i += 1;
+            }
+            b',' if parameter_brace_depth == 0 => {
+                if let Some(has_comma) = brace_expansion_stack.last_mut() {
+                    *has_comma = true;
+                }
+                value.push(bytes[i]);
+                i += 1;
+            }
+            b'}' if parameter_brace_depth > 0 => {
+                parameter_brace_depth -= 1;
+                value.push(bytes[i]);
+                i += 1;
+            }
+            b'}' if parameter_brace_depth == 0 => {
+                if brace_expansion_stack.pop().unwrap_or(false) {
+                    provenance |= WordProvenance::BRACE;
+                }
+                value.push(bytes[i]);
+                i += 1;
             }
             other => {
                 value.push(other);
@@ -381,7 +487,8 @@ fn read_word(input: &str, start: usize) -> (ShellToken, usize) {
         ShellToken::Word {
             value: String::from_utf8_lossy(&value).into_owned(),
             substitutions,
-            dynamic,
+            dynamic: !provenance.is_static(),
+            provenance,
             span: (start, i),
         },
         i,
@@ -398,7 +505,7 @@ fn read_double_quoted(
     start: usize,
     value: &mut Vec<u8>,
     substitutions: &mut Vec<Substitution>,
-    dynamic: &mut bool,
+    provenance: &mut WordProvenance,
 ) -> usize {
     let bytes = input.as_bytes();
     let mut i = start;
@@ -422,7 +529,7 @@ fn read_double_quoted(
                 match dollar_substitution(input, i + 1) {
                     Some((kind, inner, end)) => {
                         substitutions.push(Substitution { kind, inner });
-                        *dynamic = true;
+                        add_substitution_provenance(provenance, kind, true);
                         match kind {
                             // The expansion's runtime value is a number, so
                             // it never reads back as a command word.
@@ -433,14 +540,14 @@ fn read_double_quoted(
                     }
                     None => {
                         value.push(bytes[i]);
-                        *dynamic = true;
+                        *provenance |= WordProvenance::COMMAND_SUBST;
                         i += 1;
                     }
                 }
             }
             b'$' => {
                 value.push(bytes[i]);
-                *dynamic = true;
+                *provenance |= WordProvenance::PARAMETER;
                 i += 1;
             }
             b'`' => {
@@ -452,11 +559,11 @@ fn read_double_quoted(
                         inner: input[inner_start..inner_end].to_owned(),
                     });
                     value.extend_from_slice(&bytes[i..=inner_end]);
-                    *dynamic = true;
+                    *provenance |= WordProvenance::COMMAND_SUBST;
                     i = inner_end + 1;
                 } else {
                     value.push(bytes[i]);
-                    *dynamic = true;
+                    *provenance |= WordProvenance::COMMAND_SUBST;
                     i += 1;
                 }
             }
@@ -467,4 +574,15 @@ fn read_double_quoted(
         }
     }
     i
+}
+
+fn add_substitution_provenance(provenance: &mut WordProvenance, kind: SubstKind, quoted: bool) {
+    *provenance |= match kind {
+        SubstKind::Command => WordProvenance::COMMAND_SUBST,
+        SubstKind::Process => WordProvenance::PROCESS_SUBST,
+        SubstKind::Arithmetic => WordProvenance::ARITHMETIC,
+    };
+    if !quoted && matches!(kind, SubstKind::Command) {
+        *provenance |= WordProvenance::FIELD_SPLIT;
+    }
 }
