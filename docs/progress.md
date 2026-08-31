@@ -2462,6 +2462,47 @@ scripts/determinism-canary.sh                            # exit 0
 git diff --check                                         # clean
 ```
 
+## Review Round Three — Heredoc Body Boundaries and Invalid xargs Counts (2026-08-31)
+
+Status: **complete**
+
+The final Stage A review round found and fixed the remaining boundary defect
+from round two, plus the invalid-count behavior in both xargs code paths. The
+new `detect::tests::round_sixteen_tests` suite has 7 cases and covers the
+six reproductions plus the corrected valid-count check.
+
+1. **Trailing operators and multiline groups now use Bash's heredoc boundary
+   (P1).** A heredoc body begins after the first newline that is not escaped
+   or inside quotes/backticks. A trailing `|`, `&&`, or open compound group
+   does not postpone the body. The resumed probe now classifies the complete
+   post-terminator pipeline/group continuation, while grouped ownership walks
+   the redirect's own nesting depth even when physical newlines were emitted
+   as separators. Removed body/terminator placeholders preserve line numbers
+   without becoming synthetic whitespace in the resumed command.
+2. **Invalid xargs counts stay silent (P2).** `xargs_option_area_is_valid`
+   validates `-n`/`-L`/`-s` as positive numeric counts, rejects unparsable
+   `-P`/`--max-procs` while accepting `-P 0`, honors option arity for
+   dash-leading `-I` values, and gates both direct stdin consumers and
+   forwarded-heredoc landing. GNU's optional-argument behavior for bare
+   `--max-lines`/`--eof` remains consistent across the wrapped-command,
+   placeholder, and landing walks.
+3. **The valid-count regression expectation was corrected.** A static
+   `sh -c '{}'` body does not execute xargs input without a replacement or
+   positional-parameter code path, so the test now uses bodyless `sh -c`.
+
+Full verification gate in both feature configurations:
+
+```text
+cargo fmt --all -- --check                               # exit 0
+cargo clippy --workspace --all-targets -- -D warnings    # exit 0
+cargo clippy --workspace --all-targets --no-default-features -- -D warnings # exit 0
+cargo test --workspace                                   # 229 analyzer, 75 CLI
+cargo test --workspace --no-default-features              # 219 analyzer, 75 CLI
+./scripts/generate-cli-assets.sh --check                 # exit 0
+scripts/determinism-canary.sh                            # exit 0
+git diff --check                                         # clean
+```
+
 ## Plan A4 — Detector Family Extraction
 
 Status: **complete**

@@ -25,6 +25,9 @@ pub(in crate::detect) fn xargs_feeds_stdin_code(command: &ScriptCommand) -> bool
     let Some(wrapped) = xargs_wrapped_command(command) else {
         return false;
     };
+    if !xargs_option_area_is_valid(command, wrapped) {
+        return false;
+    }
     let placeholder = xargs_placeholder(command, wrapped);
     if let Some(head) = command.args.get(wrapped)
         && placeholder
@@ -138,12 +141,7 @@ fn xargs_placeholder(command: &ScriptCommand, wrapped: usize) -> Option<String> 
                         advance = 2; // the separate count word
                     }
                 }
-                "max-lines" => {
-                    placeholder = None;
-                    if glued.is_none() {
-                        advance = 2;
-                    }
-                }
+                "max-lines" => placeholder = None,
                 _ => {}
             }
         } else if arg.len() > 1 && arg.starts_with('-') {
@@ -309,6 +307,9 @@ pub(in crate::detect) fn xargs_body_fate(
 /// reads items from a file instead of stdin.
 fn xargs_landing(command: &ScriptCommand) -> Option<XargsLanding> {
     let wrapped = xargs_wrapped_command(command)?;
+    if !xargs_option_area_is_valid(command, wrapped) {
+        return None;
+    }
     let placeholder = xargs_placeholder(command, wrapped);
     let mut landing = XargsLanding {
         sink: XargsSink::BatchBodies,
@@ -356,12 +357,10 @@ fn xargs_landing(command: &ScriptCommand) -> Option<XargsLanding> {
                     }
                 }
                 "max-lines" => {
-                    if let Some(n) = value() {
-                        landing.set_line_batch(&n);
-                    }
-                    if glued.is_none() {
-                        advance = 2;
-                    }
+                    // GNU `--max-lines[=N]` takes its value only after `=`;
+                    // the bare form means one line and never consumes the
+                    // next word.
+                    landing.set_line_batch(glued.unwrap_or("1"));
                 }
                 "arg-file" => return None, // items come from a file, not stdin
                 _ => {}
@@ -799,13 +798,12 @@ fn xargs_wrapped_command(command: &ScriptCommand) -> Option<usize> {
             return Some(index);
         }
         let long = arg.strip_prefix("--");
-        // GNU `--replace[=STR]` takes its value only after `=` and never
-        // consumes the wrapped command; every other valued long option
-        // takes a separate value word.
+        // GNU `--replace[=STR]`, `--max-lines[=N]`, and `--eof[=STR]` take
+        // their values only after `=` and never consume the wrapped
+        // command; every other valued long option takes a separate value
+        // word.
         let takes_value = match long.map(|value| value.split('=').next().unwrap_or(value)) {
-            Some("max-args" | "max-lines" | "max-procs" | "max-chars" | "eof" | "delimiter") => {
-                !arg.contains('=')
-            }
+            Some("max-args" | "max-procs" | "max-chars" | "delimiter") => !arg.contains('='),
             Some(_) => false,
             None => {
                 let short = &arg[1..];
@@ -819,6 +817,83 @@ fn xargs_wrapped_command(command: &ScriptCommand) -> Option<usize> {
         index += if takes_value { 2 } else { 1 };
     }
     None
+}
+
+/// GNU xargs validates its numeric options before reading any input, so a
+/// zero or unparsable `-n`/`-L`/`-s` count (or an unparsable `-P` count)
+/// makes the whole invocation fail with a usage error and nothing ever
+/// executes (`curl URL | xargs -n0 sh -c` reports and exits). Negative
+/// counts parse as numbers and fail the same >= 1 check.
+fn xargs_option_area_is_valid(command: &ScriptCommand, wrapped: usize) -> bool {
+    let mut index = 0usize;
+    while index < wrapped {
+        let arg = command.args[index];
+        let mut advance = 1usize;
+        let invalid = if let Some(long) = arg.strip_prefix("--") {
+            let (name, glued) = long
+                .split_once('=')
+                .map(|(name, value)| (name, Some(value)))
+                .unwrap_or((long, None));
+            match name {
+                "max-args" | "max-chars" => {
+                    let value = glued.map_or_else(|| command.args.get(index + 1).copied(), Some);
+                    if glued.is_none() {
+                        advance = 2;
+                    }
+                    rejects_count(value)
+                }
+                // `-P 0` is unlimited parallelism, not a rejection.
+                "max-procs" => {
+                    let value = glued.map_or_else(|| command.args.get(index + 1).copied(), Some);
+                    if glued.is_none() {
+                        advance = 2;
+                    }
+                    value.is_some_and(|value| xargs_count(value).is_none())
+                }
+                // String-valued options are never invalid, but their
+                // separate value word must be consumed.
+                "delimiter" => {
+                    if glued.is_none() {
+                        advance = 2;
+                    }
+                    false
+                }
+                _ => false,
+            }
+        } else if arg.len() > 1 && arg.starts_with('-') {
+            let flags = &arg[1..];
+            match flags.chars().next() {
+                Some(flag @ ('n' | 'L' | 's' | 'P' | 'I' | 'd' | 'E')) => {
+                    let value = if flags.len() > 1 {
+                        Some(&flags[1..])
+                    } else {
+                        advance = 2;
+                        command.args.get(index + 1).copied()
+                    };
+                    match flag {
+                        'n' | 'L' | 's' => rejects_count(value),
+                        // `-P 0` is unlimited parallelism.
+                        'P' => value.is_some_and(|value| xargs_count(value).is_none()),
+                        _ => false,
+                    }
+                }
+                _ => false,
+            }
+        } else {
+            false
+        };
+        if invalid {
+            return false;
+        }
+        index += advance;
+    }
+    true
+}
+
+/// GNU rejects a zero or unparsable count for `-n`/`-L`/`-s` ("value 0 for
+/// -n option should be >= 1", "invalid number").
+fn rejects_count(value: Option<&str>) -> bool {
+    value.is_some_and(|value| xargs_count(value).is_none_or(|count| count == 0))
 }
 
 /// Positional parameters only taint execution when they flow into command

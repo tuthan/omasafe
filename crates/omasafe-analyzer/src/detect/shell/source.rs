@@ -15,6 +15,11 @@
 
 use super::lexer::{ShellToken, redirect_operator_at, tokenize};
 
+/// Internal line marker used for removed heredoc bodies and terminators. It
+/// preserves physical line numbers without letting artificial blank lines
+/// become whitespace in a continued pipeline or group during reassembly.
+const HEREDOC_PLACEHOLDER: &str = "\0omasafe-heredoc-placeholder";
+
 /// What the command owning a heredoc redirect does with the body.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(in crate::detect) enum HeredocOwner {
@@ -262,6 +267,9 @@ fn assemble_units(source: &str) -> Vec<(u32, String)> {
     let mut assembler = UnitAssembler::new();
     let mut units = Vec::new();
     for (index, raw_line) in source.lines().enumerate() {
+        if raw_line == HEREDOC_PLACEHOLDER {
+            continue;
+        }
         if let Some(unit) = assembler.feed(index as u32 + 1, raw_line) {
             units.push(unit);
         }
@@ -407,6 +415,64 @@ fn skip_balanced_parens(bytes: &[u8], open: usize) -> usize {
     bytes.len()
 }
 
+/// Whether the newline ending `line` reads a pending heredoc's body: bash
+/// collects bodies at the first newline that is neither escaped nor inside
+/// quotes/backticks — a trailing pipeline operator or an open compound
+/// group does NOT postpone it (`cat <<C |` reads the next line as body
+/// data, and the pipeline's next stage follows the terminator). A `#`
+/// comment ends the line, including any trailing backslash.
+fn newline_terminates_heredoc_header(line: &str) -> bool {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_backtick = false;
+    let mut boundary = true; // a line start is a word boundary for `#`
+    let mut characters = line.chars().peekable();
+    while let Some(character) = characters.next() {
+        if in_single {
+            if character == '\'' {
+                in_single = false;
+            }
+            boundary = false;
+            continue;
+        }
+        if in_backtick {
+            if character == '`' {
+                in_backtick = false;
+            }
+            boundary = false;
+            continue;
+        }
+        if in_double {
+            if character == '\\' {
+                characters.next();
+            } else if character == '"' {
+                in_double = false;
+            }
+            boundary = false;
+            continue;
+        }
+        match character {
+            '\\' => {
+                if characters.next().is_none() {
+                    return false; // escaped newline: the body waits
+                }
+                boundary = false;
+            }
+            '#' if boundary => return true, // a comment ends the line
+            _ => {
+                boundary = matches!(character, ' ' | '\t' | ';' | '&' | '|' | '(');
+                match character {
+                    '\'' => in_single = true,
+                    '"' => in_double = true,
+                    '`' => in_backtick = true,
+                    _ => {}
+                }
+            }
+        }
+    }
+    !in_single && !in_double && !in_backtick
+}
+
 /// The raw delimiter word just past a heredoc operator: quoted runs and
 /// plain word bytes up to unquoted whitespace or an operator byte, so
 /// `<<CODE|cat` keeps its pipeline tail. `None` when the line ends first.
@@ -452,13 +518,16 @@ fn delimiter_word_span(bytes: &[u8], mut i: usize) -> Option<(usize, usize)> {
 /// comparison; `<<-` accepts leading tabs on its terminator.
 ///
 /// Ownership AND body placement are decided against the COMPLETE continued
-/// command, not the bare header line: a heredoc operator may sit on its own
-/// physical line while the owning word sits on an earlier one joined by an
-/// escaped newline, an open quote, or a trailing operator (`sh \` + `<<C`),
-/// and the body only begins once the command's terminating newline is
-/// reached — a continued header like `cat <<A | \` + `cat <<B` reads both
-/// bodies after the second line, and later unit lines can carry heredocs of
-/// their own (`sh <<A; \` + `sh <<B`).
+/// header, not the bare line carrying the operator: a heredoc operator may
+/// sit on its own physical line while the owning word sits on an earlier
+/// one joined by an escaped newline or an open quote (`sh \` + `<<C`), and
+/// the body begins at the header's first newline that is neither escaped
+/// nor inside quotes — `cat <<A | \` + `cat <<B` reads both bodies after
+/// the second line, later header lines can carry heredocs of their own
+/// (`sh <<A; \` + `sh <<B`), and a trailing `|` or an open compound group
+/// does NOT postpone the body (`cat <<C |` reads the next line as body
+/// data while the pipeline's next stage follows the terminator). The
+/// pipeline tail the body fate walks spans that post-body continuation.
 ///
 /// Later heredocs of the SAME command override earlier stdin, so only each
 /// command's last heredoc supplies its body — decided by command ownership
@@ -497,16 +566,17 @@ fn shell_source_without_heredoc_payloads(
             index += 1;
             continue;
         }
-        // A heredoc body follows the COMPLETE logical command: probe the
-        // unit state to find the unit's last physical line — a continued
-        // header keeps reading lines, and those lines can carry heredocs of
-        // their own. An EOF inside the header never completes, so no body
-        // follows and the rest of the file is left alone.
-        let mut unit_end = index;
-        let mut span_probe = context.clone();
-        span_probe.feed(index as u32 + 1, line);
-        while span_probe.open {
-            if unit_end + 1 == lines.len() {
+        // A heredoc body follows the redirection-bearing command's first
+        // newline that is neither escaped nor inside quotes — a trailing
+        // pipeline operator or an open compound group does NOT postpone
+        // it, and the command's continuation (the pipeline stage, the
+        // group's closing parenthesis) follows the terminator line.
+        let mut boundary = index;
+        while !newline_terminates_heredoc_header(lines[boundary]) {
+            if boundary + 1 == lines.len() {
+                // EOF inside an escaped/quoted header: the command never
+                // reaches its newline, so no body follows — leave the rest
+                // of the file alone.
                 for &rest in lines[index..].iter() {
                     output.push(rest.to_owned());
                     context.feed(index as u32 + 1, rest);
@@ -514,15 +584,14 @@ fn shell_source_without_heredoc_payloads(
                 }
                 continue 'lines;
             }
-            unit_end += 1;
-            span_probe.feed(unit_end as u32 + 1, lines[unit_end]);
+            boundary += 1;
         }
-        // Every heredoc of the unit, in redirection order across its
-        // physical lines. The rewrite aligns the raw scan with the token
-        // stream one to one on EVERY unit line; anything else leaves the
-        // whole unit alone.
+        // Every heredoc lexed before that newline, in redirection order
+        // across the header's physical lines. The rewrite aligns the raw
+        // scan with the token stream one to one on EVERY header line;
+        // anything else leaves the whole header alone.
         let mut unit_redirects: Vec<UnitHeredoc> = Vec::new();
-        for (offset, line_index) in (index..=unit_end).enumerate() {
+        for (offset, line_index) in (index..=boundary).enumerate() {
             let unit_line = lines[line_index];
             let unit_tokens = tokenize(unit_line);
             let unit_ops: Vec<usize> = unit_tokens
@@ -535,20 +604,20 @@ fn shell_source_without_heredoc_payloads(
             let Some(unit_scan) = heredoc_redirects(unit_line, &unit_tokens)
                 .filter(|scan| scan.len() == unit_ops.len())
             else {
-                for (offset, &rest) in lines[index..=unit_end].iter().enumerate() {
+                for (offset, &rest) in lines[index..=boundary].iter().enumerate() {
                     output.push(rest.to_owned());
                     context.feed(index as u32 + 1 + offset as u32, rest);
                 }
-                index = unit_end + 1;
+                index = boundary + 1;
                 continue 'lines;
             };
             for (&token_index, redirect) in unit_ops.iter().zip(&unit_scan) {
                 let Some(word) = unit_tokens.get(token_index + 1).and_then(ShellToken::word) else {
-                    for (offset, &rest) in lines[index..=unit_end].iter().enumerate() {
+                    for (offset, &rest) in lines[index..=boundary].iter().enumerate() {
                         output.push(rest.to_owned());
                         context.feed(index as u32 + 1 + offset as u32, rest);
                     }
-                    index = unit_end + 1;
+                    index = boundary + 1;
                     continue 'lines;
                 };
                 unit_redirects.push(UnitHeredoc {
@@ -560,10 +629,11 @@ fn shell_source_without_heredoc_payloads(
             }
         }
         // Bodies are captured in redirection order, starting after the
-        // unit's LAST line: the first body follows the complete command,
-        // each next body starts after the previous terminator.
+        // header's last line: the first body follows the command's
+        // terminating newline, each next body starts after the previous
+        // terminator.
         let mut bodies: Vec<Vec<&str>> = Vec::new();
-        let mut cursor = unit_end + 1;
+        let mut cursor = boundary + 1;
         let mut terminated = true;
         for redirect in &unit_redirects {
             let mut body = Vec::new();
@@ -587,28 +657,61 @@ fn shell_source_without_heredoc_payloads(
             cursor += 1; // the terminator line
         }
         if !terminated {
-            for (offset, &rest) in lines[index..=unit_end].iter().enumerate() {
+            for (offset, &rest) in lines[index..=boundary].iter().enumerate() {
                 output.push(rest.to_owned());
                 context.feed(index as u32 + 1 + offset as u32, rest);
             }
-            index = unit_end + 1;
+            index = boundary + 1;
             continue;
         }
-        // Ownership is classified over the JOINED continued command: probe
-        // the unit state with the unit's raw lines, then take the unit's
+        // Ownership is classified over the JOINED continued header: probe
+        // the unit state with the header's raw lines, then take the batch's
         // heredoc operators from the joined stream's final ones (the prefix
-        // carries none — earlier heredocs were rewritten away).
+        // carries none — earlier heredocs were rewritten away). The same
+        // probe then walks the body placeholders and the command's
+        // post-body continuation to build the pipeline tail: bash resumes
+        // the command after the last terminator, so a trailing `|` on the
+        // header binds the post-body stage (`cat <<C |` + body + `C` +
+        // `xargs sh -c` runs the body through xargs). The placeholders
+        // contribute only the join separators, exactly like the blanked
+        // emission below.
         let mut probe = context.clone();
-        let mut joined_unit: Option<String> = None;
-        if let Some((_, text)) = probe.feed(index as u32 + 1, line) {
-            joined_unit = Some(text);
-        }
-        for (offset, &rest) in lines[index + 1..=unit_end].iter().enumerate() {
-            if let Some((_, text)) = probe.feed(index as u32 + 2 + offset as u32, rest) {
-                joined_unit = Some(text);
+        let mut line_base = vec![0usize; boundary - index + 1];
+        let mut header_text: Option<String> = None;
+        let mut full_text: Option<String> = None;
+        for (offset, line_index) in (index..=boundary).enumerate() {
+            line_base[offset] = probe.text.len();
+            if let Some((_, text)) = probe.feed(line_index as u32 + 1, lines[line_index]) {
+                header_text = Some(text.clone());
+                full_text = Some(text);
             }
         }
-        let context_text = joined_unit.unwrap_or_else(|| probe.text.clone());
+        if probe.open {
+            for _ in 0..(bodies.iter().map(Vec::len).sum::<usize>() + unit_redirects.len()) {
+                if let Some((_, text)) = probe.feed(0, "") {
+                    full_text = Some(text);
+                }
+                if !probe.open {
+                    break;
+                }
+            }
+            let mut resume =
+                boundary + 1 + bodies.iter().map(Vec::len).sum::<usize>() + unit_redirects.len();
+            while probe.open && resume < lines.len() {
+                if let Some((_, text)) = probe.feed(resume as u32 + 1, lines[resume]) {
+                    full_text = Some(text);
+                }
+                resume += 1;
+            }
+        }
+        // A header that ends with a trailing operator or an open group only
+        // completes after the post-heredoc continuation has been probed. In
+        // that case `probe.text` is empty after `feed` returns the completed
+        // unit, so classify the completed text captured in `full_text`.
+        let context_text = header_text
+            .or(full_text.clone())
+            .unwrap_or_else(|| probe.text.clone());
+        let tail_text = full_text.unwrap_or_else(|| probe.text.clone());
         let joined = tokenize(&context_text);
         let joined_ops: Vec<usize> = joined
             .iter()
@@ -618,11 +721,11 @@ fn shell_source_without_heredoc_payloads(
             })
             .collect();
         let Some(base) = joined_ops.len().checked_sub(unit_redirects.len()) else {
-            for (offset, &rest) in lines[index..=unit_end].iter().enumerate() {
+            for (offset, &rest) in lines[index..=boundary].iter().enumerate() {
                 output.push(rest.to_owned());
                 context.feed(index as u32 + 1 + offset as u32, rest);
             }
-            index = unit_end + 1;
+            index = boundary + 1;
             continue;
         };
         let owners: Vec<HeredocOwner> = (0..unit_redirects.len())
@@ -645,10 +748,10 @@ fn shell_source_without_heredoc_payloads(
             Attach(Option<usize>),
         }
         // The first physical line of each body (1-based): the line after
-        // the unit's last header line plus each earlier body's lines and
+        // the header's last line plus each earlier body's lines and
         // terminators.
         let body_start = |k: usize| -> u32 {
-            let mut line = unit_end as u32 + 2;
+            let mut line = boundary as u32 + 2;
             for earlier in bodies.iter().take(k) {
                 line += earlier.len() as u32 + 1;
             }
@@ -666,10 +769,25 @@ fn shell_source_without_heredoc_payloads(
             dispositions[k] = match owners[k] {
                 HeredocOwner::ExecutesStdin => BodyDisposition::Attach(None),
                 HeredocOwner::ForwardsStdin => {
-                    let tail = &lines[index + unit_redirect.line][unit_redirect.span.1..];
+                    // The tail starts at the redirect inside the JOINED
+                    // header-plus-continuation text, so it reaches the
+                    // pipeline stage that follows the bodies.
+                    let tail_at = line_base[unit_redirect.line] + unit_redirect.span.1;
+                    let tail = tail_text.get(tail_at..).unwrap_or_default();
                     match forwarded_body_fate(tail, &body) {
-                        ForwardedBodyFate::AttachAt(offset) => {
-                            BodyDisposition::Attach(Some(offset))
+                        ForwardedBodyFate::AttachAt(attach_offset) => {
+                            let owner_line = lines[index + unit_redirect.line];
+                            if unit_redirect.span.1 + attach_offset <= owner_line.len() {
+                                BodyDisposition::Attach(Some(attach_offset))
+                            } else {
+                                // The attach point sits on a physical line
+                                // after the blanked bodies (`cat <<C |` +
+                                // body + `C` + `sh`): the body executes out
+                                // of band instead of splicing across the
+                                // span.
+                                kept_bodies.push((body_start(k), body));
+                                BodyDisposition::Blank
+                            }
                         }
                         // Out-of-band executions come back as isolated unit
                         // groups: the body is its own program, analyzed from
@@ -690,10 +808,10 @@ fn shell_source_without_heredoc_payloads(
                 HeredocOwner::Data => BodyDisposition::Blank,
             };
         }
-        // Rewrite each unit line in place: every heredoc of that line is
+        // Rewrite each header line in place: every heredoc of that line is
         // spliced per its disposition, so a multi-line command keeps its
         // header text on the lines it came from.
-        let unit_span = unit_end - index + 1;
+        let unit_span = boundary - index + 1;
         let mut rewritten: Vec<String> = Vec::with_capacity(unit_span);
         for offset in 0..unit_span {
             let unit_line = lines[index + offset];
@@ -706,6 +824,16 @@ fn shell_source_without_heredoc_payloads(
                 header.push_str(&unit_line[byte_cursor..unit_redirect.span.0]);
                 byte_cursor = unit_redirect.span.1;
                 let BodyDisposition::Attach(attach) = &dispositions[k] else {
+                    // Removing `<<DELIM` from `cat <<DELIM | ...` leaves
+                    // whitespace on both sides of the span. Keep one copy so
+                    // the resumed command has the same readable shape as
+                    // the original pipeline.
+                    if boundary == index
+                        && header.ends_with([' ', '\t'])
+                        && unit_line[byte_cursor..].starts_with([' ', '\t'])
+                    {
+                        header.pop();
+                    }
                     continue; // kept and blanked bodies carry no header text
                 };
                 if !header.ends_with([' ', '\t', '(', ';', '&', '|']) {
@@ -753,13 +881,22 @@ fn shell_source_without_heredoc_payloads(
             context.feed(index as u32 + 1 + offset as u32, &header);
             output.push(header);
         }
+        // A same-line header (including the new trailing-operator/group
+        // boundary) can skip artificial lines during reassembly. For a
+        // backslash-continued header, retain the historical blank-line
+        // separators: they are part of the continuation's whitespace shape.
+        let placeholder = if boundary == index {
+            HEREDOC_PLACEHOLDER.to_owned()
+        } else {
+            String::new()
+        };
         for body in bodies.iter() {
             let eaten = surplus.min(body.len());
             surplus -= eaten;
-            output.extend(std::iter::repeat_n(String::new(), body.len() - eaten));
+            output.extend(std::iter::repeat_n(placeholder.clone(), body.len() - eaten));
             let eaten = surplus.min(1);
             surplus -= eaten;
-            output.extend(std::iter::repeat_n(String::new(), 1 - eaten)); // the terminator
+            output.extend(std::iter::repeat_n(placeholder.clone(), 1 - eaten)); // the terminator
         }
         index += original_span;
     }

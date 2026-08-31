@@ -8,6 +8,7 @@ mod h3_script_tests;
 mod integration_tests;
 mod round_fifteen_tests;
 mod round_fourteen_tests;
+mod round_sixteen_tests;
 mod round_thirteen_tests;
 mod round_twelve_tests;
 mod rule_contracts;

@@ -44,13 +44,32 @@ pub(in crate::detect) fn classify_heredoc_owner(
 ) -> crate::detect::shell::source::HeredocOwner {
     use crate::detect::shell::source::HeredocOwner;
 
-    let mut boundary = 0usize;
-    let mut depth = 0i32;
+    // Classify the command at the redirect's own nesting depth. The source
+    // pass inserts `;` for physical newlines inside a group, so a multiline
+    // `(\n sh <<C` arrives as `( ; sh <<C`; slicing from the innermost group
+    // opener lets the ordinary command parser see `sh` instead of the group
+    // punctuation. Separators at that same depth still select the command
+    // immediately owning the redirect.
+    let mut groups = Vec::new();
     for (index, token) in tokens[..op_index].iter().enumerate() {
         match token.operator() {
+            Some("(" | "{" | "((") => groups.push(index),
+            Some(")" | "}" | "))") => {
+                groups.pop();
+            }
+            _ => {}
+        }
+    }
+    let start = groups.last().map_or(0, |opener| opener + 1);
+    let mut boundary = start;
+    let mut depth = 0usize;
+    for (index, token) in tokens[start..op_index].iter().enumerate() {
+        match token.operator() {
             Some("(" | "{" | "((") => depth += 1,
-            Some(")" | "}" | "))") => depth = (depth - 1).max(0),
-            Some("|" | "|&" | ";" | "&&" | "||" | "&") if depth == 0 => boundary = index + 1,
+            Some(")" | "}" | "))") => depth = depth.saturating_sub(1),
+            Some("|" | "|&" | ";" | "&&" | "||" | "&") if depth == 0 => {
+                boundary = start + index + 1;
+            }
             _ => {}
         }
     }
