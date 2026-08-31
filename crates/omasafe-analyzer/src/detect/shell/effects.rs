@@ -12,11 +12,69 @@ use super::command::{
 };
 use super::interpreter::{
     InterpreterFamily, InterpreterMode, command_is_interpreter, interpreter_family,
-    interpreter_mode, interpreter_static_body, static_command_body,
+    interpreter_mode, static_command_body,
 };
 use super::lexer::{ShellToken, SubstKind, tokenize};
 use super::syntax::{GroupKind, Outcomes, conditional_statements, pipeline_segments};
 use super::xargs::xargs_feeds_stdin_code;
+
+/// How a command handles the bytes arriving on its stdin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::detect) enum StdinEffect {
+    Unread,
+    Consumed,
+    /// The command spends stdin to construct arguments for a code-running
+    /// child (`xargs sh -c`); it does not forward the bytes to the next pipe.
+    ForwardedExecutableText,
+    /// A known transformer emits the input-derived bytes on stdout.
+    ForwardedDerivedData,
+}
+
+/// What happens to this command's stdout at its own command site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::detect) enum StdoutEffect {
+    Inherited,
+    ForwardedInput,
+    DerivedData,
+    Redirected,
+}
+
+/// What code, if any, this command executes from an input or argument.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::detect) enum ExecutionEffect {
+    None,
+    ExecutesStdin,
+    ExecutesStaticBody,
+    ExecutesTaintedArgument,
+}
+
+/// Whether this command directly performs network egress.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::detect) enum EgressEffect {
+    None,
+    NetworkFetch,
+}
+
+/// One command-site effect summary consumed by stdin, stdout, execution, and
+/// egress analyses. The summary is deliberately local to a parsed segment;
+/// pipeline reachability composes summaries without reclassifying command
+/// heads independently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::detect) struct CommandEffects {
+    pub(in crate::detect) stdin: StdinEffect,
+    pub(in crate::detect) stdout: StdoutEffect,
+    pub(in crate::detect) execution: ExecutionEffect,
+    pub(in crate::detect) egress: EgressEffect,
+}
+
+impl CommandEffects {
+    const UNREAD: Self = Self {
+        stdin: StdinEffect::Unread,
+        stdout: StdoutEffect::Inherited,
+        execution: ExecutionEffect::None,
+        egress: EgressEffect::None,
+    };
+}
 
 /// What a statically known shell body (an interpreter `-c` body, an `eval`
 /// argument) does with its inherited stdin, computed by the same walks that
@@ -56,6 +114,110 @@ fn static_body_summary(body: &str, budget: &mut ShellBudget) -> ShellSummary {
     }
 }
 
+/// Summarize one simple command site. This is the single command-level
+/// decision point for stdin, stdout, execution, and direct network effects;
+/// compound groups are composed by the recursive segment walks below.
+pub(in crate::detect) fn command_effects(
+    command: &ScriptCommand,
+    segment: &[ShellToken],
+    budget: &mut ShellBudget,
+) -> CommandEffects {
+    let stdout_redirected = depth_zero_redirect_moves_stdout(segment);
+    let stdin_redirected = depth_zero_redirect_moves_stdin_away(segment);
+    let mut effects = CommandEffects {
+        stdout: if stdout_redirected {
+            StdoutEffect::Redirected
+        } else {
+            StdoutEffect::Inherited
+        },
+        egress: direct_egress_effect(command),
+        ..CommandEffects::UNREAD
+    };
+
+    // A command may still run a static body with redirected stdin, but no
+    // inherited pipe bytes can reach it. This early guard prevents a
+    // redirected `sh` or `xargs` from becoming a false code sink.
+    if stdin_redirected {
+        if static_command_body(command).is_some() {
+            effects.execution = ExecutionEffect::ExecutesStaticBody;
+        }
+        return effects;
+    }
+
+    if let Some(body) = static_command_body(command) {
+        let summary = static_body_summary(&body, budget);
+        effects.execution = if summary.consumes_stdin_as_code {
+            ExecutionEffect::ExecutesStdin
+        } else {
+            ExecutionEffect::ExecutesStaticBody
+        };
+        if summary.consumes_stdin_as_code || summary.drains_stdin {
+            effects.stdin = StdinEffect::Consumed;
+        } else if summary.forwards_stdin_body {
+            effects.stdin = StdinEffect::ForwardedDerivedData;
+            if !stdout_redirected {
+                effects.stdout = StdoutEffect::ForwardedInput;
+            }
+        }
+        return effects;
+    }
+
+    if command_is_interpreter(command) {
+        match interpreter_mode(command) {
+            InterpreterMode::StdinScript => {
+                effects.stdin = StdinEffect::Consumed;
+                if interpreter_family(command) == Some(InterpreterFamily::Shell) {
+                    effects.execution = ExecutionEffect::ExecutesStdin;
+                }
+            }
+            InterpreterMode::ParseOnly { body: None } => {
+                effects.stdin = StdinEffect::Consumed;
+            }
+            InterpreterMode::ParseOnly { body: Some(_) }
+            | InterpreterMode::LiteralBody(_)
+            | InterpreterMode::FileOrModule
+            | InterpreterMode::Exits => {}
+        }
+        return effects;
+    }
+
+    if stdin_code_consumer(command) {
+        effects.stdin = if command.head == "xargs" {
+            StdinEffect::ForwardedExecutableText
+        } else {
+            StdinEffect::Consumed
+        };
+        effects.execution = if command.head == "xargs" {
+            ExecutionEffect::ExecutesTaintedArgument
+        } else {
+            ExecutionEffect::ExecutesStdin
+        };
+        return effects;
+    }
+
+    if !drains_stdin(command.head, &command.args) {
+        return effects;
+    }
+    if stdout_redirected {
+        effects.stdin = StdinEffect::Consumed;
+    } else if forwards_stdin_body(command) {
+        effects.stdin = StdinEffect::ForwardedDerivedData;
+        effects.stdout = StdoutEffect::ForwardedInput;
+    } else {
+        effects.stdin = StdinEffect::Consumed;
+        effects.stdout = StdoutEffect::DerivedData;
+    }
+    effects
+}
+
+fn direct_egress_effect(command: &ScriptCommand) -> EgressEffect {
+    if matches!(command.head, "curl" | "wget") {
+        EgressEffect::NetworkFetch
+    } else {
+        EgressEffect::None
+    }
+}
+
 /// Whether any executed statement's pipeline carries a live fetch producer
 /// whose output reaches the pipeline's end — the body's or span's stdout
 /// (`sh -c 'curl URL'` produces the response; `sh -c 'curl URL | sh'`
@@ -81,21 +243,6 @@ pub(in crate::detect) fn tokens_live_fetch_stdout(
         outcomes = outcomes.advance(guard, statement_outcomes(statement));
     }
     false
-}
-
-/// Whether a command in a pipeline segment executes its inherited stdin as
-/// shell code: an interpreter in stdin-script mode, an interpreter whose
-/// static `-c` body itself consumes stdin as code (`sh -c sh`), or an
-/// explicit stdin-to-code consumer (`source /dev/stdin`, `xargs` feeding a
-/// body-less interpreter `-c`).
-fn command_consumes_stdin_code(command: &ScriptCommand, budget: &mut ShellBudget) -> bool {
-    if let Some(body) = interpreter_static_body(command) {
-        return static_body_summary(body, budget).consumes_stdin_as_code;
-    }
-    if interpreter_family(command) == Some(InterpreterFamily::Shell) {
-        return matches!(interpreter_mode(command), InterpreterMode::StdinScript);
-    }
-    stdin_code_consumer(command)
 }
 
 /// Explicit stdin-to-code consumers beyond interpreters: `source
@@ -154,8 +301,29 @@ fn segment_consumes_stdin_substitution(segment: &[ShellToken], budget: &mut Shel
     false
 }
 
+/// Summarize a non-compound pipeline segment, including command substitutions
+/// that turn inherited stdin into executed text (`eval "$(cat)"`). Wrapper
+/// chains are represented by their final command for stdin/stdout semantics;
+/// the command-level summary still retains direct egress for that command.
+fn simple_segment_effects(segment: &[ShellToken], budget: &mut ShellBudget) -> CommandEffects {
+    let commands = segment_commands(segment);
+    let Some(command) = commands.last() else {
+        return CommandEffects::UNREAD;
+    };
+    let mut effects = command_effects(command, segment, budget);
+    if !matches!(
+        effects.execution,
+        ExecutionEffect::ExecutesStdin | ExecutionEffect::ExecutesTaintedArgument
+    ) && segment_consumes_stdin_substitution(segment, budget)
+    {
+        effects.stdin = StdinEffect::Consumed;
+        effects.execution = ExecutionEffect::ExecutesTaintedArgument;
+    }
+    effects
+}
+
 pub(in crate::detect) fn command_fetches(command: &ScriptCommand) -> bool {
-    matches!(command.head, "curl" | "wget")
+    direct_egress_effect(command) == EgressEffect::NetworkFetch
 }
 
 /// A decoder able to release executable bytes in command position:
@@ -364,30 +532,17 @@ fn short_cluster_flag(args: &[&str], flag: char) -> bool {
     })
 }
 
-/// What a segment's leading command does with data arriving on its stdin.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum StdinBehavior {
-    /// Reads it and emits it on stdout (`cat`, `sed`): a downstream pipeline
-    /// segment receives the data.
-    Forwards,
-    /// Reads it without handing the body on (`sh` running stdin as script,
-    /// `cat >/dev/null`).
-    Consumes,
-    /// Leaves it untouched for whatever runs next (`echo`, `true`).
-    Untouched,
-}
-
-/// The leading command's stdin behavior, following compound groups into
-/// their statements (the first reading command decides).
-fn segment_stdin_behavior(segment: &[ShellToken], budget: &mut ShellBudget) -> StdinBehavior {
+/// The segment's stdin effect, following compound groups into their
+/// statements (the first command that reads the inherited pipe decides).
+fn segment_stdin_effect(segment: &[ShellToken], budget: &mut ShellBudget) -> StdinEffect {
     if let Some((kind, group)) = compound_position(segment) {
         if kind != GroupKind::List {
-            return StdinBehavior::Untouched; // arithmetic reads no stdin
+            return StdinEffect::Unread; // arithmetic reads no stdin
         }
         if !budget.spend(group.len()) || !budget.enter() {
-            return StdinBehavior::Consumes; // unresolved: assume the pipe is spent
+            return StdinEffect::Consumed; // unresolved: assume the pipe is spent
         }
-        let mut behavior = StdinBehavior::Untouched;
+        let mut effect = StdinEffect::Unread;
         let mut outcomes = Outcomes::ANY;
         for (statement, guard) in conditional_statements(group) {
             if statement.is_empty() {
@@ -397,65 +552,17 @@ fn segment_stdin_behavior(segment: &[ShellToken], budget: &mut ShellBudget) -> S
                 continue;
             }
             if let Some(first) = pipeline_segments(statement).first() {
-                behavior = segment_stdin_behavior(first, budget);
-                if behavior != StdinBehavior::Untouched {
+                effect = segment_stdin_effect(first, budget);
+                if effect != StdinEffect::Unread {
                     break;
                 }
             }
             outcomes = outcomes.advance(guard, statement_outcomes(statement));
         }
         budget.leave();
-        return behavior;
+        return effect;
     }
-    let commands = segment_commands(segment);
-    let Some(command) = commands.first() else {
-        return StdinBehavior::Untouched;
-    };
-    if depth_zero_redirect_moves_stdin_away(segment) {
-        return StdinBehavior::Untouched; // the pipe is replaced before it
-    }
-    if let Some(body) = interpreter_static_body(command) {
-        let summary = static_body_summary(body, budget);
-        return if summary.consumes_stdin_as_code || summary.drains_stdin {
-            StdinBehavior::Consumes
-        } else if summary.forwards_stdin_body {
-            StdinBehavior::Forwards
-        } else {
-            StdinBehavior::Untouched // the body never reads its stdin
-        };
-    }
-    if command_is_interpreter(command) {
-        return match interpreter_mode(command) {
-            // A stdin-script interpreter consumes the pipe; so does a
-            // parse-only interpreter WITHOUT a body (`bash -n`,
-            // `--dump-strings` read and parse stdin, executing nothing).
-            // With a `-c` body, the body is what gets parsed and the pipe
-            // stays available for what runs next
-            // (`bash -n -c 'echo safe'; sh`). Only stdin-script mode is an
-            // H3 code sink.
-            InterpreterMode::StdinScript | InterpreterMode::ParseOnly { body: None } => {
-                StdinBehavior::Consumes
-            }
-            InterpreterMode::ParseOnly { body: Some(_) }
-            | InterpreterMode::FileOrModule
-            | InterpreterMode::Exits
-            | InterpreterMode::LiteralBody(_) => StdinBehavior::Untouched,
-        };
-    }
-    if !command_is_interpreter(command) && stdin_code_consumer(command) {
-        return StdinBehavior::Consumes; // the pipe becomes executed code
-    }
-    if !drains_stdin(command.head, &command.args) {
-        return StdinBehavior::Untouched; // the pipe is never read here
-    }
-    if depth_zero_redirect_moves_stdout(segment) {
-        return StdinBehavior::Consumes; // read, but emitted elsewhere
-    }
-    if forwards_stdin_body(command) {
-        StdinBehavior::Forwards
-    } else {
-        StdinBehavior::Consumes // the pipe drains into derived output
-    }
+    simple_segment_effects(segment, budget).stdin
 }
 
 /// Whether the piped data reaches an interpreter when this segment runs:
@@ -469,12 +576,10 @@ fn segment_reaches_interpreter(segment: &[ShellToken], budget: &mut ShellBudget)
     match compound_position(segment) {
         Some((GroupKind::List, group)) => group_stdin_reaches_interpreter(group, budget).0,
         Some((GroupKind::Arithmetic, _)) => false,
-        None => {
-            segment_commands(segment)
-                .iter()
-                .any(|command| command_consumes_stdin_code(command, budget))
-                || segment_consumes_stdin_substitution(segment, budget)
-        }
+        None => matches!(
+            simple_segment_effects(segment, budget).execution,
+            ExecutionEffect::ExecutesStdin | ExecutionEffect::ExecutesTaintedArgument
+        ),
     }
 }
 
@@ -502,9 +607,9 @@ fn group_stdin_reaches_interpreter(group: &[ShellToken], budget: &mut ShellBudge
         }
         let segments = pipeline_segments(statement);
         if !segments.is_empty() {
-            let behaviors: Vec<StdinBehavior> = segments
+            let effects: Vec<StdinEffect> = segments
                 .iter()
-                .map(|segment| segment_stdin_behavior(segment, budget))
+                .map(|segment| segment_stdin_effect(segment, budget))
                 .collect();
             let mut data = pipe_alive;
             for (index, segment) in segments.iter().enumerate() {
@@ -512,12 +617,12 @@ fn group_stdin_reaches_interpreter(group: &[ShellToken], budget: &mut ShellBudge
                     reached |= segment_reaches_interpreter(segment, budget);
                 }
                 if index + 1 < segments.len() {
-                    data &= behaviors[index] == StdinBehavior::Forwards;
+                    data &= effects[index] == StdinEffect::ForwardedDerivedData;
                 }
             }
             // The group's pipe survives the statement only if its leading
             // command never read it.
-            if pipe_alive && behaviors[0] != StdinBehavior::Untouched {
+            if pipe_alive && effects[0] != StdinEffect::Unread {
                 pipe_alive = false;
                 drained = true;
             }
@@ -548,16 +653,16 @@ fn group_forwards_stdin(group: &[ShellToken], budget: &mut ShellBudget) -> bool 
         }
         let segments = pipeline_segments(statement);
         if !segments.is_empty() {
-            let behaviors: Vec<StdinBehavior> = segments
+            let effects: Vec<StdinEffect> = segments
                 .iter()
-                .map(|segment| segment_stdin_behavior(segment, budget))
+                .map(|segment| segment_stdin_effect(segment, budget))
                 .collect();
             // The body flows stage to stage only through forwarding
             // commands; walking off the pipeline's end with it still in
             // hand means it left through the compound's stdout.
             let mut data = pipe_alive;
-            for behavior in &behaviors {
-                if *behavior != StdinBehavior::Forwards {
+            for effect in &effects {
+                if *effect != StdinEffect::ForwardedDerivedData {
                     data = false;
                     break;
                 }
@@ -565,7 +670,7 @@ fn group_forwards_stdin(group: &[ShellToken], budget: &mut ShellBudget) -> bool 
             if data {
                 forwards = true;
             }
-            if pipe_alive && behaviors[0] != StdinBehavior::Untouched {
+            if pipe_alive && effects[0] != StdinEffect::Unread {
                 pipe_alive = false;
             }
         }
@@ -711,6 +816,105 @@ pub(in crate::detect) fn segment_stdout_preserved(
         // stdin transformer (the same model that reads compound interiors):
         // `echo safe` leaves the pipe untouched, `cat >/dev/null` spends it,
         // and only a forwarding filter passes the body on.
-        None => segment_stdin_behavior(segment, budget) == StdinBehavior::Forwards,
+        None => simple_segment_effects(segment, budget).stdout == StdoutEffect::ForwardedInput,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn effects_for(source: &str) -> CommandEffects {
+        let tokens = tokenize(source);
+        let segment = pipeline_segments(&tokens)
+            .first()
+            .copied()
+            .expect("test source should contain a pipeline segment");
+        let commands = segment_commands(segment);
+        let command = commands
+            .last()
+            .expect("test source should contain a command");
+        let mut budget = ShellBudget::new();
+        command_effects(command, segment, &mut budget)
+    }
+
+    #[test]
+    fn command_effects_cover_stdin_modes_and_execution() {
+        let cases = [
+            (
+                "sh",
+                StdinEffect::Consumed,
+                StdoutEffect::Inherited,
+                ExecutionEffect::ExecutesStdin,
+                EgressEffect::None,
+            ),
+            (
+                "sh -c 'echo safe'",
+                StdinEffect::Unread,
+                StdoutEffect::Inherited,
+                ExecutionEffect::ExecutesStaticBody,
+                EgressEffect::None,
+            ),
+            (
+                "sh -n",
+                StdinEffect::Consumed,
+                StdoutEffect::Inherited,
+                ExecutionEffect::None,
+                EgressEffect::None,
+            ),
+            (
+                "python3 -W ignore",
+                StdinEffect::Consumed,
+                StdoutEffect::Inherited,
+                ExecutionEffect::None,
+                EgressEffect::None,
+            ),
+            (
+                "cat",
+                StdinEffect::ForwardedDerivedData,
+                StdoutEffect::ForwardedInput,
+                ExecutionEffect::None,
+                EgressEffect::None,
+            ),
+            (
+                "cat >out",
+                StdinEffect::Consumed,
+                StdoutEffect::Redirected,
+                ExecutionEffect::None,
+                EgressEffect::None,
+            ),
+            (
+                "xargs sh -c",
+                StdinEffect::ForwardedExecutableText,
+                StdoutEffect::Inherited,
+                ExecutionEffect::ExecutesTaintedArgument,
+                EgressEffect::None,
+            ),
+            (
+                "curl https://example.test/x",
+                StdinEffect::Unread,
+                StdoutEffect::Inherited,
+                ExecutionEffect::None,
+                EgressEffect::NetworkFetch,
+            ),
+            (
+                "base64 -d",
+                StdinEffect::ForwardedDerivedData,
+                StdoutEffect::ForwardedInput,
+                ExecutionEffect::None,
+                EgressEffect::None,
+            ),
+        ];
+
+        for (source, stdin, stdout, execution, egress) in cases {
+            let effects = effects_for(source);
+            assert_eq!(effects.stdin, stdin, "stdin effect for {source:?}");
+            assert_eq!(effects.stdout, stdout, "stdout effect for {source:?}");
+            assert_eq!(
+                effects.execution, execution,
+                "execution effect for {source:?}"
+            );
+            assert_eq!(effects.egress, egress, "egress effect for {source:?}");
+        }
     }
 }

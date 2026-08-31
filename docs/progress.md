@@ -2487,6 +2487,24 @@ Verification: both feature configurations pass workspace tests and clippy with
 `git diff --check` also pass. Centralized command effects and migration of
 detectors to consume typed nodes remain the next Stage B slices.
 
+## Plan Step 9 — Centralized Command Effects (2026-08-31)
+
+Status: **in progress — command-site summary slice complete**
+
+The next Stage B slice adds a typed `CommandEffects` summary in
+`detect/shell/effects.rs`. Interpreter modes, static shell bodies, `eval`,
+`source`, `xargs`, stdin transformers, redirects, and direct `curl`/`wget`
+egress now classify stdin, stdout, execution, and egress at one command-site
+boundary. The existing compound and pipeline walks compose those summaries,
+while preserving the special contract that Python stdin is consumed as Python
+input but is not an H3 shell-code sink.
+
+The old parallel stdin behavior and command-code-consumer decisions were
+removed. Focused table-driven tests cover stdin scripts, static bodies,
+parse-only mode, redirects, xargs executable text, transformers, and direct
+fetches. Full detector migration to the IR-owned command nodes and bounded
+summary caching remain subsequent Stage B work.
+
 ## Review Round Three — Heredoc Body Boundaries and Invalid xargs Counts (2026-08-31)
 
 Status: **complete**
