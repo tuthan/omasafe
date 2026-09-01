@@ -5,7 +5,7 @@
 //! pipeline segments, compound groups, and active command/process
 //! substitutions — plus the segment/group command search it is built on.
 
-use super::budget::ShellBudget;
+use super::budget::{MAX_SHELL_ANALYSIS_DEPTH, ShellBudget};
 use super::command::{
     ScriptCommand, redirect_moves_stdout_away, segment_commands, statement_outcomes,
 };
@@ -120,6 +120,12 @@ fn node_has_direct_fetch(node: &CommandNode, budget: &mut ShellBudget) -> bool {
     match node {
         CommandNode::Simple(command) => {
             matches!(command.head.as_str(), "curl" | "wget")
+                || command.head_substitutions.iter().any(|substitution| {
+                    substitution
+                        .program
+                        .as_deref()
+                        .is_some_and(|program| program_has_direct_fetch(program, budget))
+                })
                 || command
                     .body
                     .as_ref()
@@ -137,7 +143,15 @@ fn node_has_direct_fetch(node: &CommandNode, budget: &mut ShellBudget) -> bool {
         CommandNode::Subshell { body, .. } | CommandNode::BraceGroup { body, .. } => {
             statements_have_direct_fetch(body, budget)
         }
-        CommandNode::Arithmetic { .. } | CommandNode::Opaque { .. } => false,
+        CommandNode::Arithmetic { expression, .. } => expression.iter().any(|word| {
+            word.substitutions.iter().any(|substitution| {
+                substitution
+                    .program
+                    .as_deref()
+                    .is_some_and(|program| program_has_direct_fetch(program, budget))
+            })
+        }),
+        CommandNode::Opaque { .. } => false,
         CommandNode::If {
             condition,
             then_body,
@@ -196,7 +210,10 @@ fn node_stdout_redirected(node: &CommandNode) -> bool {
     })
 }
 
-fn program_has_direct_fetch(program: &ShellProgram, budget: &mut ShellBudget) -> bool {
+pub(in crate::detect) fn program_has_direct_fetch(
+    program: &ShellProgram,
+    budget: &mut ShellBudget,
+) -> bool {
     program
         .units()
         .iter()
@@ -327,7 +344,16 @@ pub(in crate::detect) fn body_fetches_egress(body: &str, budget: &mut ShellBudge
     if !budget.enter() {
         return false;
     }
-    let fetches = tokens_fetch_egress(&tokenize(body), budget);
+    let program = ShellProgram::from_source(body, 0);
+    let fetches = if program.requires_legacy_fallback() {
+        if body.matches("$(").count() > MAX_SHELL_ANALYSIS_DEPTH as usize {
+            budget.exhausted = true;
+            return false;
+        }
+        tokens_fetch_egress(&tokenize(body), budget)
+    } else {
+        program_has_direct_fetch(&program, budget)
+    };
     budget.leave();
     if !budget.exhausted() {
         budget.cache_fetch_egress(body, fetches);
@@ -513,5 +539,15 @@ mod tests {
                 "typed direct-fetch result for {source:?}"
             );
         }
+    }
+
+    #[test]
+    fn deeply_nested_substitution_reports_budget_exhaustion() {
+        let body = format!(
+            "{}curl https://example.test/x{}",
+            "$( ".repeat(100),
+            " )".repeat(100),
+        );
+        assert_eq!(script_body_fetches(&body), (false, true));
     }
 }

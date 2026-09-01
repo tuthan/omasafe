@@ -2800,6 +2800,32 @@ determinism, corpus tooling, and the 15-fixture differential scan against
 
 Stage B is closed.
 
+## Post-Stage-B Hardening — Typed Consumers and Shell Flow Differential (2026-09-01)
+
+Status: **complete**
+
+The follow-on hardening pass completed the remaining typed-consumer migration
+and added two regression gates:
+
+- Complete IR units now drive shell egress, stdin/stdout body summaries,
+  download/decode pairing, and reverse-shell/shared-temp indicators without a
+  duplicate token walk. Opaque or depth-capped nodes retain the bounded token
+  fallback and coverage disclosure. Command-head substitutions and redirect
+  targets remain represented in the typed model.
+- A generated Cartesian invariant table covers producer/consumer redirects,
+  dead branches, parse-only execution, quoting, and decode-vs-encode behavior.
+- Fixed Bash differential cases execute in a temporary sandbox with a local
+  curl stub and a base64 payload. They cover stdin scripts, `-c`, `-n`, `+n`,
+  option clusters, compound commands, and case/for reachability. Analyzer
+  findings must match whether the safe marker reaches the executing consumer.
+
+Verification passed in both feature configurations: workspace tests and
+clippy, formatting, generated CLI assets, determinism canary, corpus tooling,
+and `git diff --check`.
+
+The post-Stage-B hardening work is complete; future shell grammar additions
+should land as separately reviewed, regression-pinned semantic slices.
+
 ## Plan A4 — Detector Family Extraction
 
 Status: **complete**

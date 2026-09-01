@@ -1,8 +1,8 @@
 //! Bounded typed structure for one shell logical unit.
 //!
 //! This is the first Stage B layer from `docs/detect-rs-maintenance-plan.md`.
-//! The existing detector families still consume lexer tokens, but the tokens
-//! now have one typed structural owner at the shell boundary. Compound groups
+//! Detector families consume this typed structure first; only opaque or
+//! depth-capped children retain a bounded token fallback. Compound groups
 //! remain nodes of their own instead of being mistaken for ordinary argv.
 
 use super::budget::MAX_SHELL_ANALYSIS_DEPTH;
@@ -89,6 +89,7 @@ pub(in crate::detect) struct CommandWrapper {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::detect) struct Command {
     pub(in crate::detect) head: String,
+    pub(in crate::detect) head_substitutions: Vec<ExecutedSubstitution>,
     pub(in crate::detect) args: Vec<Word>,
     pub(in crate::detect) redirects: Vec<Redirect>,
     pub(in crate::detect) wrappers: Vec<CommandWrapper>,
@@ -221,6 +222,12 @@ impl LogicalUnit {
     pub(in crate::detect) fn tokens(&self) -> &[ShellToken] {
         &self.tokens
     }
+
+    /// Whether this unit contains an opaque or depth-capped child that needs
+    /// the bounded token fallback.
+    pub(in crate::detect) fn requires_legacy_fallback(&self) -> bool {
+        statements_require_legacy_fallback(&self.statements)
+    }
 }
 
 /// Parsed shell logical units. Its size is bounded by the already bounded
@@ -259,6 +266,105 @@ impl ShellProgram {
     pub(in crate::detect) fn units(&self) -> &[LogicalUnit] {
         &self.units
     }
+
+    /// Whether any node in this program is incomplete enough that a bounded
+    /// token fallback is still required. Complete programs are consumed only
+    /// through the typed IR; callers use this bit to keep opaque/depth-capped
+    /// syntax conservative and disclose the resulting coverage limitation.
+    pub(in crate::detect) fn requires_legacy_fallback(&self) -> bool {
+        self.units.iter().any(LogicalUnit::requires_legacy_fallback)
+    }
+}
+
+fn statements_require_legacy_fallback(statements: &[Statement]) -> bool {
+    statements.iter().any(|statement| {
+        statement
+            .pipelines
+            .iter()
+            .any(|pipeline| pipeline.commands.iter().any(node_requires_legacy_fallback))
+    })
+}
+
+fn node_requires_legacy_fallback(node: &CommandNode) -> bool {
+    match node {
+        CommandNode::Simple(command) => {
+            command.body.as_ref().is_some_and(|body| {
+                body.program.is_none()
+                    || body
+                        .program
+                        .as_deref()
+                        .is_some_and(ShellProgram::requires_legacy_fallback)
+            }) || command.args.iter().any(word_requires_legacy_fallback)
+                || command
+                    .head_substitutions
+                    .iter()
+                    .any(substitution_requires_legacy_fallback)
+                || command
+                    .wrappers
+                    .iter()
+                    .any(|wrapper| wrapper.args.iter().any(word_requires_legacy_fallback))
+        }
+        CommandNode::Subshell { body, .. } | CommandNode::BraceGroup { body, .. } => {
+            statements_require_legacy_fallback(body)
+        }
+        CommandNode::Arithmetic { expression, .. } => {
+            expression.iter().any(word_requires_legacy_fallback)
+        }
+        CommandNode::If {
+            condition,
+            then_body,
+            elif_branches,
+            else_body,
+            ..
+        } => {
+            statements_require_legacy_fallback(condition)
+                || statements_require_legacy_fallback(then_body)
+                || elif_branches.iter().any(|branch| {
+                    statements_require_legacy_fallback(&branch.condition)
+                        || statements_require_legacy_fallback(&branch.body)
+                })
+                || statements_require_legacy_fallback(else_body)
+        }
+        CommandNode::Loop {
+            condition, body, ..
+        } => {
+            statements_require_legacy_fallback(condition)
+                || statements_require_legacy_fallback(body)
+        }
+        CommandNode::For {
+            variable,
+            words,
+            body,
+            ..
+        } => {
+            word_requires_legacy_fallback(variable)
+                || words.iter().any(word_requires_legacy_fallback)
+                || statements_require_legacy_fallback(body)
+        }
+        CommandNode::Case { word, branches, .. } => {
+            word_requires_legacy_fallback(word)
+                || branches.iter().any(|branch| {
+                    branch.patterns.iter().any(word_requires_legacy_fallback)
+                        || statements_require_legacy_fallback(&branch.body)
+                })
+        }
+        CommandNode::Opaque { .. } => true,
+    }
+}
+
+fn word_requires_legacy_fallback(word: &Word) -> bool {
+    word.substitutions
+        .iter()
+        .any(substitution_requires_legacy_fallback)
+}
+
+fn substitution_requires_legacy_fallback(substitution: &ExecutedSubstitution) -> bool {
+    (matches!(substitution.kind, SubstKind::Command | SubstKind::Process)
+        && substitution.program.is_none())
+        || substitution
+            .program
+            .as_deref()
+            .is_some_and(ShellProgram::requires_legacy_fallback)
 }
 
 fn parse_unit_with_depth(start_line: u32, source: String, depth: usize) -> LogicalUnit {
@@ -352,6 +458,10 @@ fn parse_command_node(segment: &[ShellToken], depth: usize) -> CommandNode {
             .map(|(value, dynamic)| word_from_value(value, dynamic))
             .collect()
     });
+    let head_substitutions = command_start(segment)
+        .and_then(|start| word_from_token_at_depth(segment.get(start)?, depth))
+        .map(|word| word.substitutions)
+        .unwrap_or_default();
     let wrappers = commands[..commands.len() - 1]
         .iter()
         .map(command_wrapper)
@@ -362,6 +472,7 @@ fn parse_command_node(segment: &[ShellToken], depth: usize) -> CommandNode {
     });
     CommandNode::Simple(Command {
         head: last.head.to_owned(),
+        head_substitutions,
         args,
         redirects: redirects_at_depth_zero(segment, depth),
         wrappers,
@@ -1030,6 +1141,7 @@ mod tests {
                 .commands[0],
             CommandNode::Simple(Command {
                 head: "wget".to_owned(),
+                head_substitutions: Vec::new(),
                 args: vec![Word {
                     value: "https://example.test/sub".to_owned(),
                     provenance: WordProvenance::EMPTY,
@@ -1075,6 +1187,7 @@ mod tests {
             condition[0].pipelines[0].commands[0],
             CommandNode::Simple(Command {
                 head: "false".to_owned(),
+                head_substitutions: Vec::new(),
                 args: Vec::new(),
                 redirects: Vec::new(),
                 wrappers: Vec::new(),

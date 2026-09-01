@@ -321,7 +321,11 @@ fn analyze_script_unit(
     // substitution is attributed. The budget bounds substitution and group
     // recursion over untrusted text.
     let mut budget = ShellBudget::new();
-    let token_fetch_egress = tokens_fetch_egress(tokens, &mut budget);
+    let token_fetch_egress = match shell_unit {
+        Some(unit) if unit.requires_legacy_fallback() => tokens_fetch_egress(tokens, &mut budget),
+        Some(_) => false,
+        None => tokens_fetch_egress(tokens, &mut budget),
+    };
     let ir_direct_fetch = shell_unit.is_some_and(|unit| unit_has_direct_fetch(unit, &mut budget));
     if token_fetch_egress || ir_direct_fetch {
         outcome.capabilities.push(occurrence(

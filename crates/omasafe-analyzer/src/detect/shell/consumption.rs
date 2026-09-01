@@ -22,7 +22,8 @@ use super::egress::{
     node_has_live_fetch_stdout_with_effects,
 };
 use super::indicators::{
-    chmod_relaxes_shared_temp, reverse_shell_spelling, segment_has_shared_temp_path,
+    chmod_relaxes_shared_temp, ir_visit_indicators, reverse_shell_spelling,
+    segment_has_shared_temp_path,
 };
 use super::interpreter::{INTERPRETER_BASENAMES, static_command_body};
 use super::ir::{CommandNode, ExecutedBody, LogicalUnit, ShellProgram};
@@ -48,9 +49,6 @@ pub(in crate::detect) fn shell_consumption_findings(
     found: &mut Vec<ResultParts>,
     budget: &mut ShellBudget,
 ) {
-    if !budget.spend(tokens.len()) {
-        return;
-    }
     // The typed path owns direct command, compound, and available child
     // reachability. The token walk below remains as a bounded compatibility
     // fallback only when an opaque or depth-capped child requires it.
@@ -86,6 +84,55 @@ pub(in crate::detect) fn shell_consumption_findings(
     }
     let use_legacy_pairing = shell_unit.is_none() || typed_pairing.is_some_and(|pairing| pairing.2);
     let use_legacy_structural_walk = use_legacy_pairing;
+
+    // Complete typed units do not need a second token walk. Indicator facts
+    // are visited at each typed pipeline stage so a temp-path argument from
+    // one inner command cannot be paired with a wrapper from another.
+    if !use_legacy_structural_walk {
+        if let Some(unit) = shell_unit {
+            ir_visit_indicators(&unit.statements, &mut |summary| {
+                if summary.reverse_shell {
+                    push_finding(
+                        found,
+                        parts(
+                            SCRIPT_REVERSE_SHELL_RULE,
+                            number,
+                            "reverse-shell",
+                            Confidence::LexicalFallback,
+                        ),
+                    );
+                }
+                if summary.shared_temp_path && summary.privileged_wrapper {
+                    push_finding(
+                        found,
+                        parts(
+                            SHARED_TEMP_INDICATOR_RULE,
+                            number,
+                            "privileged-shared-temp",
+                            Confidence::LexicalFallback,
+                        ),
+                    );
+                }
+                if summary.shared_temp_path && summary.chmod_release {
+                    push_finding(
+                        found,
+                        parts(
+                            SHARED_TEMP_CONTROLLED_RULE,
+                            number,
+                            "shared-temp-mode-release",
+                            Confidence::LexicalFallback,
+                        ),
+                    );
+                }
+            });
+        }
+        return;
+    }
+
+    if !budget.spend(tokens.len()) {
+        return;
+    }
+
     let mut outcomes = Outcomes::ANY;
     for (statement, guard) in conditional_statements(tokens) {
         if statement.is_empty() {
@@ -591,7 +638,7 @@ fn typed_decoder_reaches_interpreter(unit: &LogicalUnit, budget: &mut ShellBudge
 fn typed_unit_pairing(unit: &LogicalUnit, budget: &mut ShellBudget) -> (bool, bool, bool) {
     let mut download_execute = false;
     let mut decode_execute = false;
-    let mut needs_legacy_fallback = false;
+    let mut needs_legacy_fallback = unit.requires_legacy_fallback();
     for statement in unit
         .statements
         .iter()

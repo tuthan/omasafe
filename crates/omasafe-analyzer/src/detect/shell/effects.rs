@@ -11,11 +11,14 @@ use super::command::{
     depth_zero_redirect_moves_stdout, redirect_moves_stdin_away, redirect_moves_stdout_away,
     segment_commands, statement_outcomes,
 };
+use super::egress::ir_program_live_fetch_stdout;
 use super::interpreter::{
     InterpreterFamily, InterpreterMode, command_is_interpreter, interpreter_family,
     interpreter_mode, static_command_body,
 };
-use super::ir::{Command as IrCommand, CommandNode, ExecutedBody, Redirect as IrRedirect};
+use super::ir::{
+    Command as IrCommand, CommandNode, ExecutedBody, Redirect as IrRedirect, ShellProgram,
+};
 use super::lexer::{ShellToken, SubstKind, tokenize};
 use super::syntax::{GroupKind, Outcomes, conditional_statements, pipeline_segments};
 use super::xargs::xargs_feeds_stdin_code;
@@ -112,6 +115,16 @@ fn static_body_summary(body: &str, budget: &mut ShellBudget) -> ShellSummary {
             drains_stdin: summary.drains_stdin,
             forwards_stdin_body: summary.forwards_stdin_body,
         };
+    }
+    let program = ShellProgram::from_source(body, 0);
+    if !program.requires_legacy_fallback() {
+        return body_summary_from_ir(
+            &ExecutedBody {
+                source: body.to_owned(),
+                program: Some(Box::new(program)),
+            },
+            budget,
+        );
     }
     if !budget.enter() {
         return ShellSummary::SILENT;
@@ -1386,7 +1399,12 @@ pub(in crate::detect) fn body_live_fetch_stdout(body: &str, budget: &mut ShellBu
     if !budget.enter() {
         return false;
     }
-    let reaches_stdout = tokens_live_fetch_stdout(&tokenize(body), budget);
+    let program = ShellProgram::from_source(body, 0);
+    let reaches_stdout = if program.requires_legacy_fallback() {
+        tokens_live_fetch_stdout(&tokenize(body), budget)
+    } else {
+        ir_program_live_fetch_stdout(&program, budget)
+    };
     budget.leave();
     if !budget.exhausted() {
         budget.cache_live_fetch_stdout(body, reaches_stdout);
