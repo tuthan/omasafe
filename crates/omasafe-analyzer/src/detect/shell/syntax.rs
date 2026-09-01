@@ -97,8 +97,10 @@ pub(in crate::detect) fn pipeline_negated(statement: &[ShellToken]) -> bool {
     negations % 2 == 1
 }
 
-/// Split a statement into pipeline segments on `|` and Bash's `|&` (which
-/// pipes stdout AND stderr) at subshell depth zero.
+/// Split a statement into outer pipeline segments on `|` and Bash's `|&`
+/// (which pipes stdout AND stderr). Separators inside a control command's
+/// condition or body stay inside that command; a separator after `fi`,
+/// `done`, or `esac` still splits the surrounding pipeline.
 pub(in crate::detect) fn pipeline_segments(tokens: &[ShellToken]) -> Vec<&[ShellToken]> {
     split_token_stream(tokens, |op| op == "|" || op == "|&")
 }
@@ -110,16 +112,47 @@ fn split_token_stream(
     let mut segments = Vec::new();
     let mut start = 0usize;
     let mut depth = 0i32;
+    let mut controls = Vec::new();
+    let mut command_start = true;
     for (index, token) in tokens.iter().enumerate() {
-        if let Some(op) = token.operator() {
-            match op {
-                "(" | "{" | "((" => depth += 1,
-                ")" | "}" | "))" => depth = (depth - 1).max(0),
-                _ if depth == 0 && is_separator(op) => {
+        match token {
+            ShellToken::Operator(op) => match op.as_str() {
+                "(" | "{" | "((" => {
+                    depth += 1;
+                    command_start = true;
+                }
+                ")" | "}" | "))" => {
+                    depth = (depth - 1).max(0);
+                    command_start = true;
+                }
+                _ if depth == 0 && is_separator(op) && controls.is_empty() => {
                     segments.push(&tokens[start..index]);
                     start = index + 1;
+                    command_start = true;
                 }
+                "|" | "|&" | ";" | "&&" | "||" | "&" => command_start = true,
                 _ => {}
+            },
+            ShellToken::Word { value, .. } => {
+                if depth == 0 && command_start {
+                    match value.as_str() {
+                        "if" => controls.push("if"),
+                        "while" | "until" | "for" => controls.push("loop"),
+                        "case" => controls.push("case"),
+                        "fi" if controls.last() == Some(&"if") => {
+                            controls.pop();
+                        }
+                        "done" if controls.last() == Some(&"loop") => {
+                            controls.pop();
+                        }
+                        "esac" if controls.last() == Some(&"case") => {
+                            controls.pop();
+                        }
+                        _ => {}
+                    }
+                }
+                command_start = value == "!"
+                    || matches!(value.as_str(), "then" | "elif" | "else" | "do" | "in");
             }
         }
     }

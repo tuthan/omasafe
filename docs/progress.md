@@ -2695,7 +2695,7 @@ exit results for every fixture. Stage B is closed again.
 Status: **complete**
 
 A focused review found four P1 regressions in the reopened Stage B surface.
-Commit `b90a8cf` fixes and pins all four:
+Commit `f743486` fixes and pins all four:
 
 1. Child `-c`, `eval`, and substitution parsing now carries the caller's
    recursion depth through `ShellProgram::from_source` and stops parsing
@@ -2726,6 +2726,29 @@ git diff --check
 
 The 15-fixture differential scan against `8c99b12` still has zero analysis or
 exit-code mismatches after ignoring only the timestamp field.
+
+Stage B is closed.
+
+## Stage B — Follow-up Review: Outer Pipelines and Compound Output (2026-09-01)
+
+Status: **complete**
+
+A follow-up review found three additional P1 regressions in the structured
+shell path. The fixes are included in the subsequent focused commit:
+
+1. Outer pipeline segmentation is now control-aware. Pipes inside an `if`,
+   loop, or `case` stay inside the control node, while a pipe after `fi`,
+   `done`, or `esac` retains the surrounding consumer.
+2. Decoder summaries now union inherited-stdin-dependent and independent
+   producers, so a file-backed decoder remains live when a sibling decoder is
+   starved by a parent stdin redirect.
+3. Compound fetch summaries apply parent stdout redirects uniformly and walk
+   loop conditions as well as bodies.
+
+The exact regressions are covered at IR, consumption, and end-to-end H3
+levels. Full workspace tests, both clippy configurations, asset generation,
+determinism, corpus tooling, and the 15-fixture differential scan against
+`8c99b12` pass with zero analysis or exit-code mismatches.
 
 Stage B is closed.
 

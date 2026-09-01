@@ -250,6 +250,9 @@ pub(in crate::detect) fn node_has_live_fetch_stdout_with_effects(
     if !budget.spend(1) {
         return false;
     }
+    if node_stdout_redirected(node) {
+        return false;
+    }
     match node {
         CommandNode::Simple(command) => {
             let effects = supplied_effects.unwrap_or_else(|| ir_command_effects(command, budget));
@@ -264,9 +267,6 @@ pub(in crate::detect) fn node_has_live_fetch_stdout_with_effects(
                     .is_some_and(|program| ir_program_live_fetch_stdout(program, budget))
         }
         CommandNode::Subshell { body, .. } | CommandNode::BraceGroup { body, .. } => {
-            if node_stdout_redirected(node) {
-                return false;
-            }
             statements_live_fetch_stdout(body, budget)
         }
         CommandNode::Arithmetic { .. } | CommandNode::Opaque { .. } => false,
@@ -279,14 +279,19 @@ pub(in crate::detect) fn node_has_live_fetch_stdout_with_effects(
         } => {
             statements_live_fetch_stdout(condition, budget)
                 || statements_live_fetch_stdout(then_body, budget)
-                || elif_branches
-                    .iter()
-                    .any(|branch| statements_live_fetch_stdout(&branch.body, budget))
+                || elif_branches.iter().any(|branch| {
+                    statements_live_fetch_stdout(&branch.condition, budget)
+                        || statements_live_fetch_stdout(&branch.body, budget)
+                })
                 || statements_live_fetch_stdout(else_body, budget)
         }
-        CommandNode::Loop { body, .. } | CommandNode::For { body, .. } => {
-            statements_live_fetch_stdout(body, budget)
+        CommandNode::Loop {
+            condition, body, ..
+        } => {
+            statements_live_fetch_stdout(condition, budget)
+                || statements_live_fetch_stdout(body, budget)
         }
+        CommandNode::For { body, .. } => statements_live_fetch_stdout(body, budget),
         CommandNode::Case { branches, .. } => branches
             .iter()
             .any(|branch| statements_live_fetch_stdout(&branch.body, budget)),

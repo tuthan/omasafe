@@ -284,18 +284,11 @@ fn parse_statements(tokens: &[ShellToken], depth: usize) -> Vec<Statement> {
         .filter(|(statement, _)| !statement.is_empty())
         .map(|(statement, guard)| {
             let reachable = statement_reachability(outcomes, guard);
-            let control = (depth < MAX_SHELL_ANALYSIS_DEPTH as usize)
-                .then(|| parse_control_flow(statement, depth))
-                .flatten();
-            let commands = if let Some(control) = control {
-                vec![control]
-            } else {
-                pipeline_segments(statement)
-                    .into_iter()
-                    .filter(|segment| !segment.is_empty())
-                    .map(|segment| parse_command_node(segment, depth))
-                    .collect()
-            };
+            let commands: Vec<CommandNode> = pipeline_segments(statement)
+                .into_iter()
+                .filter(|segment| !segment.is_empty())
+                .map(|segment| parse_command_node(segment, depth))
+                .collect();
             let parsed = Statement {
                 guard: Guard::from_operator(guard),
                 reachable,
@@ -1168,6 +1161,21 @@ mod tests {
             };
             assert_eq!(then_body[0].reachable, expected, "{source:?}");
         }
+    }
+
+    #[test]
+    fn control_commands_preserve_their_surrounding_pipeline() {
+        let program = ShellProgram::from_units(vec![(
+            1,
+            "if true; then base64 -d payload.b64; fi | sh".to_owned(),
+        )]);
+        let pipeline = &program.units()[0].statements[0].pipelines[0];
+        assert_eq!(pipeline.commands.len(), 2);
+        assert!(matches!(pipeline.commands[0], CommandNode::If { .. }));
+        let CommandNode::Simple(command) = &pipeline.commands[1] else {
+            panic!("expected interpreter pipeline consumer");
+        };
+        assert_eq!(command.head, "sh");
     }
 
     #[test]

