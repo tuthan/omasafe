@@ -2752,6 +2752,30 @@ determinism, corpus tooling, and the 15-fixture differential scan against
 
 Stage B is closed.
 
+## Stage B — Follow-up Review: Control Syntax, Reachability, and Redirect Scope (2026-09-01)
+
+Status: **complete**
+
+The next review found three P1 regressions in control-flow parsing. Commit
+`ea13e4a` fixes and tests them:
+
+1. Dead `elif` conditions are gated by the remaining branch reachability, so
+   their fetches and decoders no longer produce false positives while live
+   counterparts remain detectable.
+2. Redirects on `If`, `Loop`, `For`, and `Case` nodes are collected only before
+   the opener or after its matching terminator; redirects inside bodies stay
+   owned by their child commands.
+3. A shared syntax-eligible control scanner now drives logical-unit assembly,
+   statement splitting, pipeline segmentation, and clause matching. Case
+   pattern words cannot open controls, while real nested controls still do.
+
+The focused regressions pass at IR and end-to-end H3 levels. The complete
+workspace matrix, both clippy configurations, asset verification,
+determinism, corpus tooling, and the 15-fixture differential scan against
+`8c99b12` all remain clean.
+
+Stage B is closed.
+
 ## Plan A4 — Detector Family Extraction
 
 Status: **complete**
