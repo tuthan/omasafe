@@ -2776,6 +2776,30 @@ determinism, corpus tooling, and the 15-fixture differential scan against
 
 Stage B is closed.
 
+## Stage B — Follow-up Review: Reserved-Word Operands and Prefix Eligibility (2026-09-01)
+
+Status: **complete**
+
+The next review found three P1 regressions in the shared shell scanner and
+command-prefix model. Commit `c125cb7` fixes and tests them:
+
+1. `for` now tracks variable, optional `in`, word-list, `do`, and body phases;
+   reserved words in the word list remain operands while nested controls and
+   `done` are recognized in the body.
+2. Case headers consume the first raw selector word before recognizing a
+   syntax-eligible `in`, so `case in in ...` is parsed correctly.
+3. Assignment prefixes carry lexer metadata requiring a plain identifier
+   before the first unquoted `=`. Quoted/escaped command names and `!` are no
+   longer skipped, while `A=B` and `A="B"` remain valid prefixes across command,
+   wrapper, and compound parsing.
+
+The exact regressions pass at IR and end-to-end H3 levels. The complete
+workspace matrix, both clippy configurations, asset verification,
+determinism, corpus tooling, and the 15-fixture differential scan against
+`8c99b12` remain clean.
+
+Stage B is closed.
+
 ## Plan A4 — Detector Family Extraction
 
 Status: **complete**
