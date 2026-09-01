@@ -8,7 +8,8 @@
 use super::budget::MAX_SHELL_ANALYSIS_NODES;
 use super::budget::{CachedFindingSummary, ShellBudget};
 use super::command::{
-    redirect_moves_stdin_away, segment_commands, skip_command_prefixes, statement_outcomes,
+    redirect_moves_stdin_away, redirect_moves_stdout_away, segment_commands, skip_command_prefixes,
+    statement_outcomes,
 };
 use super::effects::{
     CommandEffects, ExecutionEffect, StdoutEffect, body_live_fetch_stdout, command_decodes,
@@ -683,14 +684,9 @@ fn summarize_node_once(node: &CommandNode, budget: &mut ShellBudget) -> NodeSumm
                 needs_legacy_fallback,
             }
         }
-        CommandNode::Subshell { .. } | CommandNode::BraceGroup { .. } => NodeSummary {
-            executes_stdin: ir_node_reaches_interpreter(node, budget),
-            forwards_stdin: ir_node_stdout_preserved(node, budget),
-            produces_fetch: node_has_live_fetch_stdout(node, budget),
-            produces_decoder: false,
-            needs_legacy_fallback: false,
-        },
-        CommandNode::If { .. }
+        CommandNode::Subshell { .. }
+        | CommandNode::BraceGroup { .. }
+        | CommandNode::If { .. }
         | CommandNode::Loop { .. }
         | CommandNode::For { .. }
         | CommandNode::Case { .. }
@@ -698,7 +694,7 @@ fn summarize_node_once(node: &CommandNode, budget: &mut ShellBudget) -> NodeSumm
             executes_stdin: ir_node_reaches_interpreter(node, budget),
             forwards_stdin: ir_node_stdout_preserved(node, budget),
             produces_fetch: node_has_live_fetch_stdout(node, budget),
-            produces_decoder: false,
+            produces_decoder: typed_node_decoder_output(node, budget, None).reaches_stdout,
             needs_legacy_fallback: false,
         },
         CommandNode::Opaque { .. } => NodeSummary {
@@ -742,27 +738,49 @@ fn typed_node_decoder_output(
                 depends_on_inherited_stdin: child.depends_on_inherited_stdin,
             }
         }
-        CommandNode::Subshell { .. } | CommandNode::BraceGroup { .. } => DecoderOutput::NONE,
+        CommandNode::Subshell { body, .. } | CommandNode::BraceGroup { body, .. } => {
+            let child = typed_statement_decoder_output(body, budget).unwrap_or(DecoderOutput::NONE);
+            compose_decoder_output(node, child)
+        }
         CommandNode::If {
             condition,
             then_body,
             elif_branches,
             else_body,
             ..
-        } => typed_control_decoder_output(condition, then_body, elif_branches, else_body, budget),
+        } => compose_decoder_output(
+            node,
+            typed_control_decoder_output(condition, then_body, elif_branches, else_body, budget),
+        ),
         CommandNode::Loop {
             condition, body, ..
-        } => typed_statement_decoder_output(condition, budget)
-            .or_else(|| typed_statement_decoder_output(body, budget))
-            .unwrap_or(DecoderOutput::NONE),
-        CommandNode::For { body, .. } => {
-            typed_statement_decoder_output(body, budget).unwrap_or(DecoderOutput::NONE)
-        }
-        CommandNode::Case { branches, .. } => branches
-            .iter()
-            .find_map(|branch| typed_statement_decoder_output(&branch.body, budget))
-            .unwrap_or(DecoderOutput::NONE),
+        } => compose_decoder_output(
+            node,
+            typed_statement_decoder_output(condition, budget)
+                .or_else(|| typed_statement_decoder_output(body, budget))
+                .unwrap_or(DecoderOutput::NONE),
+        ),
+        CommandNode::For { body, .. } => compose_decoder_output(
+            node,
+            typed_statement_decoder_output(body, budget).unwrap_or(DecoderOutput::NONE),
+        ),
+        CommandNode::Case { branches, .. } => compose_decoder_output(
+            node,
+            branches
+                .iter()
+                .find_map(|branch| typed_statement_decoder_output(&branch.body, budget))
+                .unwrap_or(DecoderOutput::NONE),
+        ),
         CommandNode::Arithmetic { .. } | CommandNode::Opaque { .. } => DecoderOutput::NONE,
+    }
+}
+
+fn compose_decoder_output(node: &CommandNode, child: DecoderOutput) -> DecoderOutput {
+    DecoderOutput {
+        reaches_stdout: child.reaches_stdout
+            && !node_stdout_redirected(node)
+            && (!node_stdin_redirected(node) || !child.depends_on_inherited_stdin),
+        depends_on_inherited_stdin: child.depends_on_inherited_stdin,
     }
 }
 
@@ -780,6 +798,29 @@ fn node_stdin_redirected(node: &CommandNode) -> bool {
     };
     redirects.iter().any(|redirect| {
         redirect_moves_stdin_away(
+            &redirect.operator,
+            redirect
+                .target
+                .as_ref()
+                .map_or("", |target| target.value.as_str()),
+        )
+    })
+}
+
+fn node_stdout_redirected(node: &CommandNode) -> bool {
+    let redirects = match node {
+        CommandNode::Simple(command) => &command.redirects,
+        CommandNode::Subshell { redirects, .. }
+        | CommandNode::BraceGroup { redirects, .. }
+        | CommandNode::Arithmetic { redirects, .. }
+        | CommandNode::If { redirects, .. }
+        | CommandNode::Loop { redirects, .. }
+        | CommandNode::For { redirects, .. }
+        | CommandNode::Case { redirects, .. }
+        | CommandNode::Opaque { redirects, .. } => redirects,
+    };
+    redirects.iter().any(|redirect| {
+        redirect_moves_stdout_away(
             &redirect.operator,
             redirect
                 .target
@@ -1229,6 +1270,13 @@ mod tests {
             ("eval 'base64 -d' </dev/null | sh", false),
             ("eval 'base64 -d' 2>/dev/null | sh", true),
             ("eval 'base64 -d file' </dev/null | sh", true),
+            ("(base64 -d) | sh", true),
+            ("{ base64 -d; } | sh", true),
+            ("(base64 -d | cat) | sh", true),
+            ("(base64 -d) >out | sh", false),
+            ("(base64 -d) </dev/null | sh", false),
+            ("(base64 -d) 2>/dev/null | sh", true),
+            ("(base64 -d file) </dev/null | sh", true),
         ];
 
         for (source, expected) in cases {

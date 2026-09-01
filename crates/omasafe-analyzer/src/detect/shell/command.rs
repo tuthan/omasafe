@@ -306,10 +306,7 @@ pub(in crate::detect) fn statement_outcomes(statement: &[ShellToken]) -> Outcome
         .last()
         .copied()
         .unwrap_or(statement);
-    let (success, failure) = match segment_commands(segment)
-        .first()
-        .map(|command| command.head)
-    {
+    let (success, failure) = match segment_commands(segment).last().map(|command| command.head) {
         Some("true") | Some(":") => (true, false),
         Some("false") => (false, true),
         _ => (true, true),

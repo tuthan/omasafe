@@ -233,33 +233,32 @@ pub(in crate::detect) struct ShellProgram {
 impl ShellProgram {
     /// Parse the source units emitted by the shell source assembler.
     pub(in crate::detect) fn from_units(units: Vec<(u32, String)>) -> Self {
+        Self::from_units_at_depth(units, 0)
+    }
+
+    fn from_units_at_depth(units: Vec<(u32, String)>, depth: usize) -> Self {
         Self {
             units: units
                 .into_iter()
-                .map(|(start_line, source)| parse_unit(start_line, source))
+                .map(|(start_line, source)| parse_unit_with_depth(start_line, source, depth))
                 .collect(),
         }
     }
 
-    /// Parse child shell text through the same logical-unit and heredoc
-    /// assembler used by top-level source. This keeps multiline `-c`, eval,
-    /// and substitution programs from becoming one raw token unit.
-    pub(in crate::detect) fn from_source(source: &str) -> Self {
+    /// Parse shell text through the same logical-unit and heredoc assembler
+    /// used by top-level source, preserving the caller's recursion depth.
+    pub(in crate::detect) fn from_source(source: &str, depth: usize) -> Self {
         let units = super::source::shell_logical_units(
             source,
             &crate::detect::script::classify_heredoc_owner,
             &crate::detect::script::forwarded_body_fate,
         );
-        Self::from_units(units)
+        Self::from_units_at_depth(units, depth)
     }
 
     pub(in crate::detect) fn units(&self) -> &[LogicalUnit] {
         &self.units
     }
-}
-
-fn parse_unit(start_line: u32, source: String) -> LogicalUnit {
-    parse_unit_with_depth(start_line, source, 0)
 }
 
 fn parse_unit_with_depth(start_line: u32, source: String, depth: usize) -> LogicalUnit {
@@ -274,7 +273,8 @@ fn parse_unit_with_depth(start_line: u32, source: String, depth: usize) -> Logic
 }
 
 fn child_program(source: &str, depth: usize) -> Option<Box<ShellProgram>> {
-    (depth < MAX_SHELL_ANALYSIS_DEPTH as usize).then(|| Box::new(ShellProgram::from_source(source)))
+    (depth < MAX_SHELL_ANALYSIS_DEPTH as usize)
+        .then(|| Box::new(ShellProgram::from_source(source, depth)))
 }
 
 fn parse_statements(tokens: &[ShellToken], depth: usize) -> Vec<Statement> {
@@ -284,8 +284,11 @@ fn parse_statements(tokens: &[ShellToken], depth: usize) -> Vec<Statement> {
         .filter(|(statement, _)| !statement.is_empty())
         .map(|(statement, guard)| {
             let reachable = statement_reachability(outcomes, guard);
-            let commands = if parse_control_flow(statement, depth).is_some() {
-                vec![parse_control_flow(statement, depth).expect("control flow just matched")]
+            let control = (depth < MAX_SHELL_ANALYSIS_DEPTH as usize)
+                .then(|| parse_control_flow(statement, depth))
+                .flatten();
+            let commands = if let Some(control) = control {
+                vec![control]
             } else {
                 pipeline_segments(statement)
                     .into_iter()
@@ -339,7 +342,9 @@ fn parse_command_node(segment: &[ShellToken], depth: usize) -> CommandNode {
         };
     }
 
-    if let Some(node) = parse_control_flow(segment, depth) {
+    if depth < MAX_SHELL_ANALYSIS_DEPTH as usize
+        && let Some(node) = parse_control_flow(segment, depth)
+    {
         return node;
     }
 
@@ -613,13 +618,18 @@ fn condition_reachability(condition: &[Statement]) -> Reachability {
 }
 
 fn statements_outcomes(statement: &Statement) -> Outcomes {
-    statement
-        .pipelines
-        .iter()
-        .flat_map(|pipeline| pipeline.commands.iter())
+    let Some(pipeline) = statement.pipelines.first() else {
+        return Outcomes::ANY;
+    };
+    let mut outcomes = pipeline
+        .commands
+        .last()
         .map(command_node_outcomes)
-        .next()
-        .unwrap_or(Outcomes::ANY)
+        .unwrap_or(Outcomes::ANY);
+    if pipeline.negated {
+        std::mem::swap(&mut outcomes.success, &mut outcomes.failure);
+    }
+    outcomes
 }
 
 fn command_node_outcomes(node: &CommandNode) -> Outcomes {
@@ -703,7 +713,9 @@ fn parse_loop(
     let body_reachability = match (kind, condition_reachability) {
         (WhileOrUntil::While, Reachability::Never)
         | (WhileOrUntil::Until, Reachability::Always) => Reachability::Never,
-        (_, reachability) => reachability,
+        (WhileOrUntil::While, Reachability::Always)
+        | (WhileOrUntil::Until, Reachability::Never) => Reachability::Always,
+        (_, Reachability::Maybe) => Reachability::Maybe,
     };
     for statement in &mut body {
         statement.reachable = match (body_reachability, statement.reachable) {
@@ -728,12 +740,20 @@ fn parse_for(segment: &[ShellToken], start: usize, depth: usize) -> Option<Comma
     let in_index = control_marker_index(segment, &["in"], start + 2);
     let words_start = in_index.map_or(start + 2, |index| index + 1);
     let words_end = do_index;
-    let words = segment[words_start..words_end]
+    let words: Vec<Word> = segment[words_start..words_end]
         .iter()
         .filter_map(|token| word_from_token_at_depth(token, depth))
         .collect();
     let done_index = control_marker_index(segment, &["done"], do_index + 1)?;
-    let body = parse_statements(&segment[do_index + 1..done_index], depth + 1);
+    let mut body = parse_statements(&segment[do_index + 1..done_index], depth + 1);
+    let body_reachability = if in_index.is_none() {
+        Reachability::Maybe
+    } else if words.is_empty() {
+        Reachability::Never
+    } else {
+        Reachability::Always
+    };
+    apply_gate_reachability(&mut body, body_reachability);
     Some(CommandNode::For {
         variable,
         words,
@@ -1131,9 +1151,57 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_conditions_use_final_status_and_negation() {
+        let cases = [
+            ("if true | false; then echo dead; fi", Reachability::Never),
+            ("if false | true; then echo live; fi", Reachability::Always),
+            ("if ! false; then echo live; fi", Reachability::Always),
+            ("if ! true; then echo dead; fi", Reachability::Never),
+        ];
+
+        for (source, expected) in cases {
+            let program = ShellProgram::from_units(vec![(1, source.to_owned())]);
+            let CommandNode::If { then_body, .. } =
+                &program.units()[0].statements[0].pipelines[0].commands[0]
+            else {
+                panic!("expected structured if for {source:?}");
+            };
+            assert_eq!(then_body[0].reachable, expected, "{source:?}");
+        }
+    }
+
+    #[test]
+    fn until_and_for_iteration_reachability_matches_shell_status_rules() {
+        let cases = [
+            ("until false; do echo live; done", Reachability::Always),
+            ("for item in; do echo dead; done", Reachability::Never),
+            ("for item; do echo maybe; done", Reachability::Maybe),
+        ];
+
+        for (source, expected) in cases {
+            let program = ShellProgram::from_units(vec![(1, source.to_owned())]);
+            let command = &program.units()[0].statements[0].pipelines[0].commands[0];
+            let body = match command {
+                CommandNode::Loop { body, .. } | CommandNode::For { body, .. } => body,
+                _ => panic!("expected structured loop for {source:?}"),
+            };
+            assert_eq!(body[0].reachable, expected, "{source:?}");
+        }
+    }
+
+    #[test]
+    fn deeply_nested_substitutions_stop_at_the_analysis_depth_cap() {
+        let source = format!("{}safe{}", "echo $(".repeat(5_000), ")".repeat(5_000));
+        let program = ShellProgram::from_units(vec![(1, source)]);
+        assert_eq!(program.units().len(), 1);
+        assert!(!program.units()[0].statements.is_empty());
+    }
+
+    #[test]
     fn child_programs_use_multiline_logical_and_heredoc_frontend() {
         let program = ShellProgram::from_source(
             "sh -c 'if false; then\n  curl https://example.test/dead\nfi'\n",
+            0,
         );
         let CommandNode::Simple(command) =
             &program.units()[0].statements[0].pipelines[0].commands[0]

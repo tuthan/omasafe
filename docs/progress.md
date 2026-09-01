@@ -2690,6 +2690,45 @@ A differential scan of all 15 checked-in plugin fixtures against
 `8c99b12` (default feature configuration) produced identical analysis and
 exit results for every fixture. Stage B is closed again.
 
+## Stage B — Review Closure: Depth, Status, and Compound Decoder Fixes (2026-09-01)
+
+Status: **complete**
+
+A focused review found four P1 regressions in the reopened Stage B surface.
+Commit `b90a8cf` fixes and pins all four:
+
+1. Child `-c`, `eval`, and substitution parsing now carries the caller's
+   recursion depth through `ShellProgram::from_source` and stops parsing
+   control-flow children at the same depth cap. A 5,000-level substitution
+   regression stays bounded without a stack overflow.
+2. Typed and token fallback condition summaries now use the final pipeline
+   command and apply `!`. `until` body reachability and explicit empty `for`
+   lists are also modeled correctly; `for` without `in` remains `Maybe`.
+3. Subshell and brace-group decoder output is composed through parent stdout
+   and stdin redirects, including nested pipelines and stderr-only/file-backed
+   cases, so `(base64 -d) | sh` and its compound variants are detected.
+4. The exact control-flow, depth, compound decoder, and redirect regressions
+   are covered at both IR/consumption level and end to end in H3 tests.
+
+Verification:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+cargo test --workspace                         # 256 analyzer, 75 CLI
+cargo test --workspace --no-default-features   # 246 analyzer, 75 CLI
+./scripts/generate-cli-assets.sh --check
+scripts/determinism-canary.sh
+python3 scripts/test_corpus_tooling.py
+git diff --check
+```
+
+The 15-fixture differential scan against `8c99b12` still has zero analysis or
+exit-code mismatches after ignoring only the timestamp field.
+
+Stage B is closed.
+
 ## Plan A4 — Detector Family Extraction
 
 Status: **complete**
