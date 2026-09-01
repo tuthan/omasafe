@@ -89,12 +89,310 @@ impl Outcomes {
 pub(in crate::detect) fn pipeline_negated(statement: &[ShellToken]) -> bool {
     let mut negations = 0usize;
     for token in statement {
-        match token {
-            ShellToken::Word { value, .. } if value == "!" => negations += 1,
-            _ => break,
+        if token.syntax_word() == Some("!") {
+            negations += 1;
+        } else {
+            break;
         }
     }
     negations % 2 == 1
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ControlKind {
+    If,
+    Loop,
+    Case,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CasePhase {
+    Header,
+    Patterns,
+    Body,
+}
+
+#[derive(Clone, Copy)]
+struct ControlFrame {
+    kind: ControlKind,
+    case_phase: CasePhase,
+    case_header_word_seen: bool,
+}
+
+/// One shared shell-control scanner. All structural consumers use the same
+/// command-position and case-pattern rules, so a quoted/escaped/expanded
+/// reserved-word value never changes control nesting.
+pub(in crate::detect) struct ControlScanner {
+    groups: i32,
+    controls: Vec<ControlFrame>,
+    command_start: bool,
+    case_separator_pending: bool,
+    case_end_pending: bool,
+}
+
+impl ControlScanner {
+    pub(in crate::detect) fn new() -> Self {
+        Self {
+            groups: 0,
+            controls: Vec::new(),
+            command_start: true,
+            case_separator_pending: false,
+            case_end_pending: false,
+        }
+    }
+
+    pub(in crate::detect) fn control_depth(&self) -> i32 {
+        self.controls.len() as i32
+    }
+
+    pub(in crate::detect) fn prepare(&mut self, token: &ShellToken) {
+        if self.case_end_pending && token.operator() != Some(")") {
+            if self
+                .controls
+                .last()
+                .is_some_and(|frame| frame.kind == ControlKind::Case)
+            {
+                self.controls.pop();
+            }
+            self.case_end_pending = false;
+        }
+    }
+
+    pub(in crate::detect) fn can_split(&self) -> bool {
+        self.groups == 0 && self.controls.is_empty()
+    }
+
+    pub(in crate::detect) fn marker_at(
+        &self,
+        token: &ShellToken,
+        next: Option<&ShellToken>,
+        markers: &[&str],
+        base_depth: i32,
+    ) -> bool {
+        if self.groups != 0 || self.control_depth() != base_depth {
+            return false;
+        }
+        let Some(word) = token.syntax_word() else {
+            return false;
+        };
+        let Some(top) = self.controls.last() else {
+            return false;
+        };
+
+        if top.kind == ControlKind::Case && top.case_phase == CasePhase::Patterns {
+            return word == "esac"
+                && markers.contains(&"esac")
+                && self.command_start
+                && next.is_none_or(|candidate| candidate.operator() != Some(")"));
+        }
+
+        if word == "in"
+            && markers.contains(&"in")
+            && ((top.kind == ControlKind::Loop)
+                || (top.kind == ControlKind::Case
+                    && top.case_phase == CasePhase::Header
+                    && top.case_header_word_seen))
+        {
+            return true;
+        }
+
+        self.command_start && markers.contains(&word)
+    }
+
+    pub(in crate::detect) fn step(&mut self, token: &ShellToken) {
+        if let Some(operator) = token.operator() {
+            match operator {
+                "(" | "{" | "((" => {
+                    self.groups += 1;
+                    self.command_start = true;
+                }
+                ")" | "}" | "))" => {
+                    if operator == ")"
+                        && self.groups == 0
+                        && self.controls.last().is_some_and(|frame| {
+                            frame.kind == ControlKind::Case
+                                && frame.case_phase == CasePhase::Patterns
+                        })
+                    {
+                        if let Some(top) = self.controls.last_mut() {
+                            top.case_phase = CasePhase::Body;
+                        }
+                        self.case_separator_pending = false;
+                    }
+                    self.groups = (self.groups - 1).max(0);
+                    self.command_start = true;
+                    if self.case_end_pending && operator == ")" {
+                        self.case_end_pending = false;
+                    }
+                }
+                ";" if self.groups == 0 => {
+                    if let Some(top) = self.controls.last_mut()
+                        && top.kind == ControlKind::Case
+                        && top.case_phase == CasePhase::Body
+                    {
+                        if self.case_separator_pending {
+                            top.case_phase = CasePhase::Patterns;
+                            self.case_separator_pending = false;
+                        } else {
+                            self.case_separator_pending = true;
+                        }
+                    } else {
+                        self.case_separator_pending = false;
+                    }
+                    self.command_start = true;
+                }
+                ";" | "&&" | "||" | "&" | "|" | "|&" => {
+                    self.case_separator_pending = false;
+                    self.command_start = true;
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        let raw_word = token.word();
+        let syntax_word = token.syntax_word();
+        if raw_word.is_some() {
+            self.case_separator_pending = false;
+        }
+
+        if self.groups == 0 {
+            match self.controls.last().copied() {
+                Some(ControlFrame {
+                    kind: ControlKind::Case,
+                    case_phase: CasePhase::Patterns,
+                    ..
+                }) => {
+                    if syntax_word == Some("esac") && self.command_start {
+                        self.case_end_pending = true;
+                    }
+                }
+                Some(ControlFrame {
+                    kind: ControlKind::Case,
+                    case_phase: CasePhase::Header,
+                    case_header_word_seen,
+                }) => {
+                    if syntax_word == Some("in") && case_header_word_seen {
+                        if let Some(top) = self.controls.last_mut() {
+                            top.case_phase = CasePhase::Patterns;
+                        }
+                    } else if raw_word.is_some()
+                        && syntax_word != Some("in")
+                        && let Some(top) = self.controls.last_mut()
+                    {
+                        top.case_header_word_seen = true;
+                    }
+                }
+                Some(ControlFrame {
+                    kind: ControlKind::If,
+                    ..
+                })
+                | Some(ControlFrame {
+                    kind: ControlKind::Loop,
+                    ..
+                })
+                | Some(ControlFrame {
+                    kind: ControlKind::Case,
+                    case_phase: CasePhase::Body,
+                    ..
+                }) if self.command_start => {
+                    if let Some(word) = syntax_word {
+                        match word {
+                            "if" => self.controls.push(ControlFrame {
+                                kind: ControlKind::If,
+                                case_phase: CasePhase::Header,
+                                case_header_word_seen: false,
+                            }),
+                            "while" | "until" | "for" => self.controls.push(ControlFrame {
+                                kind: ControlKind::Loop,
+                                case_phase: CasePhase::Header,
+                                case_header_word_seen: false,
+                            }),
+                            "case" => self.controls.push(ControlFrame {
+                                kind: ControlKind::Case,
+                                case_phase: CasePhase::Header,
+                                case_header_word_seen: false,
+                            }),
+                            "fi" if self
+                                .controls
+                                .last()
+                                .is_some_and(|frame| frame.kind == ControlKind::If) =>
+                            {
+                                self.controls.pop();
+                            }
+                            "done"
+                                if self
+                                    .controls
+                                    .last()
+                                    .is_some_and(|frame| frame.kind == ControlKind::Loop) =>
+                            {
+                                self.controls.pop();
+                            }
+                            "esac"
+                                if self
+                                    .controls
+                                    .last()
+                                    .is_some_and(|frame| frame.kind == ControlKind::Case) =>
+                            {
+                                self.case_end_pending = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                None if self.command_start => {
+                    if let Some(word) = syntax_word {
+                        match word {
+                            "if" => self.controls.push(ControlFrame {
+                                kind: ControlKind::If,
+                                case_phase: CasePhase::Header,
+                                case_header_word_seen: false,
+                            }),
+                            "while" | "until" | "for" => self.controls.push(ControlFrame {
+                                kind: ControlKind::Loop,
+                                case_phase: CasePhase::Header,
+                                case_header_word_seen: false,
+                            }),
+                            "case" => self.controls.push(ControlFrame {
+                                kind: ControlKind::Case,
+                                case_phase: CasePhase::Header,
+                                case_header_word_seen: false,
+                            }),
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.command_start = syntax_word
+            .is_some_and(|word| matches!(word, "!" | "then" | "elif" | "else" | "do" | "in"));
+    }
+
+    pub(in crate::detect) fn finish(&mut self) {
+        if self.case_end_pending {
+            if self
+                .controls
+                .last()
+                .is_some_and(|frame| frame.kind == ControlKind::Case)
+            {
+                self.controls.pop();
+            }
+            self.case_end_pending = false;
+        }
+    }
+}
+
+/// Control depth for the logical-source assembler, using the same scanner as
+/// pipeline and compound-command parsing.
+pub(in crate::detect) fn control_flow_depth(tokens: &[ShellToken]) -> i32 {
+    let mut scanner = ControlScanner::new();
+    for token in tokens {
+        scanner.prepare(token);
+        scanner.step(token);
+    }
+    scanner.finish();
+    scanner.control_depth()
 }
 
 /// Split a statement into outer pipeline segments on `|` and Bash's `|&`
@@ -111,50 +409,17 @@ fn split_token_stream(
 ) -> Vec<&[ShellToken]> {
     let mut segments = Vec::new();
     let mut start = 0usize;
-    let mut depth = 0i32;
-    let mut controls = Vec::new();
-    let mut command_start = true;
+    let mut scanner = ControlScanner::new();
     for (index, token) in tokens.iter().enumerate() {
-        match token {
-            ShellToken::Operator(op) => match op.as_str() {
-                "(" | "{" | "((" => {
-                    depth += 1;
-                    command_start = true;
-                }
-                ")" | "}" | "))" => {
-                    depth = (depth - 1).max(0);
-                    command_start = true;
-                }
-                _ if depth == 0 && is_separator(op) && controls.is_empty() => {
-                    segments.push(&tokens[start..index]);
-                    start = index + 1;
-                    command_start = true;
-                }
-                "|" | "|&" | ";" | "&&" | "||" | "&" => command_start = true,
-                _ => {}
-            },
-            ShellToken::Word { value, .. } => {
-                if depth == 0 && command_start {
-                    match value.as_str() {
-                        "if" => controls.push("if"),
-                        "while" | "until" | "for" => controls.push("loop"),
-                        "case" => controls.push("case"),
-                        "fi" if controls.last() == Some(&"if") => {
-                            controls.pop();
-                        }
-                        "done" if controls.last() == Some(&"loop") => {
-                            controls.pop();
-                        }
-                        "esac" if controls.last() == Some(&"case") => {
-                            controls.pop();
-                        }
-                        _ => {}
-                    }
-                }
-                command_start = value == "!"
-                    || matches!(value.as_str(), "then" | "elif" | "else" | "do" | "in");
-            }
+        scanner.prepare(token);
+        if let Some(op) = token.operator()
+            && is_separator(op)
+            && scanner.can_split()
+        {
+            segments.push(&tokens[start..index]);
+            start = index + 1;
         }
+        scanner.step(token);
     }
     segments.push(&tokens[start..]);
     segments

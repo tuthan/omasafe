@@ -13,7 +13,8 @@
 //! fate of a forwarded body are injected by the facade as classifiers, so
 //! the source layer stays free of interpreter and command modeling.
 
-use super::lexer::{ShellToken, control_flow_depth, redirect_operator_at, tokenize};
+use super::lexer::{ShellToken, redirect_operator_at, tokenize};
+use super::syntax::control_flow_depth;
 
 /// Internal line marker used for removed heredoc bodies and terminators. It
 /// preserves physical line numbers without letting artificial blank lines

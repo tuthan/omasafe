@@ -14,7 +14,7 @@ use super::command::{
 pub(in crate::detect) use super::lexer::WordProvenance;
 use super::lexer::{ShellToken, SubstKind};
 use super::syntax::{
-    GroupKind, Outcomes, matching_group_close, pipeline_negated, pipeline_segments,
+    ControlScanner, GroupKind, Outcomes, matching_group_close, pipeline_negated, pipeline_segments,
 };
 
 /// The list operator that controls whether a statement may run.
@@ -401,7 +401,7 @@ fn compound_open(segment: &[ShellToken]) -> Option<(usize, GroupKind)> {
 fn parse_control_flow(segment: &[ShellToken], depth: usize) -> Option<CommandNode> {
     let mut index = 0usize;
     skip_command_prefixes(segment, &mut index);
-    match segment.get(index).and_then(ShellToken::word)? {
+    match segment.get(index).and_then(ShellToken::syntax_word)? {
         "if" => parse_if(segment, index, depth),
         "while" => parse_loop(segment, index, depth, WhileOrUntil::While),
         "until" => parse_loop(segment, index, depth, WhileOrUntil::Until),
@@ -409,13 +409,6 @@ fn parse_control_flow(segment: &[ShellToken], depth: usize) -> Option<CommandNod
         "case" => parse_case(segment, index, depth),
         _ => None,
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ControlBlock {
-    If,
-    Loop,
-    Case,
 }
 
 fn statement_reachability(outcomes: Outcomes, guard: Option<&str>) -> Reachability {
@@ -439,92 +432,39 @@ fn control_aware_statements(tokens: &[ShellToken]) -> Vec<(&[ShellToken], Option
     let mut statements = Vec::new();
     let mut start = 0usize;
     let mut guard = None;
-    let mut groups = 0i32;
-    let mut controls = Vec::new();
-    let mut command_start = true;
+    let mut scanner = ControlScanner::new();
 
     for (index, token) in tokens.iter().enumerate() {
-        match token {
-            ShellToken::Operator(operator) => match operator.as_str() {
-                "(" | "{" | "((" => {
-                    groups += 1;
-                    command_start = true;
-                }
-                ")" | "}" | "))" => {
-                    groups = (groups - 1).max(0);
-                    command_start = true;
-                }
-                ";" | "&&" | "||" | "&" if groups == 0 => {
-                    if controls.is_empty() {
-                        statements.push((&tokens[start..index], guard));
-                        guard = Some(operator.as_str());
-                        start = index + 1;
-                    }
-                    command_start = true;
-                }
-                "|" | "|&" => command_start = true,
-                _ => {}
-            },
-            ShellToken::Word { value, .. } => {
-                if groups == 0 && command_start {
-                    match value.as_str() {
-                        "if" => controls.push(ControlBlock::If),
-                        "while" | "until" | "for" => controls.push(ControlBlock::Loop),
-                        "case" => controls.push(ControlBlock::Case),
-                        "fi" => pop_control(&mut controls, ControlBlock::If),
-                        "done" => pop_control(&mut controls, ControlBlock::Loop),
-                        "esac" => pop_control(&mut controls, ControlBlock::Case),
-                        _ => {}
-                    }
-                }
-                command_start = matches!(value.as_str(), "then" | "elif" | "else" | "do" | "in");
-            }
+        scanner.prepare(token);
+        if let Some(operator) = token.operator()
+            && matches!(operator, ";" | "&&" | "||" | "&")
+            && scanner.can_split()
+        {
+            statements.push((&tokens[start..index], guard));
+            guard = Some(operator);
+            start = index + 1;
         }
+        scanner.step(token);
     }
     statements.push((&tokens[start..], guard));
     statements
 }
 
-fn pop_control(controls: &mut Vec<ControlBlock>, expected: ControlBlock) {
-    if controls.last() == Some(&expected) {
-        controls.pop();
-    }
-}
-
 /// Find a control clause at the current block's level, skipping nested
 /// control structures and grouped command lists.
 fn control_marker_index(tokens: &[ShellToken], markers: &[&str], start: usize) -> Option<usize> {
-    let mut groups = 0i32;
-    let mut nested_controls = 0i32;
-    let mut command_start = true;
+    let mut scanner = ControlScanner::new();
+    for token in tokens.iter().take(start) {
+        scanner.prepare(token);
+        scanner.step(token);
+    }
+    let base_depth = scanner.control_depth();
     for (index, token) in tokens.iter().enumerate().skip(start) {
-        match token {
-            ShellToken::Operator(operator) => match operator.as_str() {
-                "(" | "{" | "((" => {
-                    groups += 1;
-                    command_start = true;
-                }
-                ")" | "}" | "))" => {
-                    groups = (groups - 1).max(0);
-                    command_start = true;
-                }
-                ";" | "&&" | "||" | "&" | "|" | "|&" => command_start = true,
-                _ => {}
-            },
-            ShellToken::Word { value, .. } => {
-                if groups == 0 && command_start {
-                    if nested_controls == 0 && markers.contains(&value.as_str()) {
-                        return Some(index);
-                    }
-                    match value.as_str() {
-                        "if" | "while" | "until" | "for" | "case" => nested_controls += 1,
-                        "fi" | "done" | "esac" if nested_controls > 0 => nested_controls -= 1,
-                        _ => {}
-                    }
-                }
-                command_start = matches!(value.as_str(), "then" | "elif" | "else" | "do" | "in");
-            }
+        scanner.prepare(token);
+        if scanner.marker_at(token, tokens.get(index + 1), markers, base_depth) {
+            return Some(index);
         }
+        scanner.step(token);
     }
     None
 }
@@ -655,15 +595,17 @@ fn parse_if(segment: &[ShellToken], start: usize, depth: usize) -> Option<Comman
     let mut elif_branches = Vec::new();
     let mut cursor = then_end;
     while cursor < fi_index {
-        if segment[cursor].word() == Some("elif") {
+        if segment[cursor].syntax_word() == Some("elif") {
             let branch_then = control_marker_index(segment, &["then"], cursor + 1)?;
             let branch_end =
                 control_marker_index(segment, &["elif", "else", "fi"], branch_then + 1)
                     .filter(|index| *index < fi_index)
                     .unwrap_or(fi_index);
-            let branch_condition = parse_statements(&segment[cursor + 1..branch_then], depth + 1);
+            let mut branch_condition =
+                parse_statements(&segment[cursor + 1..branch_then], depth + 1);
             let mut body = parse_statements(&segment[branch_then + 1..branch_end], depth + 1);
             let branch_condition_reachability = condition_reachability(&branch_condition);
+            apply_gate_reachability(&mut branch_condition, remaining);
             let branch_gate = gate_with_condition(remaining, branch_condition_reachability, true);
             apply_gate_reachability(&mut body, branch_gate);
             remaining = gate_with_condition(remaining, branch_condition_reachability, false);
@@ -676,7 +618,7 @@ fn parse_if(segment: &[ShellToken], start: usize, depth: usize) -> Option<Comman
             break;
         }
     }
-    let else_body = if cursor < fi_index && segment[cursor].word() == Some("else") {
+    let else_body = if cursor < fi_index && segment[cursor].syntax_word() == Some("else") {
         let mut body = parse_statements(&segment[cursor + 1..fi_index], depth + 1);
         apply_gate_reachability(&mut body, remaining);
         body
@@ -688,7 +630,7 @@ fn parse_if(segment: &[ShellToken], start: usize, depth: usize) -> Option<Comman
         then_body,
         elif_branches,
         else_body,
-        redirects: redirects_at_depth_zero(segment, depth),
+        redirects: redirects_around_control(segment, depth, start, fi_index),
     })
 }
 
@@ -723,7 +665,7 @@ fn parse_loop(
         kind,
         condition,
         body,
-        redirects: redirects_at_depth_zero(segment, depth),
+        redirects: redirects_around_control(segment, depth, start, done_index),
     })
 }
 
@@ -751,7 +693,7 @@ fn parse_for(segment: &[ShellToken], start: usize, depth: usize) -> Option<Comma
         variable,
         words,
         body,
-        redirects: redirects_at_depth_zero(segment, depth),
+        redirects: redirects_around_control(segment, depth, start, done_index),
     })
 }
 
@@ -792,7 +734,7 @@ fn parse_case(segment: &[ShellToken], start: usize, depth: usize) -> Option<Comm
     Some(CommandNode::Case {
         word,
         branches,
-        redirects: redirects_at_depth_zero(segment, depth),
+        redirects: redirects_around_control(segment, depth, start, end),
     })
 }
 
@@ -822,6 +764,20 @@ fn redirects_at_depth_zero(segment: &[ShellToken], depth: usize) -> Vec<Redirect
         }
         index += 1;
     }
+    redirects
+}
+
+/// Redirects before a control opener or after its matching terminator belong
+/// to the compound node. Redirects between those boundaries belong to the
+/// parsed condition, body, or branch command that owns them.
+fn redirects_around_control(
+    segment: &[ShellToken],
+    depth: usize,
+    opener: usize,
+    closer: usize,
+) -> Vec<Redirect> {
+    let mut redirects = redirects_at_depth_zero(&segment[..opener], depth);
+    redirects.extend(redirects_at_depth_zero(&segment[closer + 1..], depth));
     redirects
 }
 
@@ -1176,6 +1132,94 @@ mod tests {
             panic!("expected interpreter pipeline consumer");
         };
         assert_eq!(command.head, "sh");
+    }
+
+    #[test]
+    fn dead_elif_conditions_are_gated_and_case_patterns_do_not_nest_controls() {
+        let program = ShellProgram::from_units(vec![
+            (
+                1,
+                "if true; then :; elif curl https://example.test/dead; then :; fi".to_owned(),
+            ),
+            (
+                2,
+                "if false; then :; elif curl https://example.test/live; then :; fi".to_owned(),
+            ),
+        ]);
+        for (unit, expected) in program
+            .units()
+            .iter()
+            .zip([Reachability::Never, Reachability::Always])
+        {
+            let CommandNode::If { elif_branches, .. } =
+                &unit.statements[0].pipelines[0].commands[0]
+            else {
+                panic!("expected structured if");
+            };
+            assert_eq!(elif_branches[0].condition[0].reachable, expected);
+        }
+
+        for pattern in [
+            "if", "\"if\"", "fi", "\"fi\"", "case", "\"case\"", "done", "\"done\"",
+        ] {
+            let source = format!("case x in {pattern}) echo safe;; esac | sh");
+            let program = ShellProgram::from_units(vec![(1, source)]);
+            let pipeline = &program.units()[0].statements[0].pipelines[0];
+            assert_eq!(pipeline.commands.len(), 2, "{pattern:?}");
+            assert!(matches!(pipeline.commands[0], CommandNode::Case { .. }));
+        }
+
+        let program = ShellProgram::from_units(vec![(
+            1,
+            "case x in x) if true; then base64 -d payload.b64; fi;; esac | sh".to_owned(),
+        )]);
+        let pipeline = &program.units()[0].statements[0].pipelines[0];
+        assert_eq!(pipeline.commands.len(), 2);
+        let CommandNode::Case { branches, .. } = &pipeline.commands[0] else {
+            panic!("expected structured case");
+        };
+        assert!(matches!(
+            branches[0].body[0].pipelines[0].commands[0],
+            CommandNode::If { .. }
+        ));
+    }
+
+    #[test]
+    fn control_redirects_are_owned_by_their_boundaries() {
+        let sources = [
+            "if true; then echo body >body; :; fi >outer",
+            "while true; do echo body >body; done >outer",
+            "for item in one; do echo body >body; done >outer",
+            "case x in x) echo body >body;; esac >outer",
+        ];
+        for source in sources {
+            let program = ShellProgram::from_units(vec![(1, source.to_owned())]);
+            let node = &program.units()[0].statements[0].pipelines[0].commands[0];
+            let body = match node {
+                CommandNode::If { then_body, .. }
+                | CommandNode::Loop {
+                    body: then_body, ..
+                }
+                | CommandNode::For {
+                    body: then_body, ..
+                } => then_body,
+                CommandNode::Case { branches, .. } => &branches[0].body,
+                _ => panic!("expected compound control for {source:?}"),
+            };
+            let redirects = match node {
+                CommandNode::If { redirects, .. }
+                | CommandNode::Loop { redirects, .. }
+                | CommandNode::For { redirects, .. }
+                | CommandNode::Case { redirects, .. } => redirects,
+                _ => unreachable!(),
+            };
+            assert_eq!(redirects.len(), 1, "{source:?}");
+            assert_eq!(redirects[0].target.as_ref().unwrap().value, "outer");
+            let CommandNode::Simple(command) = &body[0].pipelines[0].commands[0] else {
+                panic!("expected body command for {source:?}");
+            };
+            assert_eq!(command.redirects[0].target.as_ref().unwrap().value, "body");
+        }
     }
 
     #[test]
