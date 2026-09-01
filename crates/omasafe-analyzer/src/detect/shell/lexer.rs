@@ -89,6 +89,10 @@ pub(in crate::detect) enum ShellToken {
         /// expansions preserve the runtime value but disqualify it from
         /// reserved-word recognition.
         syntax_eligible: bool,
+        /// Whether this token is a valid assignment prefix. The identifier
+        /// before the first unquoted `=` must be plain; quoting, escaping,
+        /// and expansion remain valid in the value after that `=`.
+        assignment_eligible: bool,
         /// Some fragment of the word resolves only at runtime — an unquoted
         /// or double-quoted `$`/backtick expansion, or a captured
         /// substitution — so the value is not statically known text.
@@ -114,6 +118,17 @@ impl ShellToken {
             ShellToken::Word {
                 value,
                 syntax_eligible: true,
+                ..
+            } => Some(value),
+            _ => None,
+        }
+    }
+
+    pub(in crate::detect) fn assignment_word(&self) -> Option<&str> {
+        match self {
+            ShellToken::Word {
+                value,
+                assignment_eligible: true,
                 ..
             } => Some(value),
             _ => None,
@@ -356,6 +371,11 @@ fn read_word(input: &str, start: usize) -> (ShellToken, usize) {
     let mut substitutions: Vec<Substitution> = Vec::new();
     let mut provenance = WordProvenance::EMPTY;
     let mut syntax_eligible = true;
+    let mut assignment_eligible = true;
+    let mut assignment_lhs = true;
+    let mut assignment_lhs_valid = true;
+    let mut assignment_lhs_len = 0usize;
+    let mut assignment_saw_equals = false;
     let mut parameter_brace_depth = 0u32;
     let mut brace_expansion_stack = Vec::new();
     let mut glob_bracket_open = false;
@@ -367,6 +387,9 @@ fn read_word(input: &str, start: usize) -> (ShellToken, usize) {
                     && let Some((open, close)) = balanced_bracket_span(input, i + 1)
                 {
                     syntax_eligible = false;
+                    if assignment_lhs {
+                        assignment_eligible = false;
+                    }
                     substitutions.push(Substitution {
                         kind: SubstKind::Process,
                         inner: input[open..close].to_owned(),
@@ -380,6 +403,9 @@ fn read_word(input: &str, start: usize) -> (ShellToken, usize) {
             }
             b'\\' => {
                 syntax_eligible = false;
+                if assignment_lhs {
+                    assignment_eligible = false;
+                }
                 if let Some(&next) = bytes.get(i + 1) {
                     value.push(next);
                     i += 2;
@@ -389,6 +415,9 @@ fn read_word(input: &str, start: usize) -> (ShellToken, usize) {
             }
             b'\'' => {
                 syntax_eligible = false;
+                if assignment_lhs {
+                    assignment_eligible = false;
+                }
                 if let Some(rel) = input[i + 1..].find('\'') {
                     value.extend_from_slice(&bytes[i + 1..i + 1 + rel]);
                     i = i + 1 + rel + 1;
@@ -399,6 +428,9 @@ fn read_word(input: &str, start: usize) -> (ShellToken, usize) {
             }
             b'"' => {
                 syntax_eligible = false;
+                if assignment_lhs {
+                    assignment_eligible = false;
+                }
                 i = read_double_quoted(
                     input,
                     i + 1,
@@ -409,6 +441,9 @@ fn read_word(input: &str, start: usize) -> (ShellToken, usize) {
             }
             b'$' if bytes.get(i + 1) == Some(&b'(') => {
                 syntax_eligible = false;
+                if assignment_lhs {
+                    assignment_eligible = false;
+                }
                 match dollar_substitution(input, i + 1) {
                     Some((kind, inner, end)) => {
                         substitutions.push(Substitution { kind, inner });
@@ -430,6 +465,9 @@ fn read_word(input: &str, start: usize) -> (ShellToken, usize) {
             }
             b'$' => {
                 syntax_eligible = false;
+                if assignment_lhs {
+                    assignment_eligible = false;
+                }
                 // A braced or bare parameter expansion resolves at runtime.
                 provenance |= WordProvenance::PARAMETER | WordProvenance::FIELD_SPLIT;
                 value.push(bytes[i]);
@@ -443,6 +481,9 @@ fn read_word(input: &str, start: usize) -> (ShellToken, usize) {
             }
             b'`' => {
                 syntax_eligible = false;
+                if assignment_lhs {
+                    assignment_eligible = false;
+                }
                 if let Some(rel) = input[i + 1..].find('`') {
                     let inner_start = i + 1;
                     let inner_end = i + 1 + rel;
@@ -461,36 +502,54 @@ fn read_word(input: &str, start: usize) -> (ShellToken, usize) {
             }
             b'~' if i == start || value.last() == Some(&b'=') => {
                 syntax_eligible = false;
+                if assignment_lhs {
+                    assignment_eligible = false;
+                }
                 provenance |= WordProvenance::TILDE;
                 value.push(bytes[i]);
                 i += 1;
             }
             b'*' | b'?' => {
                 syntax_eligible = false;
+                if assignment_lhs {
+                    assignment_eligible = false;
+                }
                 provenance |= WordProvenance::GLOB;
                 value.push(bytes[i]);
                 i += 1;
             }
             b'[' => {
                 syntax_eligible = false;
+                if assignment_lhs {
+                    assignment_eligible = false;
+                }
                 glob_bracket_open = true;
                 value.push(bytes[i]);
                 i += 1;
             }
             b']' if glob_bracket_open => {
                 syntax_eligible = false;
+                if assignment_lhs {
+                    assignment_eligible = false;
+                }
                 provenance |= WordProvenance::GLOB;
                 glob_bracket_open = false;
                 value.push(bytes[i]);
                 i += 1;
             }
             b'{' if parameter_brace_depth == 0 => {
+                if assignment_lhs {
+                    assignment_eligible = false;
+                }
                 brace_expansion_stack.push(false);
                 value.push(bytes[i]);
                 i += 1;
             }
             b',' if parameter_brace_depth == 0 => {
                 syntax_eligible = false;
+                if assignment_lhs {
+                    assignment_eligible = false;
+                }
                 if let Some(has_comma) = brace_expansion_stack.last_mut() {
                     *has_comma = true;
                 }
@@ -507,10 +566,33 @@ fn read_word(input: &str, start: usize) -> (ShellToken, usize) {
                     syntax_eligible = false;
                     provenance |= WordProvenance::BRACE;
                 }
+                if assignment_lhs {
+                    assignment_eligible = false;
+                }
+                value.push(bytes[i]);
+                i += 1;
+            }
+            b'=' => {
+                if assignment_lhs {
+                    if assignment_lhs_len == 0 || !assignment_lhs_valid {
+                        assignment_eligible = false;
+                    }
+                    assignment_lhs = false;
+                    assignment_saw_equals = true;
+                }
                 value.push(bytes[i]);
                 i += 1;
             }
             other => {
+                if assignment_lhs {
+                    assignment_lhs_valid = assignment_lhs_valid
+                        && if assignment_lhs_len == 0 {
+                            other.is_ascii_alphabetic() || other == b'_'
+                        } else {
+                            other.is_ascii_alphanumeric() || other == b'_'
+                        };
+                    assignment_lhs_len += 1;
+                }
                 value.push(other);
                 i += 1;
             }
@@ -523,6 +605,7 @@ fn read_word(input: &str, start: usize) -> (ShellToken, usize) {
             dynamic: !provenance.is_static(),
             provenance,
             syntax_eligible,
+            assignment_eligible: assignment_eligible && assignment_saw_equals,
             span: (start, i),
         },
         i,

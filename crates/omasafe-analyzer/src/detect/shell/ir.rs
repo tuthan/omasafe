@@ -8,8 +8,8 @@
 use super::budget::MAX_SHELL_ANALYSIS_DEPTH;
 use super::command::{
     ScriptCommand, command_arguments, command_basename, env_split_string_command,
-    is_env_assignment, is_redirect_operator, segment_commands, skip_command_prefixes,
-    skip_wrapper_options, statement_outcomes,
+    is_redirect_operator, segment_commands, skip_command_prefixes, skip_wrapper_options,
+    statement_outcomes,
 };
 pub(in crate::detect) use super::lexer::WordProvenance;
 use super::lexer::{ShellToken, SubstKind};
@@ -375,7 +375,9 @@ fn compound_open(segment: &[ShellToken]) -> Option<(usize, GroupKind)> {
     let mut index = 0usize;
     while let Some(token) = segment.get(index) {
         match token {
-            ShellToken::Word { value, .. } if value == "!" || is_env_assignment(value) => {
+            ShellToken::Word { .. }
+                if token.syntax_word() == Some("!") || token.assignment_word().is_some() =>
+            {
                 index += 1
             }
             ShellToken::Operator(operator) if is_redirect_operator(operator) => {
@@ -706,6 +708,12 @@ fn parse_case(segment: &[ShellToken], start: usize, depth: usize) -> Option<Comm
     let mut branches = Vec::new();
     let mut cursor = in_index + 1;
     while cursor < end {
+        while cursor < end && segment[cursor].operator() == Some(";") {
+            cursor += 1;
+        }
+        if cursor >= end {
+            break;
+        }
         let close = top_level_operator_index(segment, ")", cursor)?;
         if close > end {
             return None;
@@ -905,7 +913,7 @@ mod tests {
     use super::{
         Command, CommandNode, Guard, Reachability, ShellProgram, WhileOrUntil, Word, WordProvenance,
     };
-    use crate::detect::shell::lexer::SubstKind;
+    use crate::detect::shell::lexer::{SubstKind, tokenize};
 
     #[test]
     fn parses_guards_pipelines_and_compounds_without_flattening() {
@@ -1182,6 +1190,41 @@ mod tests {
             branches[0].body[0].pipelines[0].commands[0],
             CommandNode::If { .. }
         ));
+    }
+
+    #[test]
+    fn for_word_lists_and_case_selectors_preserve_reserved_word_values() {
+        for value in ["done", "if", "do", "case"] {
+            let program = ShellProgram::from_units(vec![(
+                1,
+                format!("for x in {value}; do base64 -d payload.b64; done | sh"),
+            )]);
+            let pipeline = &program.units()[0].statements[0].pipelines[0];
+            assert_eq!(pipeline.commands.len(), 2, "for x in {value}");
+            assert!(matches!(pipeline.commands[0], CommandNode::For { .. }));
+        }
+
+        let program = ShellProgram::from_units(vec![(
+            1,
+            "case in in in) base64 -d payload.b64;; esac | sh".to_owned(),
+        )]);
+        let pipeline = &program.units()[0].statements[0].pipelines[0];
+        assert_eq!(pipeline.commands.len(), 2);
+        assert!(matches!(pipeline.commands[0], CommandNode::Case { .. }));
+
+        for (source, assignment) in [
+            ("\"A=B\"", false),
+            ("A\\=B", false),
+            ("A=B", true),
+            ("A=\"B\"", true),
+            ("A=$B", true),
+        ] {
+            let token = &tokenize(source)[0];
+            assert_eq!(token.assignment_word().is_some(), assignment, "{source:?}");
+        }
+        assert!(tokenize("\"!\"")[0].syntax_word().is_none());
+        assert!(tokenize("\\!")[0].syntax_word().is_none());
+        assert_eq!(tokenize("!")[0].syntax_word(), Some("!"));
     }
 
     #[test]

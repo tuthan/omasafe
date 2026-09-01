@@ -112,11 +112,21 @@ enum CasePhase {
     Body,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ForPhase {
+    Variable,
+    BeforeList,
+    WordList,
+    AwaitingDo,
+    Body,
+}
+
 #[derive(Clone, Copy)]
 struct ControlFrame {
     kind: ControlKind,
     case_phase: CasePhase,
     case_header_word_seen: bool,
+    for_phase: Option<ForPhase>,
 }
 
 /// One shared shell-control scanner. All structural consumers use the same
@@ -186,14 +196,35 @@ impl ControlScanner {
                 && next.is_none_or(|candidate| candidate.operator() != Some(")"));
         }
 
-        if word == "in"
-            && markers.contains(&"in")
-            && ((top.kind == ControlKind::Loop)
-                || (top.kind == ControlKind::Case
-                    && top.case_phase == CasePhase::Header
-                    && top.case_header_word_seen))
+        if word == "in" && markers.contains(&"in") {
+            if top.kind == ControlKind::Case
+                && top.case_phase == CasePhase::Header
+                && top.case_header_word_seen
+            {
+                return true;
+            }
+            if top.kind == ControlKind::Loop && top.for_phase == Some(ForPhase::BeforeList) {
+                return true;
+            }
+        }
+
+        if word == "do" && markers.contains(&"do") {
+            if top.kind == ControlKind::Loop
+                && top
+                    .for_phase
+                    .is_some_and(|phase| phase == ForPhase::AwaitingDo)
+            {
+                return true;
+            }
+            if top.kind == ControlKind::Loop && top.for_phase.is_none() && self.command_start {
+                return true;
+            }
+        }
+
+        if top.kind == ControlKind::Loop
+            && top.for_phase.is_some_and(|phase| phase != ForPhase::Body)
         {
-            return true;
+            return false;
         }
 
         self.command_start && markers.contains(&word)
@@ -226,15 +257,23 @@ impl ControlScanner {
                     }
                 }
                 ";" if self.groups == 0 => {
-                    if let Some(top) = self.controls.last_mut()
-                        && top.kind == ControlKind::Case
-                        && top.case_phase == CasePhase::Body
-                    {
-                        if self.case_separator_pending {
-                            top.case_phase = CasePhase::Patterns;
+                    if let Some(top) = self.controls.last_mut() {
+                        if top.kind == ControlKind::Case && top.case_phase == CasePhase::Body {
+                            if self.case_separator_pending {
+                                top.case_phase = CasePhase::Patterns;
+                                self.case_separator_pending = false;
+                            } else {
+                                self.case_separator_pending = true;
+                            }
+                        } else if top.kind == ControlKind::Loop
+                            && top.for_phase.is_some_and(|phase| {
+                                matches!(phase, ForPhase::BeforeList | ForPhase::WordList)
+                            })
+                        {
+                            top.for_phase = Some(ForPhase::AwaitingDo);
                             self.case_separator_pending = false;
                         } else {
-                            self.case_separator_pending = true;
+                            self.case_separator_pending = false;
                         }
                     } else {
                         self.case_separator_pending = false;
@@ -271,16 +310,35 @@ impl ControlScanner {
                     kind: ControlKind::Case,
                     case_phase: CasePhase::Header,
                     case_header_word_seen,
+                    ..
                 }) => {
                     if syntax_word == Some("in") && case_header_word_seen {
                         if let Some(top) = self.controls.last_mut() {
                             top.case_phase = CasePhase::Patterns;
                         }
                     } else if raw_word.is_some()
-                        && syntax_word != Some("in")
                         && let Some(top) = self.controls.last_mut()
                     {
                         top.case_header_word_seen = true;
+                    }
+                }
+                Some(ControlFrame {
+                    kind: ControlKind::Loop,
+                    for_phase: Some(phase),
+                    ..
+                }) if phase != ForPhase::Body => {
+                    let next_phase = match phase {
+                        ForPhase::Variable if raw_word.is_some() => Some(ForPhase::BeforeList),
+                        ForPhase::BeforeList if syntax_word == Some("in") => {
+                            Some(ForPhase::WordList)
+                        }
+                        ForPhase::AwaitingDo if syntax_word == Some("do") => Some(ForPhase::Body),
+                        _ => None,
+                    };
+                    if let Some(next_phase) = next_phase
+                        && let Some(top) = self.controls.last_mut()
+                    {
+                        top.for_phase = Some(next_phase);
                     }
                 }
                 Some(ControlFrame {
@@ -289,6 +347,12 @@ impl ControlScanner {
                 })
                 | Some(ControlFrame {
                     kind: ControlKind::Loop,
+                    for_phase: None,
+                    ..
+                })
+                | Some(ControlFrame {
+                    kind: ControlKind::Loop,
+                    for_phase: Some(ForPhase::Body),
                     ..
                 })
                 | Some(ControlFrame {
@@ -302,16 +366,25 @@ impl ControlScanner {
                                 kind: ControlKind::If,
                                 case_phase: CasePhase::Header,
                                 case_header_word_seen: false,
+                                for_phase: None,
                             }),
-                            "while" | "until" | "for" => self.controls.push(ControlFrame {
+                            "while" | "until" => self.controls.push(ControlFrame {
                                 kind: ControlKind::Loop,
                                 case_phase: CasePhase::Header,
                                 case_header_word_seen: false,
+                                for_phase: None,
+                            }),
+                            "for" => self.controls.push(ControlFrame {
+                                kind: ControlKind::Loop,
+                                case_phase: CasePhase::Header,
+                                case_header_word_seen: false,
+                                for_phase: Some(ForPhase::Variable),
                             }),
                             "case" => self.controls.push(ControlFrame {
                                 kind: ControlKind::Case,
                                 case_phase: CasePhase::Header,
                                 case_header_word_seen: false,
+                                for_phase: None,
                             }),
                             "fi" if self
                                 .controls
@@ -347,16 +420,25 @@ impl ControlScanner {
                                 kind: ControlKind::If,
                                 case_phase: CasePhase::Header,
                                 case_header_word_seen: false,
+                                for_phase: None,
                             }),
-                            "while" | "until" | "for" => self.controls.push(ControlFrame {
+                            "while" | "until" => self.controls.push(ControlFrame {
                                 kind: ControlKind::Loop,
                                 case_phase: CasePhase::Header,
                                 case_header_word_seen: false,
+                                for_phase: None,
+                            }),
+                            "for" => self.controls.push(ControlFrame {
+                                kind: ControlKind::Loop,
+                                case_phase: CasePhase::Header,
+                                case_header_word_seen: false,
+                                for_phase: Some(ForPhase::Variable),
                             }),
                             "case" => self.controls.push(ControlFrame {
                                 kind: ControlKind::Case,
                                 case_phase: CasePhase::Header,
                                 case_header_word_seen: false,
+                                for_phase: None,
                             }),
                             _ => {}
                         }

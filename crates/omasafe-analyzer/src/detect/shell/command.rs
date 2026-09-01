@@ -85,7 +85,7 @@ pub(in crate::detect) fn env_split_string_command(
             ShellToken::Operator(_) => return None,
             ShellToken::Word { value: word, .. } => {
                 let word = word.as_str();
-                if is_env_assignment(word) {
+                if segment[index].assignment_word().is_some() {
                     index += 1;
                 } else if word == "-S" || word == "--split-string" {
                     index += 1;
@@ -120,16 +120,6 @@ pub(in crate::detect) fn env_split_string_command(
         args: words.collect(),
         arg_dynamic: Vec::new(),
     })
-}
-
-pub(in crate::detect) fn is_env_assignment(token: &str) -> bool {
-    let Some(equals) = token.find('=') else {
-        return false;
-    };
-    equals > 0
-        && token[..equals]
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 /// Argument word values of the command heading at `start`, each with its
@@ -175,7 +165,9 @@ pub(in crate::detect) fn is_redirect_operator(op: &str) -> bool {
 pub(in crate::detect) fn skip_command_prefixes(segment: &[ShellToken], index: &mut usize) {
     while let Some(token) = segment.get(*index) {
         match token {
-            ShellToken::Word { value, .. } if value == "!" || is_env_assignment(value) => {
+            ShellToken::Word { .. }
+                if token.syntax_word() == Some("!") || token.assignment_word().is_some() =>
+            {
                 *index += 1;
             }
             ShellToken::Operator(op) if op == "(" || op == "{" => *index += 1,
@@ -213,7 +205,7 @@ pub(in crate::detect) fn skip_wrapper_options(
             ShellToken::Operator(_) => return false,
             ShellToken::Word { value, .. } => {
                 let token = value.as_str();
-                if is_env_assignment(token) {
+                if segment[*index].assignment_word().is_some() {
                     *index += 1;
                 } else if token == "--" {
                     *index += 1;
@@ -432,7 +424,10 @@ pub(in crate::detect) fn compound_position(
                     return None;
                 }
             }
-            ShellToken::Word { value, .. } if value == "!" || is_env_assignment(value) => {
+            ShellToken::Word { .. }
+                if segment[index].syntax_word() == Some("!")
+                    || segment[index].assignment_word().is_some() =>
+            {
                 index += 1;
             }
             _ => return None,

