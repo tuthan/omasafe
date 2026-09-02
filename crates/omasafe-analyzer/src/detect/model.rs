@@ -114,6 +114,31 @@ pub(in crate::detect) const SHARED_TEMP_INDICATOR_RULE: &str = "oma.script.privi
 pub(in crate::detect) const SHARED_TEMP_CONTROLLED_RULE: &str =
     "oma.script.privileged-shared-temp-controlled";
 pub(in crate::detect) const REPLACES_BAR_RULE: &str = "oma.context.replaces-bar";
+pub(in crate::detect) const BUNDLED_BINARY_RULE: &str = "oma.payload.bundled-binary";
+pub(in crate::detect) const OMASAFE_STATE_TAMPER_RULE: &str = "oma.context.omasafe-state-tamper";
+pub(in crate::detect) const SENSITIVE_PATH_RULE_QML: &str = "oma.qml.sensitive-path";
+pub(in crate::detect) const INPUT_INJECTION_RULE_QML: &str = "oma.qml.input-injection";
+pub(in crate::detect) const SCREEN_CAPTURE_RULE_QML: &str = "oma.qml.screen-capture";
+pub(in crate::detect) const SENSITIVE_DATA_EGRESS_RULE_QML: &str = "oma.qml.sensitive-data-egress";
+pub(in crate::detect) const INPUT_INJECTION_BACKGROUND_RULE_QML: &str =
+    "oma.qml.input-injection-background";
+pub(in crate::detect) const SCREEN_CAPTURE_BACKGROUND_RULE_QML: &str =
+    "oma.qml.screen-capture-background";
+pub(in crate::detect) const PERSISTENCE_BACKGROUND_RULE_QML: &str =
+    "oma.qml.persistence-background";
+pub(in crate::detect) const SENSITIVE_PATH_RULE_SCRIPT: &str = "oma.script.sensitive-path";
+pub(in crate::detect) const INPUT_INJECTION_RULE_SCRIPT: &str = "oma.script.input-injection";
+pub(in crate::detect) const SCREEN_CAPTURE_RULE_SCRIPT: &str = "oma.script.screen-capture";
+pub(in crate::detect) const CLIPBOARD_RULE_SCRIPT: &str = "oma.script.clipboard-access";
+pub(in crate::detect) const PERSISTENCE_RULE_SCRIPT: &str = "oma.script.persistence-scheduling";
+pub(in crate::detect) const SENSITIVE_DATA_EGRESS_RULE_SCRIPT: &str =
+    "oma.script.sensitive-data-egress";
+pub(in crate::detect) const INPUT_INJECTION_BACKGROUND_RULE_SCRIPT: &str =
+    "oma.script.input-injection-background";
+pub(in crate::detect) const SCREEN_CAPTURE_BACKGROUND_RULE_SCRIPT: &str =
+    "oma.script.screen-capture-background";
+pub(in crate::detect) const PERSISTENCE_BACKGROUND_RULE_SCRIPT: &str =
+    "oma.script.persistence-background";
 
 pub(in crate::detect) fn parts(
     rule_id: &'static str,
@@ -135,10 +160,8 @@ pub(in crate::detect) fn occurrence(
     line: u32,
     detail: &str,
 ) -> CapabilityOccurrence {
-    // Script-language capability context has no dedicated catalog rule yet;
-    // attributing it to QML rules would produce misleading guidance.
     let covering_rule = if matches!(language, Language::Shell | Language::Python) {
-        None
+        script_capability_covering_rule(capability)
     } else {
         capability_covering_rule(capability)
     }
@@ -162,6 +185,17 @@ pub(in crate::detect) fn occurrence(
     }
 }
 
+fn script_capability_covering_rule(capability: Capability) -> Option<&'static str> {
+    match capability {
+        Capability::SensitivePath => Some(SENSITIVE_PATH_RULE_SCRIPT),
+        Capability::InputInjection => Some(INPUT_INJECTION_RULE_SCRIPT),
+        Capability::ScreenCapture => Some(SCREEN_CAPTURE_RULE_SCRIPT),
+        Capability::ClipboardAccess => Some(CLIPBOARD_RULE_SCRIPT),
+        Capability::PersistenceScheduling => Some(PERSISTENCE_RULE_SCRIPT),
+        _ => None,
+    }
+}
+
 pub(in crate::detect) fn capability_covering_rule(capability: Capability) -> Option<&'static str> {
     match capability {
         Capability::ProcessExecution => Some("oma.qml.process-execution"),
@@ -175,6 +209,11 @@ pub(in crate::detect) fn capability_covering_rule(capability: Capability) -> Opt
         Capability::SessionLockSurface => Some("oma.qml.session-lock"),
         Capability::PamAuthentication => Some("oma.qml.pam-authentication"),
         Capability::DynamicCodeExecution => Some(DYNAMIC_CODE_RULE),
+        Capability::ShellIpcInventory => Some("oma.shell.ipc-injected-objects"),
+        Capability::BundledBinary => Some("oma.payload.bundled-binary"),
+        Capability::SensitivePath => Some(SENSITIVE_PATH_RULE_QML),
+        Capability::InputInjection => Some(INPUT_INJECTION_RULE_QML),
+        Capability::ScreenCapture => Some(SCREEN_CAPTURE_RULE_QML),
         _ => None,
     }
 }
@@ -313,5 +352,20 @@ pub(in crate::detect) fn disclose_budget_limitation(outcome: &mut FileOutcome) {
         .any(|existing| existing == limitation)
     {
         outcome.limitations.push(limitation.to_owned());
+    }
+}
+
+/// Record a bounded QML/JS dataflow limitation once per file. Dataflow is
+/// deliberately conservative: an exhausted bound is visible partial
+/// coverage, never a clean result.
+#[cfg(feature = "qml-parser")]
+pub(in crate::detect) fn disclose_dataflow_limitation(outcome: &mut FileOutcome, kind: &str) {
+    let limitation = format!("dataflow-{kind}");
+    if !outcome
+        .limitations
+        .iter()
+        .any(|existing| existing == &limitation)
+    {
+        outcome.limitations.push(limitation);
     }
 }

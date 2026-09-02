@@ -1,2 +1,4 @@
 /target/
 /release-reports/
+__pycache__/
+*.py[cod]

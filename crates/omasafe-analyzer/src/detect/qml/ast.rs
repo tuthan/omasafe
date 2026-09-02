@@ -4,10 +4,11 @@
 
 use crate::detect::model::{
     DETACHED_RULE, DYNAMIC_CODE_RULE, DYNAMIC_REFERENCE_RULE, FileOutcome, OBFUSCATION_RULE,
-    PERSISTENCE_RULE, PROCESS_RULE, SinkKind, disclose_budget_limitation, occurrence, parts,
+    PERSISTENCE_RULE, PROCESS_RULE, SinkKind, disclose_budget_limitation,
+    disclose_dataflow_limitation, occurrence, parts,
 };
 use crate::detect::qml::lexical::{
-    LexFlags, argv_head_fetches, encoded_literal_length, find_shell_interpreter,
+    argv_head_fetches, encoded_literal_length, find_shell_interpreter,
 };
 use crate::detect::references::{
     ReferenceCandidate, SinkPosition, apply_directory_import, is_path_shaped, record_sink_reference,
@@ -15,6 +16,7 @@ use crate::detect::references::{
 use crate::fingerprint::Confidence;
 use crate::rules::{Capability, Language};
 
+use super::dataflow::{DataflowFacts, FlowValue};
 use super::strings::decode_js_escapes;
 
 /// Module name of an `import X.Y <version>` statement (keyword/version/as
@@ -123,7 +125,7 @@ fn apply_surface_token(
     }
 }
 
-/// Classified value of a binding or call argument.
+/// Classified value of a binding or call argument after bounded dataflow.
 enum Value {
     Static(String),
     Dynamic(&'static str),
@@ -138,10 +140,7 @@ pub(super) fn scan(source: &str, tree: &tree_sitter::Tree) -> FileOutcome {
         confidence: Confidence::AstBacked,
         limitations: Vec::new(),
     };
-    let mut flags = LexFlags {
-        detached_any: None,
-        network: None,
-    };
+    let mut dataflow = DataflowFacts::build(source, tree);
 
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
@@ -167,7 +166,7 @@ pub(super) fn scan(source: &str, tree: &tree_sitter::Tree) -> FileOutcome {
                 }
             }
             "ui_object_definition" => {
-                handle_object_definition(source, node, &mut outcome);
+                handle_object_definition(source, node, &mut outcome, &mut dataflow);
                 // Loader { source: <expr> }: computed sources are
                 // dynamic reference sinks. Qualified spellings
                 // (`QQ.Loader`) resolve through the terminal type
@@ -177,36 +176,17 @@ pub(super) fn scan(source: &str, tree: &tree_sitter::Tree) -> FileOutcome {
                 });
                 if is_loader && binding_value_named(source, node, "source").is_some() {
                     let binding = binding_value_named(source, node, "source").unwrap();
-                    {
-                        match classify_value(source, binding) {
-                            Value::Static(text) => {
-                                record_sink_reference(
-                                    &text,
-                                    SinkPosition::LoaderSource,
-                                    number_of(binding),
-                                    &mut outcome,
-                                );
-                            }
-                            Value::Dynamic(_) => {
-                                outcome.result_parts.push(parts(
-                                    DYNAMIC_REFERENCE_RULE,
-                                    number_of(binding),
-                                    format!(
-                                        "dynamic-reference-sink:Loader.source:{}",
-                                        node_text(source, unwrap_expression_statement(binding))
-                                            .chars()
-                                            .take(120)
-                                            .collect::<String>()
-                                    ),
-                                    Confidence::AstBacked,
-                                ));
-                            }
-                        }
-                    }
+                    handle_reference_sink_value(
+                        source,
+                        binding,
+                        SinkPosition::LoaderSource,
+                        &mut outcome,
+                        &mut dataflow,
+                    );
                 }
             }
             "call_expression" => {
-                handle_call_expression(source, node, &mut outcome, &mut flags);
+                handle_call_expression(source, node, &mut outcome, &mut dataflow);
             }
             "identifier" | "property_identifier" => {
                 let token_line = number_of(node);
@@ -246,7 +226,6 @@ pub(super) fn scan(source: &str, tree: &tree_sitter::Tree) -> FileOutcome {
                 if node.child_count() >= 2
                     && node_text(source, node.child(1).unwrap()) == "XMLHttpRequest"
                 {
-                    flags.network.get_or_insert(number_of(node));
                     outcome.capabilities.push(occurrence(
                         Capability::NetworkAccess,
                         Language::Qml,
@@ -256,7 +235,6 @@ pub(super) fn scan(source: &str, tree: &tree_sitter::Tree) -> FileOutcome {
                 } else if node.child_count() >= 2
                     && node_text(source, node.child(1).unwrap()) == "WebSocket"
                 {
-                    flags.network.get_or_insert(number_of(node));
                     outcome.capabilities.push(occurrence(
                         Capability::NetworkAccess,
                         Language::Qml,
@@ -273,6 +251,10 @@ pub(super) fn scan(source: &str, tree: &tree_sitter::Tree) -> FileOutcome {
 
     // Literal references: path-shaped strings in reference positions.
     collect_ast_references(source, tree, &mut outcome.references);
+
+    for kind in dataflow.limitations() {
+        disclose_dataflow_limitation(&mut outcome, kind);
+    }
 
     outcome
 }
@@ -305,7 +287,12 @@ fn terminal_segment(type_text: &str) -> &str {
     type_text.rsplit('.').next().unwrap_or(type_text)
 }
 
-fn handle_object_definition(source: &str, node: tree_sitter::Node, outcome: &mut FileOutcome) {
+fn handle_object_definition(
+    source: &str,
+    node: tree_sitter::Node,
+    outcome: &mut FileOutcome,
+    dataflow: &mut DataflowFacts,
+) {
     let Some(type_node) = object_type_node(source, node) else {
         return;
     };
@@ -320,7 +307,13 @@ fn handle_object_definition(source: &str, node: tree_sitter::Node, outcome: &mut
                 type_name,
             ));
             if let Some(binding_value) = binding_value(source, node, "command") {
-                evaluate_execution_value(source, binding_value, SinkKind::Process, outcome);
+                evaluate_execution_value(
+                    source,
+                    binding_value,
+                    SinkKind::Process,
+                    outcome,
+                    dataflow,
+                );
                 // Command argv is a verified sink position (H2): literal
                 // arguments outside the tree surface typed rejections;
                 // in-tree literals resolve as invocation edges.
@@ -329,6 +322,7 @@ fn handle_object_definition(source: &str, node: tree_sitter::Node, outcome: &mut
                     binding_value,
                     SinkPosition::ProcessCommand,
                     outcome,
+                    dataflow,
                 );
             }
         }
@@ -341,48 +335,32 @@ fn handle_object_definition(source: &str, node: tree_sitter::Node, outcome: &mut
             ));
             if let Some(path_value) = binding_value(source, node, "path") {
                 let unwrapped = unwrap_expression_statement(path_value);
-                match classify_value(source, path_value) {
-                    Value::Static(text) => {
-                        // Persistence locations: writing toward autostart
-                        // or user-systemd units is a context finding.
-                        if text.contains("autostart")
-                            || text.contains("systemd/user")
-                            || text.contains(".config/systemd")
-                        {
-                            outcome.result_parts.push(parts(
-                                PERSISTENCE_RULE,
-                                number_of(unwrapped),
-                                format!("persistence-location:{text}"),
-                                Confidence::AstBacked,
-                            ));
-                        }
-                        // FileView.path is a verified sink position (H2):
-                        // the path participates in reference resolution
-                        // with typed rejections, never load-sink findings.
-                        handle_reference_sink_value(
-                            source,
-                            path_value,
-                            SinkPosition::FileViewPath,
-                            outcome,
-                        );
-                    }
-                    Value::Dynamic(_) => {
-                        // Computed reference sink: explicit low-confidence
-                        // finding per the S3 exit criterion.
+                if let Value::Static(text) = classify_value(source, path_value, dataflow) {
+                    // Persistence locations: writing toward autostart
+                    // or user-systemd units is a context finding.
+                    if text.contains("autostart")
+                        || text.contains("systemd/user")
+                        || text.contains(".config/systemd")
+                    {
                         outcome.result_parts.push(parts(
-                            DYNAMIC_REFERENCE_RULE,
+                            PERSISTENCE_RULE,
                             number_of(unwrapped),
-                            format!(
-                                "dynamic-reference-sink:FileView.path:{}",
-                                node_text(source, unwrapped)
-                                    .chars()
-                                    .take(120)
-                                    .collect::<String>()
-                            ),
+                            format!("persistence-location:{text}"),
                             Confidence::AstBacked,
                         ));
                     }
                 }
+                // FileView.path is a verified sink position (H2): the path
+                // participates in reference resolution with typed
+                // rejections; computed values stay explicit as dynamic,
+                // tainted-reference findings.
+                handle_reference_sink_value(
+                    source,
+                    path_value,
+                    SinkPosition::FileViewPath,
+                    outcome,
+                    dataflow,
+                );
             }
         }
         "Timer" => {
@@ -435,11 +413,14 @@ fn binding_value_named<'a>(
     None
 }
 
-/// Process argv elements at runtime-value granularity (H3 review):
-/// static-shaped elements contribute their text; computed elements
-/// contribute nothing — an unknown position is never guessed at, which
-/// leaves dynamic-head egress to the H4 dataflow slice.
-fn argv_elements(source: &str, value: tree_sitter::Node) -> Vec<String> {
+/// Process argv elements at runtime-value granularity (H3/H4): static-shaped
+/// elements contribute their text; dataflow-resolved identifiers do too, and
+/// unknown positions stay empty so a dynamic head is never guessed at.
+fn argv_elements(
+    source: &str,
+    value: tree_sitter::Node,
+    dataflow: &mut DataflowFacts,
+) -> Vec<String> {
     let inner = unwrap_expression_statement(value);
     match inner.kind() {
         "array" => {
@@ -447,62 +428,25 @@ fn argv_elements(source: &str, value: tree_sitter::Node) -> Vec<String> {
             inner
                 .children(&mut cursor)
                 .filter(|child| child.is_named())
-                .map(|child| match classify_value(source, child) {
+                .map(|child| match classify_value(source, child, dataflow) {
                     Value::Static(text) => text,
                     Value::Dynamic(_) => String::new(),
                 })
                 .collect()
         }
-        _ => match classify_value(source, inner) {
+        _ => match classify_value(source, inner, dataflow) {
             Value::Static(text) => text.split_whitespace().map(str::to_owned).collect(),
             Value::Dynamic(_) => Vec::new(),
         },
     }
 }
 
-fn classify_value(source: &str, node: tree_sitter::Node) -> Value {
-    let inner = unwrap_expression_statement(node);
-    match inner.kind() {
-        "string" => Value::Static(string_literal_content(source, inner)),
-        "template_string" => {
-            let mut cursor = inner.walk();
-            let has_substitution = inner
-                .children(&mut cursor)
-                .any(|child| child.kind() == "template_substitution");
-            if has_substitution {
-                Value::Dynamic("dynamic-command")
-            } else {
-                Value::Static(template_plain_content(source, inner))
-            }
-        }
-        "array" => {
-            let mut elements = Vec::new();
-            let mut cursor = inner.walk();
-            for child in inner.children(&mut cursor) {
-                if matches!(child.kind(), "[" | "]" | "," | ";" | "\"" | "'") {
-                    continue;
-                }
-                match classify_value(source, child) {
-                    Value::Static(text) => elements.push(text),
-                    Value::Dynamic(reason) => return Value::Dynamic(reason),
-                }
-            }
-            Value::Static(elements.join(" "))
-        }
-        _ => {
-            // Provenance marker: does this expression read network
-            // response data? Checked over the raw slice so any nesting
-            // depth counts.
-            let text = node_text(source, inner);
-            if text.contains("responseText")
-                || text.contains(".response")
-                || text.contains(".text(")
-            {
-                Value::Dynamic("network-response-executed")
-            } else {
-                Value::Dynamic("dynamic-command")
-            }
-        }
+fn classify_value(source: &str, node: tree_sitter::Node, dataflow: &mut DataflowFacts) -> Value {
+    match dataflow.classify(source, node) {
+        FlowValue::Static(text) => Value::Static(text),
+        FlowValue::Network => Value::Dynamic("network-response-executed"),
+        FlowValue::UserInput => Value::Dynamic("user-input-executed"),
+        FlowValue::Dynamic | FlowValue::Unknown => Value::Dynamic("dynamic-command"),
     }
 }
 
@@ -569,7 +513,7 @@ fn handle_call_expression(
     source: &str,
     node: tree_sitter::Node,
     outcome: &mut FileOutcome,
-    flags: &mut LexFlags,
+    dataflow: &mut DataflowFacts,
 ) {
     let mut cursor = node.walk();
     let children: Vec<tree_sitter::Node> = node.children(&mut cursor).collect();
@@ -634,7 +578,7 @@ fn handle_call_expression(
                 .filter(|child| child.is_named())
                 .collect();
             if let Some(first) = args.first().copied() {
-                handle_reference_sink_value(source, first, sink, outcome);
+                handle_reference_sink_value(source, first, sink, outcome, dataflow);
             }
         }
     }
@@ -665,7 +609,6 @@ fn handle_call_expression(
             _ => false,
         };
         if fetch_call {
-            flags.network.get_or_insert(number_of(node));
             outcome.capabilities.push(occurrence(
                 Capability::NetworkAccess,
                 Language::Qml,
@@ -675,7 +618,6 @@ fn handle_call_expression(
         }
         return;
     }
-    flags.detached_any.get_or_insert(number_of(node));
     outcome.capabilities.push(occurrence(
         Capability::DetachedProcessExecution,
         Language::Qml,
@@ -694,11 +636,23 @@ fn handle_call_expression(
             .filter(|child| child.is_named())
             .collect();
         if let Some(first) = args.first().copied() {
-            evaluate_execution_value(source, first, SinkKind::DetachedExecution, outcome);
+            evaluate_execution_value(
+                source,
+                first,
+                SinkKind::DetachedExecution,
+                outcome,
+                dataflow,
+            );
             // The executed path is also a reference sink (H2): a literal
             // outside the tree is a typed rejection, a literal inside it
             // resolves as an invocation edge.
-            handle_reference_sink_value(source, first, SinkPosition::ExecDetached, outcome);
+            handle_reference_sink_value(
+                source,
+                first,
+                SinkPosition::ExecDetached,
+                outcome,
+                dataflow,
+            );
         }
     }
 }
@@ -708,6 +662,7 @@ fn evaluate_execution_value(
     value_node: tree_sitter::Node,
     kind: SinkKind,
     outcome: &mut FileOutcome,
+    dataflow: &mut DataflowFacts,
 ) {
     let number = number_of(value_node);
     let rule_id = match kind {
@@ -717,7 +672,7 @@ fn evaluate_execution_value(
     // Egress attribution (H3 review): only the executable position
     // attributes egress. See argv_head_fetches.
     if kind == SinkKind::Process {
-        let elements = argv_elements(source, value_node);
+        let elements = argv_elements(source, value_node, dataflow);
         let borrowed: Vec<&str> = elements.iter().map(String::as_str).collect();
         let head = argv_head_fetches(&borrowed);
         if head.fetches {
@@ -732,7 +687,7 @@ fn evaluate_execution_value(
             disclose_budget_limitation(outcome);
         }
     }
-    match classify_value(source, value_node) {
+    match classify_value(source, value_node, dataflow) {
         Value::Static(text) => {
             if let Some(shell_offset) = find_shell_interpreter(&text) {
                 outcome.result_parts.push(parts(
@@ -773,40 +728,65 @@ fn handle_reference_sink_value(
     value: tree_sitter::Node,
     sink: SinkPosition,
     outcome: &mut FileOutcome,
+    dataflow: &mut DataflowFacts,
 ) {
     let inner = unwrap_expression_statement(value);
-    match inner.kind() {
-        "string" => record_sink_reference(
-            &string_literal_content(source, inner),
-            sink,
-            number_of(inner),
-            outcome,
-        ),
-        "template_string" => {
-            let mut cursor = inner.walk();
-            let substituted = inner
-                .children(&mut cursor)
-                .any(|child| child.kind() == "template_substitution");
-            if !substituted {
-                record_sink_reference(
-                    &template_plain_content(source, inner),
-                    sink,
-                    number_of(inner),
-                    outcome,
-                );
-            }
+    if inner.kind() == "array" {
+        let mut cursor = inner.walk();
+        let children: Vec<tree_sitter::Node> = inner
+            .children(&mut cursor)
+            .filter(|child| child.is_named())
+            .collect();
+        for child in children {
+            handle_reference_sink_value(source, child, sink, outcome, dataflow);
         }
-        "array" => {
-            let mut cursor = inner.walk();
-            let children: Vec<tree_sitter::Node> = inner
-                .children(&mut cursor)
-                .filter(|child| child.is_named())
-                .collect();
-            for child in children {
-                handle_reference_sink_value(source, child, sink, outcome);
-            }
+        return;
+    }
+    let flow = dataflow.classify(source, inner);
+    match flow {
+        FlowValue::Static(text) => record_sink_reference(&text, sink, number_of(inner), outcome),
+        flow @ (FlowValue::Network
+        | FlowValue::UserInput
+        | FlowValue::Dynamic
+        | FlowValue::Unknown)
+            if matches!(
+                sink,
+                SinkPosition::LoaderSource | SinkPosition::FileViewPath
+            ) =>
+        {
+            let reason = match flow {
+                FlowValue::Network => "network-input",
+                FlowValue::UserInput => "user-input",
+                FlowValue::Unknown => "coverage-unknown",
+                _ => "computed",
+            };
+            outcome.result_parts.push(parts(
+                DYNAMIC_REFERENCE_RULE,
+                number_of(inner),
+                format!(
+                    "dynamic-reference-sink:{}:{}:{}",
+                    sink_name(sink),
+                    reason,
+                    node_text(source, inner)
+                        .chars()
+                        .take(120)
+                        .collect::<String>()
+                ),
+                Confidence::AstBacked,
+            ));
         }
         _ => {}
+    }
+}
+
+fn sink_name(sink: SinkPosition) -> &'static str {
+    match sink {
+        SinkPosition::LoaderSource => "Loader.source",
+        SinkPosition::FileViewPath => "FileView.path",
+        SinkPosition::CreateComponent => "Qt.createComponent",
+        SinkPosition::Include => "Qt.include",
+        SinkPosition::ProcessCommand => "Process.command",
+        SinkPosition::ExecDetached => "execDetached",
     }
 }
 

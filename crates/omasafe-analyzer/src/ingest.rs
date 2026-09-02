@@ -171,6 +171,14 @@ impl Walker {
         let mut children: Vec<PathBuf> = Vec::new();
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
+            // Git metadata is repository state, not plugin payload. In
+            // particular, the stock *.sample hook files contain shell
+            // persistence examples that must not become findings. Installed
+            // repository identity and hook safety are audited separately by
+            // the CLI lifecycle path.
+            if entry.file_name() == ".git" {
+                continue;
+            }
             if children.len() >= child_cap || self.entries.len() >= child_cap {
                 self.note("directory_entry_limit_exceeded");
                 return Ok(());
@@ -877,4 +885,28 @@ fn run_git_capped_within(
         }));
     }
     Ok((captured.stdout, captured.truncated))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn git_metadata_is_not_ingested_as_plugin_payload() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".git/hooks")).unwrap();
+        fs::write(
+            root.path().join(".git/hooks/pre-rebase.sample"),
+            "echo persistence example\n",
+        )
+        .unwrap();
+        fs::write(root.path().join("Main.qml"), "Item {}\n").unwrap();
+
+        let inventory =
+            ingest_filesystem(root.path(), Limits::default(), TimeBudget::default()).unwrap();
+
+        assert_eq!(inventory.total_files_seen, 1);
+        assert_eq!(inventory.entries.len(), 1);
+        assert_eq!(inventory.entries[0].relative_path, "Main.qml");
+    }
 }

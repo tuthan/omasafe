@@ -69,7 +69,7 @@ mod tests {
     #[test]
     fn embedded_map_parses_and_records_v3() {
         let map = EquivalenceMap::embedded();
-        assert_eq!(map.map_version, "1");
+        assert_eq!(map.map_version, "2");
         assert_eq!(map.external_system, "omarchy-plugin-marketplace");
         assert_eq!(map.external_ruleset_version, "3");
         assert_eq!(map.verified_at_commit.len(), 40);

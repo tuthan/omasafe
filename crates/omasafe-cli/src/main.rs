@@ -4,6 +4,9 @@ use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use omasafe_core::{TOOL_VERSION, paths::XdgPaths};
 use omasafe_marketplace::{
     Correlation, MAX_CATALOG_BYTES, OFFICIAL_REPOSITORY, correlate, fetch_pinned_catalog,
@@ -12,12 +15,17 @@ use omasafe_marketplace::{
 use omasafe_plugin_trust::{
     DiffResult, SourceIdentity,
     baseline::{
-        ReviewDecision, ScanState, TrustHistory, TrustRecord, UpdateFlowRecord, lock as lock_state,
+        EnforcementHistory, OverrideHistory, ReviewDecision, ScanState, TrustHistory, TrustRecord,
+        UpdateFlowRecord, lock as lock_state,
     },
     collect, collect_one, git_diff, omarchy_bar_use_default, omarchy_plugin_disable,
     omarchy_plugin_enable, omarchy_plugin_update, query_shell, source_identity,
 };
 use omasafe_report::Report;
+use omasafe_report::enforcement::{
+    AuthorizationBasis, EnforcementAuditEvent, EnforcementEvaluation, EnforcementMode,
+    EnforcementOutcome, EnforcementPolicy, OVERRIDE_SCHEMA_VERSION, OverrideBinding,
+};
 use sha2::{Digest, Sha256};
 
 fn main() {
@@ -39,6 +47,11 @@ fn main() {
 /// need not distinguish; the specific signal is not otherwise meaningful to
 /// OmaSafe's flows.
 const INTERRUPTED_EXIT_CODE: i32 = 130;
+const SCHEDULE_SCHEMA_VERSION: &str = "omasafe.schedule.v1";
+const ENFORCEMENT_SUMMARY_SCHEMA_VERSION: &str = "omasafe.enforcement-summary.v1";
+const DEFAULT_SCAN_MEMORY_LIMIT_MB: u64 = 768;
+const SCHEDULE_PROCESS_BUDGET: Duration = Duration::from_secs(5);
+const SCHEDULE_PROCESS_OUTPUT_CAP: usize = 64 * 1024;
 
 fn interrupted(context: &str) -> Box<dyn std::error::Error> {
     format!("interrupted: {context}").into()
@@ -143,6 +156,28 @@ fn run(args: Vec<String>) -> Result<i32, Box<dyn std::error::Error>> {
             review_update(id, rest)?;
             0
         }
+        [command, subcommand, id, rest @ ..] if command == "plugins" && subcommand == "enable" => {
+            plugins_enable(id, rest)?;
+            0
+        }
+        [command, subcommand, id, rest @ ..]
+            if command == "plugins" && subcommand == "enforcement-status" =>
+        {
+            enforcement_status(id, rest)?;
+            0
+        }
+        [command, subcommand, action, id, rest @ ..]
+            if command == "plugins" && subcommand == "override" && action == "create" =>
+        {
+            override_create(id, rest)?;
+            0
+        }
+        [command, subcommand, action, rest @ ..]
+            if command == "plugins" && subcommand == "override" && action == "list" =>
+        {
+            override_list(rest)?;
+            0
+        }
         [command, subcommand, id, rest @ ..] if command == "plugins" && subcommand == "review" => {
             review(id, rest)?;
             0
@@ -165,12 +200,20 @@ fn run(args: Vec<String>) -> Result<i32, Box<dyn std::error::Error>> {
             schedule_install(rest)?;
             0
         }
+        [command, subcommand, rest @ ..] if command == "schedule" && subcommand == "status" => {
+            schedule_status(rest)?;
+            0
+        }
         [command, subcommand, rest @ ..] if command == "marketplace" && subcommand == "refresh" => {
             marketplace_refresh(rest)?;
             0
         }
         [command, subcommand, rest @ ..] if command == "rules" && subcommand == "list" => {
             rules_list(rest)?;
+            0
+        }
+        [command, subcommand, rest @ ..] if command == "rules" && subcommand == "coverage" => {
+            rules_coverage(rest)?;
             0
         }
         [command, subcommand, id, rest @ ..] if command == "rules" && subcommand == "explain" => {
@@ -183,7 +226,7 @@ fn run(args: Vec<String>) -> Result<i32, Box<dyn std::error::Error>> {
         [command, rest @ ..] if command == "scan-plugin" => scan_plugin(rest)?,
         _ => {
             eprintln!(
-                "usage: omasafe-cli plugins ... | scan [--format text|json] [--notify] [--only-new] | marketplace refresh [--commit COMMIT|--latest] | rules list [--format text|json] | rules explain RULE_ID [--format text|json] | plugins analyze PLUGIN_ID [--format text|json] [--fail-on SEVERITY] | plugins review-update PLUGIN_ID [--expected-commit SHA] [--yes] | scan-plugin (--path DIR|--git URL --revision COMMIT) [--format text|json] | schedule install | paths | provenance [--format text|json]"
+                "usage: omasafe-cli plugins ... | scan [--format text|json] [--notify] [--only-new] | marketplace refresh [--commit COMMIT|--latest] | rules list [--format text|json] | rules coverage [--format text|json] | rules explain RULE_ID [--format text|json] | plugins analyze PLUGIN_ID [--format text|json] [--fail-on SEVERITY] | plugins enable PLUGIN_ID [--policy advisory|hardened] [--format text|json] | plugins review-update PLUGIN_ID [--expected-commit SHA] [--yes] [--policy advisory|hardened] | plugins enforcement-status PLUGIN_ID [--format text|json] | plugins override create PLUGIN_ID --rule RULE_ID [--rule RULE_ID ...] --commit SHA --reason TEXT --expires TIMESTAMP | plugins override list [--format text|json] | scan-plugin (--path DIR|--git URL --revision COMMIT) [--format text|json] | schedule install [--policy advisory|hardened] | schedule status [--format text|json] | paths | provenance [--format text|json]"
             );
             std::process::exit(2);
         }
@@ -952,6 +995,7 @@ fn random_u64() -> u64 {
 fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut yes = false;
     let mut expected_commit: Option<String> = None;
+    let mut policy_mode = EnforcementMode::Advisory;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -968,6 +1012,13 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
                     .into());
                 }
                 expected_commit = Some(value.to_owned());
+                index += 2;
+            }
+            "--policy" => {
+                let value = next_value(args, index, "policy")?;
+                policy_mode = value
+                    .parse::<EnforcementMode>()
+                    .map_err(|error| format!("invalid --policy value: {error}"))?;
                 index += 2;
             }
             value => return Err(format!("unknown review-update argument: {value}").into()),
@@ -1052,7 +1103,14 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
 
     // --- Pre-flight: refuse before anything mutates ---
     let plugin_root = plugin_root()?;
-    let (shell_json, _shell_error) = query_shell();
+    let (shell_json, shell_error) = query_shell();
+    if shell_json.is_none() {
+        return Err(format!(
+            "refusing: cannot verify the pre-update Omarchy plugin inventory ({})",
+            shell_error.unwrap_or_else(|| "unknown shell inventory error".into())
+        )
+        .into());
+    }
     let inventory = collect_one(&plugin_root, id, shell_json.as_deref());
     let record = inventory
         .plugins
@@ -1072,6 +1130,12 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
                 .into(),
         );
     }
+    if record.enabled.is_none() {
+        return Err(
+            "refusing: installed plugin enabled state is unavailable, so safe quiescing cannot be guaranteed"
+                .into(),
+        );
+    }
 
     let history_path = paths.state.join("trust-history.json");
     let _history_lock = lock_state(&history_path)?;
@@ -1085,7 +1149,7 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
     let full_bar_active = record.active == Some(true)
         && record.kinds.iter().any(|kind| kind == "bar")
         || inventory.active_full_bars.iter().any(|bar| bar == id);
-    let was_enabled = record.enabled.unwrap_or(false);
+    let was_enabled = record.enabled == Some(true);
 
     // --- Candidate resolution: exact commit or explicit pin, never HEAD-text ---
     let url = record
@@ -1145,8 +1209,13 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
     let baseline_head_available = baseline
         .head
         .as_deref()
-        .filter(|head| *head != candidate)
-        .map(|head| omasafe_analyzer::ensure_pinned_repository(&cache_root, &url, head).is_ok())
+        .map(|head| {
+            // When the trusted baseline is the exact candidate, the candidate
+            // fetch already proves the object needed for a zero-line diff.
+            // Otherwise require the trusted object to be fetched separately.
+            head == candidate
+                || omasafe_analyzer::ensure_pinned_repository(&cache_root, &url, head).is_ok()
+        })
         .unwrap_or(false);
 
     // Materialize a working tree for validation + filesystem analysis.
@@ -1220,6 +1289,9 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
     );
     let mut candidate_inventory =
         ingest.map_err(|error| format!("candidate analysis failed: {error}"))?;
+    candidate_inventory
+        .entries
+        .retain(|entry| entry.relative_path != ".git" && !entry.relative_path.starts_with(".git/"));
     let reader = pinned_filesystem_reader(checkout.0.clone());
     let budget = omasafe_core::bounds::TimeBudget::default();
     let artifacts = omasafe_analyzer::analyze_inventory(&mut candidate_inventory, &reader, &budget);
@@ -1262,7 +1334,138 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
         Some(candidate.clone()),
         tree.clone(),
     );
+    candidate_coverage.extend(candidate_identity.limitations.iter().cloned());
+    let diff = if baseline_head_available {
+        let head = baseline.head.clone().unwrap_or_default();
+        git_diff(&checkout.0, &head, &candidate)
+    } else {
+        DiffResult {
+            available: false,
+            text: None,
+            truncated: false,
+            limitation: Some("trusted HEAD could not be fetched into the cache".to_owned()),
+        }
+    };
+    let mut enforcement_coverage = candidate_coverage.clone();
+    if !diff.available {
+        // The source diff is part of the hardened review evidence. A
+        // candidate analysis without the trusted side is incomplete, even
+        // when the candidate itself analyzed cleanly.
+        enforcement_coverage.push("trusted-baseline-diff-unavailable".to_owned());
+    }
+    enforcement_coverage.sort();
+    enforcement_coverage.dedup();
 
+    // H8a pre-mutation policy evaluation. The candidate is not yet installed,
+    // so installed-tree postconditions are checked again after native update;
+    // this first decision only prevents a hardened review from reaching the
+    // mutation/approval path with already-known precision-independent blockers.
+    let mut coverage_count_map = std::collections::BTreeMap::new();
+    for entry in &candidate_inventory.entries {
+        let state = entry.coverage_state.as_str().to_owned();
+        *coverage_count_map.entry(state).or_insert(0usize) += 1;
+    }
+    let unsupported_executable_paths: Vec<String> = candidate_inventory
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.executable && entry.coverage_state == omasafe_analyzer::CoverageState::Unsupported
+        })
+        .map(|entry| entry.relative_path.clone())
+        .collect();
+    let enforcement_policy = EnforcementPolicy::new(policy_mode);
+    let candidate_facts = EnforcementFacts {
+        identity: candidate_identity.clone(),
+        coverage_counts: coverage_count_map.clone(),
+        coverage_limitations: enforcement_coverage.clone(),
+        unsupported_executable_paths: unsupported_executable_paths.clone(),
+        observed_rule_ids: finding_rule_ids.clone(),
+        analyzer_policy_identity: omasafe_analyzer::policy_identity(),
+    };
+    let (override_present, override_valid, override_binding) =
+        resolve_override(&paths, id, &enforcement_policy, &candidate_facts)?;
+    let enforcement_decision = enforcement_policy.evaluate(EnforcementEvaluation {
+        plugin_id: id.to_owned(),
+        operation: "review-update".to_owned(),
+        coverage_counts: coverage_count_map,
+        coverage_limitations: enforcement_coverage.clone(),
+        unsupported_executable_paths,
+        executable_digest_approved: false,
+        analyzer_identity_current: true,
+        enforcement_policy_identity_current: true,
+        // The installed-tree verification is a post-mutation condition and is
+        // evaluated again below before trust/re-enable. At preview time the
+        // candidate itself has not failed that condition.
+        installed_tree_postconditions_passed: true,
+        observed_rule_ids: finding_rule_ids.clone(),
+        commit: Some(candidate.clone()),
+        tree: tree.clone(),
+        content_digest: candidate_identity.content_digest.clone(),
+        analyzer_policy_identity: Some(candidate_facts.analyzer_policy_identity.clone()),
+        override_present,
+        override_valid,
+        override_binding: override_binding.clone(),
+        audit_event_id: format!("preview:{id}:{candidate}"),
+        evaluated_at: now(),
+        native_install_not_interposed: true,
+    });
+
+    // The preview is not the final lifecycle decision. Keep a second
+    // decision writer ready so every exit after native mutation records the
+    // installed-tree postcondition, including failed verification paths.
+    let persist_post_update_decision =
+        |passed: bool, phase: &str| -> Result<(), Box<dyn std::error::Error>> {
+            let decision = enforcement_policy.evaluate(EnforcementEvaluation {
+                plugin_id: id.to_owned(),
+                operation: "review-update".to_owned(),
+                coverage_counts: candidate_facts.coverage_counts.clone(),
+                coverage_limitations: candidate_facts.coverage_limitations.clone(),
+                unsupported_executable_paths: candidate_facts.unsupported_executable_paths.clone(),
+                executable_digest_approved: false,
+                analyzer_identity_current: true,
+                enforcement_policy_identity_current: true,
+                installed_tree_postconditions_passed: passed,
+                observed_rule_ids: candidate_facts.observed_rule_ids.clone(),
+                commit: Some(candidate.clone()),
+                tree: tree.clone(),
+                content_digest: candidate_identity.content_digest.clone(),
+                analyzer_policy_identity: Some(candidate_facts.analyzer_policy_identity.clone()),
+                override_present,
+                override_valid,
+                override_binding: override_binding.clone(),
+                audit_event_id: format!("post:{id}:{candidate}:{phase}"),
+                evaluated_at: now(),
+                native_install_not_interposed: true,
+            });
+            persist_enforcement_decision(&paths, &decision)
+        };
+    persist_enforcement_decision(&paths, &enforcement_decision)?;
+    println!(
+        "  enforcement: {} (policy identity {})",
+        enforcement_decision.outcome.as_str(),
+        enforcement_decision.enforcement_policy_identity
+    );
+    if !enforcement_decision.reason_codes.is_empty() {
+        println!(
+            "  enforcement reasons: {}",
+            enforcement_decision.reason_codes.join(", ")
+        );
+    }
+    if override_present {
+        persist_enforcement_audit_event(
+            &paths,
+            &override_audit_event(&enforcement_decision, false),
+        )?;
+    }
+    if policy_mode == EnforcementMode::Hardened
+        && enforcement_decision.outcome == EnforcementOutcome::Block
+    {
+        return Err(format!(
+            "hardened policy blocked review-update before mutation: {}",
+            enforcement_decision.reason_codes.join(", ")
+        )
+        .into());
+    }
     interruption_checkpoint("after candidate evaluation")?;
 
     // --- Delta versus the trusted baseline ---
@@ -1290,18 +1493,6 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
     };
     let (added_rules, removed_rules) = set_delta(&finding_rule_ids, previous_rules);
     let (added_capabilities, removed_capabilities) = set_delta(&capability_kinds, previous_caps);
-
-    let diff = if baseline_head_available {
-        let head = baseline.head.clone().unwrap_or_default();
-        git_diff(&checkout.0, &head, &candidate)
-    } else {
-        DiffResult {
-            available: false,
-            text: None,
-            truncated: false,
-            limitation: Some("trusted HEAD could not be fetched into the cache".to_owned()),
-        }
-    };
 
     // --- Preview ---
     println!("Reviewed update preview for {id}");
@@ -1357,7 +1548,12 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
         );
         println!("{text}");
     } else {
-        println!("  source diff unavailable: trusted HEAD could not be fetched into the cache");
+        println!(
+            "  source diff unavailable: {}",
+            diff.limitation
+                .as_deref()
+                .unwrap_or("trusted baseline could not be compared with the candidate")
+        );
     }
     for limitation in candidate_inventory
         .limitations
@@ -1508,6 +1704,7 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
             let _ = fs::remove_file(&config_backup_path);
         }
         RestoreOutcome::Tampered => {
+            persist_post_update_decision(false, "git-config-tampered")?;
             // Original reinstalled, but the window was tampered with. Clear the
             // pointer (the target is restored), persist, then delete the backup
             // and refuse the update.
@@ -1526,6 +1723,7 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
             return Err("git configuration modified during the update window".into());
         }
         RestoreOutcome::RestoreFailed(error) => {
+            persist_post_update_decision(false, "git-config-restore-failed")?;
             // The original could NOT be reinstalled. KEEP the recovery pointer
             // and backup so the next run reconciles the target; do not delete
             // anything. Persist the failed record with its backup reference
@@ -1544,6 +1742,7 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
         }
     }
     if !outcome.success && omasafe_core::interrupt::raised() {
+        persist_post_update_decision(false, "native-update-interrupted")?;
         flow.phase = "failed".into();
         flow.store(&flow_path)?;
         eprintln!(
@@ -1555,6 +1754,7 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
         return Err(interrupted("during the native update"));
     }
     if !outcome.success {
+        persist_post_update_decision(false, "native-update-failed")?;
         flow.phase = "failed".into();
         flow.store(&flow_path)?;
         eprintln!("native updater failed:\n{}", outcome.output);
@@ -1572,6 +1772,7 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
 
     // --- Postconditions: exact HEAD + fresh rescan before anything goes live ---
     if omasafe_core::interrupt::raised() {
+        persist_post_update_decision(false, "interrupted-before-verification")?;
         flow.phase = "failed".into();
         flow.store(&flow_path)?;
         eprintln!(
@@ -1588,6 +1789,7 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
     let fresh_json = match fresh_shell_json {
         Some(json) => json,
         None => {
+            persist_post_update_decision(false, "rescan-unavailable")?;
             flow.phase = "failed".into();
             flow.store(&flow_path)?;
             eprintln!(
@@ -1600,6 +1802,7 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
     let updated = collect_one(&plugin_root, id, Some(fresh_json.as_str()));
     let updated_record = updated.plugins.iter().find(|plugin| plugin.id == id);
     let Some(updated_record) = updated_record else {
+        persist_post_update_decision(false, "plugin-missing-after-update")?;
         flow.phase = "failed".into();
         flow.store(&flow_path)?;
         eprintln!(
@@ -1609,6 +1812,7 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
         return Err("rescan verification failed after update".into());
     };
     if updated_record.head.as_deref() != Some(candidate.as_str()) {
+        persist_post_update_decision(false, "head-mismatch")?;
         flow.phase = "failed".into();
         flow.store(&flow_path)?;
         eprintln!(
@@ -1622,6 +1826,7 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
         return Err("installed HEAD does not match the reviewed commit".into());
     }
     if updated_record.dirty != Some(false) {
+        persist_post_update_decision(false, "worktree-not-clean")?;
         flow.phase = "failed".into();
         flow.store(&flow_path)?;
         if updated_record.dirty.is_none() {
@@ -1676,6 +1881,7 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
         installed_tree.clone(),
     );
     if !candidate_identity.limitations.is_empty() || !installed_identity.limitations.is_empty() {
+        persist_post_update_decision(false, "identity-coverage-incomplete")?;
         flow.phase = "failed".into();
         flow.store(&flow_path)?;
         eprintln!(
@@ -1710,6 +1916,7 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
     mismatched_files.sort();
     mismatched_files.dedup();
     if !mismatched_files.is_empty() {
+        persist_post_update_decision(false, "installed-bytes-mismatch")?;
         flow.phase = "failed".into();
         flow.store(&flow_path)?;
         eprintln!(
@@ -1726,6 +1933,7 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
         return Err("installed bytes differ from the reviewed candidate".into());
     }
     if installed_tree.as_deref() != tree.as_deref() {
+        persist_post_update_decision(false, "installed-tree-mismatch")?;
         flow.phase = "failed".into();
         flow.store(&flow_path)?;
         eprintln!(
@@ -1737,6 +1945,7 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
         return Err("installed tree does not match the reviewed candidate tree".into());
     }
     if let Err(failure) = audit_installed_git_state(&installed_dir, &url) {
+        persist_post_update_decision(false, "installed-git-audit-failed")?;
         flow.phase = "failed".into();
         flow.store(&flow_path)?;
         eprintln!(
@@ -1749,6 +1958,7 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
     let installed_policy: String =
         serde_json::to_string(&serde_json::to_value(omasafe_analyzer::policy_identity())?)?;
     if installed_policy != candidate_policy {
+        persist_post_update_decision(false, "analyzer-policy-mismatch")?;
         flow.phase = "failed".into();
         flow.store(&flow_path)?;
         eprintln!(
@@ -1766,6 +1976,7 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
     let mut installed_inventory = match installed_ingest {
         Ok(inventory) => inventory,
         Err(error) => {
+            persist_post_update_decision(false, "installed-analysis-failed")?;
             flow.phase = "failed".into();
             flow.store(&flow_path)?;
             eprintln!(
@@ -1775,6 +1986,9 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
             return Err("installed-tree analysis failed after update".into());
         }
     };
+    installed_inventory
+        .entries
+        .retain(|entry| entry.relative_path != ".git" && !entry.relative_path.starts_with(".git/"));
     let installed_reader = pinned_filesystem_reader(installed_dir.clone());
     let budget = omasafe_core::bounds::TimeBudget::default();
     let installed_artifacts =
@@ -1792,6 +2006,7 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
     installed_coverage.sort();
     installed_coverage.dedup();
     if installed_coverage != candidate_coverage {
+        persist_post_update_decision(false, "installed-coverage-mismatch")?;
         flow.phase = "failed".into();
         flow.store(&flow_path)?;
         eprintln!(
@@ -1803,6 +2018,7 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
         return Err("installed-tree coverage state differs from the approved candidate".into());
     }
     if installed_fingerprint != candidate_fingerprint {
+        persist_post_update_decision(false, "installed-analysis-mismatch")?;
         flow.phase = "failed".into();
         flow.store(&flow_path)?;
         eprintln!(
@@ -1814,6 +2030,11 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
             "installed-tree analysis fingerprint differs from the approved candidate".into(),
         );
     }
+
+    // Replace the preview as the latest status only after the installed tree
+    // has passed every postcondition. This is what enforcement-status must
+    // expose to consumers after a successful reviewed update.
+    persist_post_update_decision(true, "verified")?;
 
     if omasafe_core::interrupt::raised() {
         // Verified content is installed, but service restore and the trust
@@ -1832,6 +2053,7 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
     }
 
     // --- Restore availability, then trust the verified identity ---
+    let mut live_transition_completed = true;
     if full_bar_active || was_enabled {
         let enable_outcome = omarchy_plugin_enable(id);
         if !enable_outcome.success {
@@ -1846,6 +2068,7 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
                 );
                 return Err(interrupted("during re-enable"));
             }
+            live_transition_completed = false;
             eprintln!(
                 "warning: re-enabling failed ({}); the reviewed commit is installed but the plugin stays disabled.\nmanual step: omarchy plugin enable {id}",
                 enable_outcome.output
@@ -1861,12 +2084,492 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
     });
     history.write_atomic_locked(&history_path)?;
 
+    if enforcement_decision.authorization_basis == Some(AuthorizationBasis::Override) {
+        persist_enforcement_audit_event(
+            &paths,
+            &override_audit_event(&enforcement_decision, live_transition_completed),
+        )?;
+        if live_transition_completed {
+            notify_enforcement_transition(&enforcement_decision);
+        }
+    }
+
     let _ = std::fs::remove_file(&flow_path);
     let _ = std::fs::remove_file(&config_backup_path);
     println!(
         "Reviewed update complete: {id} is at reviewed commit {candidate}; trust baseline advanced."
     );
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct EnforcementFacts {
+    identity: SourceIdentity,
+    coverage_counts: std::collections::BTreeMap<String, usize>,
+    coverage_limitations: Vec<String>,
+    unsupported_executable_paths: Vec<String>,
+    observed_rule_ids: Vec<String>,
+    analyzer_policy_identity: omasafe_report::analysis::PolicyIdentity,
+}
+
+fn collect_enforcement_facts(
+    id: &str,
+    record: &omasafe_plugin_trust::PluginRecord,
+) -> Result<EnforcementFacts, Box<dyn std::error::Error>> {
+    let path = PathBuf::from(record.path.clone());
+    let identity = source_identity(
+        id,
+        &path,
+        record.repository.clone(),
+        record.head.clone(),
+        record.tree.clone(),
+    );
+    let mut inventory = omasafe_analyzer::ingest_filesystem(
+        &path,
+        omasafe_analyzer::Limits::default(),
+        omasafe_core::bounds::TimeBudget::default(),
+    )
+    .map_err(|error| format!("installed tree analysis failed: {error}"))?;
+    // Git metadata is identity/audit input, not plugin payload. Excluding it
+    // from the analyzer prevents bundled sample hooks and repository prose
+    // from becoming false coverage limitations or findings.
+    inventory
+        .entries
+        .retain(|entry| entry.relative_path != ".git" && !entry.relative_path.starts_with(".git/"));
+    let reader = pinned_filesystem_reader(path);
+    let budget = omasafe_core::bounds::TimeBudget::default();
+    let artifacts = omasafe_analyzer::analyze_inventory(&mut inventory, &reader, &budget);
+
+    let mut coverage_counts = std::collections::BTreeMap::new();
+    for entry in &inventory.entries {
+        let state = entry.coverage_state.as_str().to_owned();
+        *coverage_counts.entry(state).or_insert(0usize) += 1;
+    }
+    let unsupported_executable_paths = inventory
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.executable && entry.coverage_state == omasafe_analyzer::CoverageState::Unsupported
+        })
+        .map(|entry| entry.relative_path.clone())
+        .collect();
+    let observed_rule_ids = artifacts
+        .rendered_findings()
+        .into_iter()
+        .map(|finding| finding.rule_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut coverage_limitations = identity.limitations.clone();
+    coverage_limitations.extend(record.limitations.iter().cloned());
+    coverage_limitations.extend(inventory.limitations.iter().cloned());
+    coverage_limitations.extend(artifacts.limitations.iter().cloned());
+    coverage_limitations.sort();
+    coverage_limitations.dedup();
+
+    Ok(EnforcementFacts {
+        identity,
+        coverage_counts,
+        coverage_limitations,
+        unsupported_executable_paths,
+        observed_rule_ids,
+        analyzer_policy_identity: omasafe_analyzer::policy_identity(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_enable_decision(
+    policy: &EnforcementPolicy,
+    id: &str,
+    facts: &EnforcementFacts,
+    installed_tree_postconditions_passed: bool,
+    audit_event_id: String,
+    override_present: bool,
+    override_valid: bool,
+    override_binding: Option<OverrideBinding>,
+) -> omasafe_report::enforcement::EnforcementDecision {
+    policy.evaluate(EnforcementEvaluation {
+        plugin_id: id.to_owned(),
+        operation: "enable".to_owned(),
+        coverage_counts: facts.coverage_counts.clone(),
+        coverage_limitations: facts.coverage_limitations.clone(),
+        unsupported_executable_paths: facts.unsupported_executable_paths.clone(),
+        executable_digest_approved: false,
+        analyzer_identity_current: true,
+        enforcement_policy_identity_current: true,
+        installed_tree_postconditions_passed,
+        observed_rule_ids: facts.observed_rule_ids.clone(),
+        commit: facts.identity.head.clone(),
+        tree: facts.identity.tree.clone(),
+        content_digest: facts.identity.content_digest.clone(),
+        analyzer_policy_identity: Some(facts.analyzer_policy_identity.clone()),
+        override_present,
+        override_valid,
+        override_binding,
+        audit_event_id,
+        evaluated_at: now(),
+        native_install_not_interposed: true,
+    })
+}
+
+#[derive(Debug, serde::Serialize)]
+struct EnableResult {
+    plugin_id: String,
+    policy: String,
+    enabled: bool,
+    decision: omasafe_report::enforcement::EnforcementDecision,
+}
+
+fn print_enable_result(
+    format: &str,
+    result: EnableResult,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&Report::new(TOOL_VERSION, now(), result))?
+        );
+    } else {
+        println!(
+            "{}: {} (policy {}, outcome {})",
+            safe_text(&result.plugin_id),
+            if result.enabled {
+                "enabled"
+            } else {
+                "not enabled"
+            },
+            result.policy,
+            result.decision.outcome.as_str()
+        );
+        if !result.decision.reason_codes.is_empty() {
+            println!("Reasons: {}", result.decision.reason_codes.join(", "));
+        }
+    }
+    Ok(())
+}
+
+fn plugins_enable(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut policy_mode = EnforcementMode::Advisory;
+    let mut format = "text";
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--policy" => {
+                let value = next_value(args, index, "policy")?;
+                policy_mode = value
+                    .parse::<EnforcementMode>()
+                    .map_err(|error| format!("invalid --policy value: {error}"))?;
+                index += 2;
+            }
+            "--format" => {
+                format = next_value(args, index, "enable format")?;
+                index += 2;
+            }
+            value => return Err(format!("unknown enable argument: {value}").into()),
+        }
+    }
+    if !matches!(format, "text" | "json") {
+        return Err("enable format must be text or json".into());
+    }
+
+    interruption_checkpoint("before enable evaluation started")?;
+    let paths = XdgPaths::discover()?;
+    paths.ensure()?;
+    let plugin_root = plugin_root()?;
+    let (shell_json, shell_error) = query_shell();
+    if shell_json.is_none()
+        && let Some(error) = shell_error
+    {
+        return Err(
+            format!("refusing enable: cannot verify installed plugin state ({error})").into(),
+        );
+    }
+    let inventory = collect_one(&plugin_root, id, shell_json.as_deref());
+    let record = inventory
+        .plugins
+        .iter()
+        .find(|plugin| plugin.id == id)
+        .ok_or_else(|| format!("plugin not found: {id}"))?;
+
+    // A controlled enable gate only operates on an installed, inactive tree.
+    // First-install staging and native lifecycle calls outside OmaSafe remain
+    // outside this boundary and are detectable after the fact.
+    if record.enabled == Some(true) {
+        return Err(format!("plugin {id} is already enabled; nothing to do").into());
+    }
+    if record.enabled.is_none() || record.active != Some(false) {
+        return Err(
+            "refusing enable: installed plugin state is not provably inactive; inspect omarchy plugin list --json"
+                .into(),
+        );
+    }
+    let repository = record
+        .repository
+        .as_deref()
+        .ok_or("refusing enable: installed plugin origin is unavailable")?;
+    if !repository.starts_with("https://") {
+        return Err("refusing enable: installed plugin origin is not an HTTPS repository".into());
+    }
+    audit_installed_git_state(Path::new(&record.path), repository).map_err(|failure| {
+        format!("refusing enable: installed repository audit failed: {failure}")
+    })?;
+
+    let facts = collect_enforcement_facts(id, record)?;
+    let policy = EnforcementPolicy::new(policy_mode);
+    let (override_present, override_valid, override_binding) =
+        resolve_override(&paths, id, &policy, &facts)?;
+    let pre_decision = evaluate_enable_decision(
+        &policy,
+        id,
+        &facts,
+        true,
+        format!(
+            "enable:pre:{id}:{}",
+            facts.identity.head.as_deref().unwrap_or("unknown")
+        ),
+        override_present,
+        override_valid,
+        override_binding,
+    );
+    persist_enforcement_decision(&paths, &pre_decision)?;
+    if override_present {
+        persist_enforcement_audit_event(&paths, &override_audit_event(&pre_decision, false))?;
+    }
+    if policy_mode == EnforcementMode::Hardened && pre_decision.outcome == EnforcementOutcome::Block
+    {
+        print_enable_result(
+            format,
+            EnableResult {
+                plugin_id: id.to_owned(),
+                policy: policy_mode.as_str().to_owned(),
+                enabled: false,
+                decision: pre_decision.clone(),
+            },
+        )?;
+        return Err(format!(
+            "hardened policy blocked enable before mutation: {}",
+            pre_decision.reason_codes.join(", ")
+        )
+        .into());
+    }
+
+    let outcome = omarchy_plugin_enable(id);
+    if !outcome.success {
+        let failed_decision = evaluate_enable_decision(
+            &policy,
+            id,
+            &facts,
+            false,
+            format!("enable:post:{id}:failed"),
+            override_present,
+            override_valid,
+            pre_decision.override_binding.clone(),
+        );
+        persist_enforcement_decision(&paths, &failed_decision)?;
+        print_enable_result(
+            format,
+            EnableResult {
+                plugin_id: id.to_owned(),
+                policy: policy_mode.as_str().to_owned(),
+                enabled: false,
+                decision: failed_decision,
+            },
+        )?;
+        return Err(format!("native enable of {id} failed: {}", outcome.output).into());
+    }
+
+    // Recollect both shell state and the exact installed identity. If the
+    // native command changed content or did not actually enable the plugin,
+    // immediately fail closed and attempt to undo the live-state transition.
+    let (fresh_shell_json, fresh_shell_error) = query_shell();
+    let fresh_inventory = collect_one(&plugin_root, id, fresh_shell_json.as_deref());
+    let fresh_record = fresh_inventory
+        .plugins
+        .iter()
+        .find(|plugin| plugin.id == id);
+    let Some(fresh_record) = fresh_record else {
+        let _ = omarchy_plugin_disable(id);
+        let failed_decision = evaluate_enable_decision(
+            &policy,
+            id,
+            &facts,
+            false,
+            format!("enable:post:{id}:missing"),
+            override_present,
+            override_valid,
+            pre_decision.override_binding.clone(),
+        );
+        persist_enforcement_decision(&paths, &failed_decision)?;
+        return Err("postcondition failed: plugin vanished from inventory after enable".into());
+    };
+    let post_facts = collect_enforcement_facts(id, fresh_record).ok();
+    let identity_matches = post_facts.as_ref().is_some_and(|post| {
+        post.identity.identity_material() == facts.identity.identity_material()
+            && post.identity.file_digests == facts.identity.file_digests
+            && post.coverage_limitations == facts.coverage_limitations
+            && post.observed_rule_ids == facts.observed_rule_ids
+    });
+    let enabled = fresh_record.enabled == Some(true);
+    let postconditions_passed = fresh_shell_error.is_none() && enabled && identity_matches;
+    let post_facts_for_decision = post_facts.as_ref().unwrap_or(&facts);
+    let (post_override_present, post_override_valid, post_override_binding) =
+        resolve_override(&paths, id, &policy, post_facts_for_decision)?;
+    let post_decision = evaluate_enable_decision(
+        &policy,
+        id,
+        post_facts_for_decision,
+        postconditions_passed,
+        format!(
+            "enable:post:{id}:{}",
+            facts.identity.head.as_deref().unwrap_or("unknown")
+        ),
+        post_override_present,
+        post_override_valid,
+        post_override_binding,
+    );
+    persist_enforcement_decision(&paths, &post_decision)?;
+    if !postconditions_passed
+        || (policy_mode == EnforcementMode::Hardened
+            && post_decision.outcome == EnforcementOutcome::Block)
+    {
+        if enabled {
+            let disable = omarchy_plugin_disable(id);
+            if !disable.success {
+                eprintln!(
+                    "omasafe: warning: failed to undo enable after postcondition failure: {}",
+                    disable.output
+                );
+            }
+        }
+        print_enable_result(
+            format,
+            EnableResult {
+                plugin_id: id.to_owned(),
+                policy: policy_mode.as_str().to_owned(),
+                enabled: false,
+                decision: post_decision.clone(),
+            },
+        )?;
+        return Err("postcondition failed after enable; plugin was left disabled".into());
+    }
+
+    if post_decision.authorization_basis == Some(AuthorizationBasis::Override) {
+        persist_enforcement_audit_event(&paths, &override_audit_event(&post_decision, true))?;
+        notify_enforcement_transition(&post_decision);
+    }
+
+    print_enable_result(
+        format,
+        EnableResult {
+            plugin_id: id.to_owned(),
+            policy: policy_mode.as_str().to_owned(),
+            enabled: true,
+            decision: post_decision,
+        },
+    )?;
+    Ok(())
+}
+
+fn persist_enforcement_decision(
+    paths: &XdgPaths,
+    decision: &omasafe_report::enforcement::EnforcementDecision,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = paths.state.join("enforcement-history.json");
+    let _lock = lock_state(&path)?;
+    let mut history = EnforcementHistory::load(&path)?;
+    history.record_decision(decision.clone());
+    history.write_atomic_locked(&path)?;
+    Ok(())
+}
+
+fn persist_enforcement_audit_event(
+    paths: &XdgPaths,
+    event: &EnforcementAuditEvent,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = paths.state.join("enforcement-history.json");
+    let _lock = lock_state(&path)?;
+    let mut history = EnforcementHistory::load(&path)?;
+    history.record_audit_event(event.clone());
+    history.write_atomic_locked(&path)?;
+    Ok(())
+}
+
+fn notify_enforcement_transition(decision: &omasafe_report::enforcement::EnforcementDecision) {
+    let body = format!(
+        "{}: override authorized {} ({} blocking rule(s), audit {})",
+        safe_text(&decision.plugin_id),
+        safe_text(&decision.operation),
+        decision.blocking_rule_ids.len(),
+        safe_text(&decision.audit_event_id),
+    );
+    let result = std::process::Command::new("notify-send")
+        .args(["--urgency=normal", "OmaSafe", &body])
+        .status();
+    if result
+        .as_ref()
+        .map(|status| !status.success())
+        .unwrap_or(true)
+    {
+        eprintln!("OmaSafe notification unavailable: {body}");
+    }
+}
+
+fn override_path(paths: &XdgPaths) -> PathBuf {
+    paths.state.join("enforcement-overrides.json")
+}
+
+/// Find the latest binding for this plugin and report whether it is an exact,
+/// unexpired match for the current installed/candidate identity. A mismatched
+/// latest record is returned as present-but-invalid so the evaluator can retain
+/// an explicit audit reason instead of silently treating it as absent.
+fn resolve_override(
+    paths: &XdgPaths,
+    id: &str,
+    policy: &EnforcementPolicy,
+    facts: &EnforcementFacts,
+) -> Result<(bool, bool, Option<OverrideBinding>), Box<dyn std::error::Error>> {
+    let history = OverrideHistory::load(&override_path(paths))?;
+    let Some(binding) = history
+        .overrides
+        .iter()
+        .rev()
+        .find(|binding| binding.plugin_id == id)
+        .cloned()
+    else {
+        return Ok((false, false, None));
+    };
+    let valid = binding.schema == OVERRIDE_SCHEMA_VERSION
+        && binding.plugin_id == id
+        && binding.commit == facts.identity.head.clone().unwrap_or_default()
+        && binding.tree == facts.identity.tree
+        && binding.content_digest == facts.identity.content_digest.clone().unwrap_or_default()
+        && binding.analyzer_policy_identity == facts.analyzer_policy_identity
+        && binding.enforcement_policy_identity == policy.identity()
+        && binding.coverage_limitations == facts.coverage_limitations
+        && facts
+            .observed_rule_ids
+            .iter()
+            .all(|rule_id| binding.rule_ids.contains(rule_id))
+        && parse_timestamp_seconds(&binding.expires_at).is_some_and(|expires| expires > unix_now());
+    Ok((true, valid, Some(binding)))
+}
+
+fn override_audit_event(
+    decision: &omasafe_report::enforcement::EnforcementDecision,
+    completed: bool,
+) -> EnforcementAuditEvent {
+    EnforcementAuditEvent {
+        schema: omasafe_report::enforcement::ENFORCEMENT_AUDIT_SCHEMA_VERSION.to_owned(),
+        audit_event_id: decision.audit_event_id.clone(),
+        plugin_id: decision.plugin_id.clone(),
+        operation: decision.operation.clone(),
+        attempted_at: decision.evaluated_at.clone(),
+        completed,
+        outcome: decision.outcome,
+        authorization_basis: decision.authorization_basis,
+        reason_codes: decision.reason_codes.clone(),
+        blocking_rule_ids: decision.blocking_rule_ids.clone(),
+    }
 }
 
 /// Bounded argv-only local git invocation with scrubbed config, returning
@@ -1944,6 +2647,9 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
     }
     if !matches!(format, "text" | "json") {
         return Err(format!("unsupported format: {format}").into());
+    }
+    if include_analysis {
+        apply_scan_memory_limit()?;
     }
     let paths = XdgPaths::discover()?;
     paths.ensure()?;
@@ -2488,23 +3194,49 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
                 }
             }
             match class {
-                EventClass::PolicyUpdate => emit_scan_alert(
-                    format!("analysis:{}:analyzer-policy-update", plugin.id),
-                    plugin.id.clone(),
-                    "analyzer-policy-update",
-                    "warning",
-                    "analyzer policy changed since the last evaluation; findings \
-                     and capabilities were re-evaluated under the new policy"
-                        .to_owned(),
-                    false,
-                    notify,
-                    only_new,
-                    &mut live_keys,
-                    &mut alerts,
-                    &mut new_alerts,
-                    &mut state,
-                    &mut highest_severity,
-                ),
+                EventClass::PolicyUpdate => {
+                    emit_scan_alert(
+                        format!("analysis:{}:analyzer-policy-update", plugin.id),
+                        plugin.id.clone(),
+                        "analyzer-policy-update",
+                        "warning",
+                        "analyzer policy changed since the last evaluation; findings \
+                         and capabilities were re-evaluated under the new policy"
+                            .to_owned(),
+                        false,
+                        notify,
+                        only_new,
+                        &mut live_keys,
+                        &mut alerts,
+                        &mut new_alerts,
+                        &mut state,
+                        &mut highest_severity,
+                    );
+                    // H4 gives predicate changes their own user-facing event:
+                    // source identity and trust remain valid, while findings
+                    // may appear or disappear under the improved analyzer.
+                    if previous.as_ref().is_some_and(|previous| {
+                        previous.fingerprint != fingerprint
+                            || previous.finding_rule_ids != finding_rule_ids
+                    }) {
+                        emit_scan_alert(
+                            format!("analysis:{}:analyzer-improvement", plugin.id),
+                            plugin.id.clone(),
+                            "analyzer-improvement",
+                            "warning",
+                            "analyzer improvement changed findings under an unchanged plugin revision; re-review the results and confirm affected suppressions"
+                                .to_owned(),
+                            false,
+                            notify,
+                            only_new,
+                            &mut live_keys,
+                            &mut alerts,
+                            &mut new_alerts,
+                            &mut state,
+                            &mut highest_severity,
+                        );
+                    }
+                }
                 EventClass::Instability => emit_scan_alert(
                     format!("analysis:{}:fingerprint-instability", plugin.id),
                     plugin.id.clone(),
@@ -2690,8 +3422,19 @@ fn safe_text(value: &str) -> String {
 }
 
 fn schedule_install(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    if !args.is_empty() {
-        return Err("schedule install takes no arguments".into());
+    let mut policy_mode = EnforcementMode::Advisory;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--policy" => {
+                let value = next_value(args, index, "schedule policy")?;
+                policy_mode = value
+                    .parse::<EnforcementMode>()
+                    .map_err(|error| format!("invalid --policy value: {error}"))?;
+                index += 2;
+            }
+            value => return Err(format!("unknown schedule install argument: {value}").into()),
+        }
     }
     let home = home()?;
     let xdg = XdgPaths::discover()?;
@@ -2719,27 +3462,316 @@ fn schedule_install(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .to_string()
         .replace('%', "%%")
         .replace('"', "\\\"");
+    let analysis_flag = if policy_mode == EnforcementMode::Hardened {
+        " --include-analysis"
+    } else {
+        ""
+    };
     let service = format!(
-        "[Unit]\nDescription=OmaSafe plugin drift scan\n\n[Service]\nType=oneshot\nSuccessExitStatus=3\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nProtectHome=read-only\nReadWritePaths=\"{}\" \"{}\"\nExecStart=\"{}\" scan --notify --only-new\n",
-        state_path, cache_path, executable
+        "[Unit]\nDescription=OmaSafe {} plugin drift scan\n\n[Service]\nType=oneshot\nSuccessExitStatus=3\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nProtectHome=read-only\nReadWritePaths=\"{}\" \"{}\"\nExecStart=\"{}\" scan --notify --only-new{}\n",
+        policy_mode.as_str(),
+        state_path,
+        cache_path,
+        executable,
+        analysis_flag
     );
-    write_if_changed(&unit_dir.join("omasafe-scan.service"), service.as_bytes())?;
-    write_if_changed(
-        &unit_dir.join("omasafe-scan.timer"),
-        b"[Unit]\nDescription=Daily OmaSafe plugin drift scan\n\n[Timer]\nOnCalendar=daily\nRandomizedDelaySec=15m\nPersistent=true\nUnit=omasafe-scan.service\n\n[Install]\nWantedBy=timers.target\n",
-    )?;
+    let service_path = unit_dir.join("omasafe-scan.service");
+    let timer_path = unit_dir.join("omasafe-scan.timer");
+    let timer = b"[Unit]\nDescription=Daily OmaSafe plugin drift scan\n\n[Timer]\nOnCalendar=daily\nRandomizedDelaySec=15m\nPersistent=true\nUnit=omasafe-scan.service\n\n[Install]\nWantedBy=timers.target\n";
+    write_if_changed(&service_path, service.as_bytes())?;
+    write_if_changed(&timer_path, timer)?;
     for args in [
         vec!["--user", "daemon-reload"],
         vec!["--user", "enable", "--now", "omasafe-scan.timer"],
     ] {
-        let status = std::process::Command::new("systemctl")
-            .args(args)
-            .status()?;
-        if !status.success() {
-            return Err("systemd user timer installation failed".into());
+        run_bounded_systemctl(&args)
+            .map_err(|error| format!("systemd user timer installation failed: {error}"))?;
+    }
+    let metadata = ScheduleMetadata {
+        schema: SCHEDULE_SCHEMA_VERSION.to_owned(),
+        policy: policy_mode,
+        report_only: true,
+        service_unit: "omasafe-scan.service".to_owned(),
+        timer_unit: "omasafe-scan.timer".to_owned(),
+        unit_identity: schedule_unit_identity(service.as_bytes(), timer),
+        installed_at: now(),
+    };
+    write_schedule_metadata(&xdg.state.join("schedule.json"), &metadata)?;
+    println!(
+        "Installed and enabled daily OmaSafe {} scan timer.",
+        policy_mode.as_str()
+    );
+    Ok(())
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ScheduleMetadata {
+    schema: String,
+    policy: EnforcementMode,
+    report_only: bool,
+    service_unit: String,
+    timer_unit: String,
+    unit_identity: String,
+    installed_at: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ScheduleExecution {
+    available: bool,
+    timer_active_state: Option<String>,
+    timer_sub_state: Option<String>,
+    service_active_state: Option<String>,
+    service_sub_state: Option<String>,
+    service_exit_code: Option<i32>,
+    service_finished_at: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ScheduleStatusResult {
+    schema: &'static str,
+    installed: bool,
+    policy: Option<EnforcementMode>,
+    report_only: Option<bool>,
+    unit_identity: Option<String>,
+    metadata_unit_identity: Option<String>,
+    metadata_consistent: bool,
+    installed_at: Option<String>,
+    service_unit: String,
+    timer_unit: String,
+    last_known_execution: Option<ScheduleExecution>,
+    metadata_error: Option<String>,
+}
+
+fn schedule_unit_identity(service: &[u8], timer: &[u8]) -> String {
+    let mut material = Vec::with_capacity(service.len() + timer.len());
+    material.extend_from_slice(service);
+    material.extend_from_slice(timer);
+    format!("{:x}", Sha256::digest(material))
+}
+
+fn schedule_unit_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let home = home()?;
+    Ok(std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| home.join(".config"))
+        .join("systemd/user"))
+}
+
+fn write_schedule_metadata(
+    path: &Path,
+    metadata: &ScheduleMetadata,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = serde_json::to_vec_pretty(metadata)?;
+    write_if_changed(path, &[bytes.as_slice(), b"\n"].concat())?;
+    #[cfg(unix)]
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+/// Runs one systemd query/mutation under the same process-group and bounded
+/// output runner used by Git. A timeout, spawn failure, truncated stream, or
+/// non-success exit is unavailable/failure; no caller may treat partial
+/// systemctl output as a successful schedule operation.
+fn run_bounded_systemctl(
+    args: &[&str],
+) -> Result<omasafe_core::bounds::BoundedProcessOutput, String> {
+    let mut command = std::process::Command::new("systemctl");
+    command.args(args);
+    match omasafe_core::bounds::run_bounded_capped(
+        &mut command,
+        SCHEDULE_PROCESS_BUDGET,
+        SCHEDULE_PROCESS_OUTPUT_CAP,
+    ) {
+        Ok(Some(captured)) if captured.truncated => Err(format!(
+            "systemd command output was truncated: {}",
+            String::from_utf8_lossy(&captured.stderr).trim()
+        )),
+        Ok(Some(captured)) if !captured.status.success() => Err(format!(
+            "systemd command exited with {}: {}",
+            captured.status,
+            String::from_utf8_lossy(&captured.stderr).trim()
+        )),
+        Ok(Some(captured)) => Ok(captured),
+        Ok(None) => Err(format!(
+            "systemd command timed out after {} seconds",
+            SCHEDULE_PROCESS_BUDGET.as_secs()
+        )),
+        Err(error) => Err(format!("systemd command could not start: {error}")),
+    }
+}
+
+fn read_systemd_properties(unit: &str) -> Result<BTreeSet<(String, String)>, String> {
+    let output = run_bounded_systemctl(&[
+        "--user",
+        "show",
+        unit,
+        "--no-pager",
+        "--property=ActiveState,SubState,ExecMainStatus,ExecMainExitTimestamp",
+    ])
+    .map_err(|error| format!("systemd user status is unavailable: {error}"))?;
+    let mut properties = BTreeSet::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines().take(32) {
+        if let Some((key, value)) = line.split_once('=') {
+            properties.insert((key.to_owned(), value.chars().take(256).collect()));
         }
     }
-    println!("Installed and enabled daily OmaSafe scan timer.");
+    const REQUIRED_PROPERTIES: [&str; 4] = [
+        "ActiveState",
+        "SubState",
+        "ExecMainStatus",
+        "ExecMainExitTimestamp",
+    ];
+    if !REQUIRED_PROPERTIES
+        .iter()
+        .all(|key| properties.iter().any(|(name, _)| name == key))
+    {
+        return Err("systemd user status is unavailable: incomplete systemctl output".to_owned());
+    }
+    Ok(properties)
+}
+
+fn systemd_property(properties: &BTreeSet<(String, String)>, key: &str) -> Option<String> {
+    properties
+        .iter()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value.clone())
+        .filter(|value| !value.is_empty() && value != "n/a")
+}
+
+fn schedule_execution() -> ScheduleExecution {
+    let timer = read_systemd_properties("omasafe-scan.timer");
+    let service = read_systemd_properties("omasafe-scan.service");
+    let error = timer.as_ref().err().or(service.as_ref().err()).cloned();
+    let timer_properties = timer.ok();
+    let service_properties = service.ok();
+    let available = error.is_none();
+    let service_exit_code = service_properties
+        .as_ref()
+        .and_then(|properties| systemd_property(properties, "ExecMainStatus"))
+        .and_then(|value| value.parse::<i32>().ok());
+    ScheduleExecution {
+        available,
+        timer_active_state: timer_properties
+            .as_ref()
+            .and_then(|properties| systemd_property(properties, "ActiveState")),
+        timer_sub_state: timer_properties
+            .as_ref()
+            .and_then(|properties| systemd_property(properties, "SubState")),
+        service_active_state: service_properties
+            .as_ref()
+            .and_then(|properties| systemd_property(properties, "ActiveState")),
+        service_sub_state: service_properties
+            .as_ref()
+            .and_then(|properties| systemd_property(properties, "SubState")),
+        service_exit_code,
+        service_finished_at: service_properties
+            .as_ref()
+            .and_then(|properties| systemd_property(properties, "ExecMainExitTimestamp")),
+        error,
+    }
+}
+
+fn schedule_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let format = format_arg(args)?;
+    let paths = XdgPaths::discover()?;
+    let unit_dir = schedule_unit_dir()?;
+    let service_path = unit_dir.join("omasafe-scan.service");
+    let timer_path = unit_dir.join("omasafe-scan.timer");
+    let service_bytes = std::fs::read(&service_path).ok();
+    let timer_bytes = std::fs::read(&timer_path).ok();
+    let installed = service_bytes.is_some() && timer_bytes.is_some();
+    let unit_identity = match (&service_bytes, &timer_bytes) {
+        (Some(service), Some(timer)) => Some(schedule_unit_identity(service, timer)),
+        _ => None,
+    };
+    let metadata_path = paths.state.join("schedule.json");
+    let (metadata, metadata_error) = match std::fs::read_to_string(&metadata_path) {
+        Ok(text) => match serde_json::from_str::<ScheduleMetadata>(&text) {
+            Ok(metadata) if metadata.schema == SCHEDULE_SCHEMA_VERSION => (Some(metadata), None),
+            Ok(_) => (
+                None,
+                Some("schedule metadata schema is unsupported".to_owned()),
+            ),
+            Err(_) => (None, Some("schedule metadata is malformed".to_owned())),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
+        Err(_) => (None, Some("schedule metadata is unreadable".to_owned())),
+    };
+    let metadata_consistent = metadata.as_ref().is_some_and(|metadata| {
+        installed
+            && unit_identity.as_deref() == Some(metadata.unit_identity.as_str())
+            && metadata.service_unit == "omasafe-scan.service"
+            && metadata.timer_unit == "omasafe-scan.timer"
+    });
+    let result = ScheduleStatusResult {
+        schema: SCHEDULE_SCHEMA_VERSION,
+        installed,
+        policy: metadata_consistent.then(|| metadata.as_ref().unwrap().policy),
+        report_only: metadata_consistent.then(|| metadata.as_ref().unwrap().report_only),
+        unit_identity,
+        metadata_unit_identity: metadata.as_ref().map(|value| value.unit_identity.clone()),
+        metadata_consistent,
+        installed_at: metadata_consistent.then(|| metadata.as_ref().unwrap().installed_at.clone()),
+        service_unit: "omasafe-scan.service".to_owned(),
+        timer_unit: "omasafe-scan.timer".to_owned(),
+        last_known_execution: installed.then(schedule_execution),
+        metadata_error,
+    };
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&Report::new(TOOL_VERSION, now(), result))?
+        );
+    } else {
+        println!(
+            "Schedule: {}",
+            if result.installed {
+                "installed"
+            } else {
+                "not installed"
+            }
+        );
+        println!(
+            "Policy: {}",
+            result
+                .policy
+                .map(EnforcementMode::as_str)
+                .unwrap_or("unavailable")
+        );
+        println!(
+            "Behavior: {}",
+            match result.report_only {
+                Some(true) => "report-only scan",
+                Some(false) => "enforcement may mutate state",
+                None => "unavailable",
+            }
+        );
+        println!(
+            "Unit identity: {}",
+            result.unit_identity.as_deref().unwrap_or("unavailable")
+        );
+        if let Some(execution) = result.last_known_execution {
+            if let Some(error) = execution.error {
+                println!("Last execution: unavailable ({error})");
+            } else {
+                println!(
+                    "Last execution: {} (exit {})",
+                    execution
+                        .service_finished_at
+                        .as_deref()
+                        .unwrap_or("not recorded"),
+                    execution
+                        .service_exit_code
+                        .map_or_else(|| "unknown".to_owned(), |code| code.to_string())
+                );
+            }
+        }
+        if let Some(error) = result.metadata_error {
+            println!("Metadata: {error}");
+        }
+    }
     Ok(())
 }
 
@@ -2960,6 +3992,9 @@ fn suppression_review(
                 path_scope: canonical_path_scope,
                 reason: reason.to_owned(),
                 created_at: now(),
+                policy_identity: Some(serde_json::to_string(&serde_json::to_value(
+                    omasafe_analyzer::policy_identity(),
+                )?)?),
                 active: true,
                 reinstated_at: None,
             });
@@ -2982,6 +4017,259 @@ fn suppression_review(
             );
         }
         _ => unreachable!("action filtered by caller"),
+    }
+    Ok(())
+}
+
+#[derive(Debug, serde::Serialize)]
+struct EnforcementStatusResult {
+    plugin_id: String,
+    decision: Option<omasafe_report::enforcement::EnforcementDecision>,
+}
+
+fn enforcement_status(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let format = format_arg(args)?;
+    let paths = XdgPaths::discover()?;
+    let path = paths.state.join("enforcement-history.json");
+    let history = EnforcementHistory::load(&path)?;
+    let result = EnforcementStatusResult {
+        plugin_id: id.to_owned(),
+        decision: history.latest(id).cloned(),
+    };
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&Report::new(TOOL_VERSION, now(), result))?
+        );
+    } else if let Some(decision) = result.decision {
+        println!(
+            "{}: {} ({})",
+            safe_text(&result.plugin_id),
+            decision.outcome.as_str(),
+            decision
+                .authorization_basis
+                .map(|basis| match basis {
+                    omasafe_report::enforcement::AuthorizationBasis::Policy => "policy",
+                    omasafe_report::enforcement::AuthorizationBasis::Override => "override",
+                })
+                .unwrap_or("none")
+        );
+        println!("Evaluation state: {:?}", decision.evaluation_state);
+        println!("Evaluated at: {}", safe_text(&decision.evaluated_at));
+        if !decision.reason_codes.is_empty() {
+            println!("Reasons: {}", decision.reason_codes.join(", "));
+        }
+    } else {
+        println!(
+            "{}: no enforcement decision recorded",
+            safe_text(&result.plugin_id)
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, serde::Serialize)]
+struct OverrideCreateResult {
+    status: String,
+    binding: OverrideBinding,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct OverrideListEntry {
+    binding: OverrideBinding,
+    status: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct OverrideListResult {
+    overrides: Vec<OverrideListEntry>,
+}
+
+fn override_create(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return Err("override creation requires an interactive terminal".into());
+    }
+    let mut rule_ids = Vec::new();
+    let mut commit = None;
+    let mut reason = None;
+    let mut expires_at = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--rule" => {
+                rule_ids.push(next_value(args, index, "override rule")?.to_owned());
+                index += 2;
+            }
+            "--commit" => {
+                commit = Some(next_value(args, index, "override commit")?.to_owned());
+                index += 2;
+            }
+            "--reason" => {
+                reason = Some(next_value(args, index, "override reason")?.to_owned());
+                index += 2;
+            }
+            "--expires" => {
+                expires_at = Some(next_value(args, index, "override expiry")?.to_owned());
+                index += 2;
+            }
+            value => return Err(format!("unknown override-create argument: {value}").into()),
+        }
+    }
+    if rule_ids.is_empty() {
+        return Err("override creation requires at least one --rule RULE_ID".into());
+    }
+    for rule_id in &rule_ids {
+        if rule_id.is_empty()
+            || rule_id.len() > 256
+            || rule_id.chars().any(|character| character.is_control())
+        {
+            return Err("override rule IDs must be 1-256 printable characters".into());
+        }
+    }
+    rule_ids.sort();
+    rule_ids.dedup();
+    let commit = commit.ok_or("--commit is required")?;
+    if !valid_commit(&commit) {
+        return Err("--commit must be a full hexadecimal commit SHA".into());
+    }
+    let reason = reason.ok_or("--reason is required")?;
+    if reason.trim().is_empty() || reason.len() > 4096 {
+        return Err("override reason must be 1-4096 characters".into());
+    }
+    let expires_at = expires_at.ok_or("--expires is required")?;
+    let expiry = parse_timestamp_seconds(&expires_at)
+        .ok_or("--expires must be an RFC3339 UTC timestamp (YYYY-MM-DDTHH:MM:SSZ)")?;
+    if expiry <= unix_now() {
+        return Err("--expires must be in the future".into());
+    }
+
+    eprint!(
+        "Create an auditable override for {id} at {commit} through {expires_at}? Type 'create': "
+    );
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if answer.trim() != "create" {
+        return Err("override not created".into());
+    }
+
+    let paths = XdgPaths::discover()?;
+    paths.ensure()?;
+    let (record, _) = current_identity(id)?;
+    if record.enabled != Some(false) || record.active != Some(false) {
+        return Err(
+            "override creation requires an installed plugin that is provably inactive".into(),
+        );
+    }
+    let repository = record
+        .repository
+        .as_deref()
+        .ok_or("override creation requires an installed plugin origin")?;
+    if !repository.starts_with("https://") {
+        return Err("override creation requires an HTTPS plugin origin".into());
+    }
+    audit_installed_git_state(Path::new(&record.path), repository)
+        .map_err(|failure| format!("installed repository audit failed: {failure}"))?;
+    let facts = collect_enforcement_facts(id, &record)?;
+    let policy = EnforcementPolicy::new(EnforcementMode::Hardened);
+    let commit_identity = facts
+        .identity
+        .head
+        .clone()
+        .ok_or("installed plugin has no commit identity")?;
+    if commit_identity != commit {
+        return Err(format!("--commit does not match installed HEAD {commit_identity}").into());
+    }
+    let content_digest = facts
+        .identity
+        .content_digest
+        .clone()
+        .ok_or("installed plugin has no complete content digest")?;
+    let binding = OverrideBinding {
+        schema: OVERRIDE_SCHEMA_VERSION.to_owned(),
+        plugin_id: id.to_owned(),
+        commit,
+        tree: facts.identity.tree.clone(),
+        content_digest,
+        analyzer_policy_identity: facts.analyzer_policy_identity.clone(),
+        enforcement_policy_identity: policy.identity(),
+        rule_ids,
+        coverage_limitations: facts.coverage_limitations.clone(),
+        reason,
+        created_at: now(),
+        expires_at,
+    };
+
+    let overrides_path = override_path(&paths);
+    let _lock = lock_state(&overrides_path)?;
+    let mut history = OverrideHistory::load(&overrides_path)?;
+    history.record(binding.clone());
+    history.write_atomic_locked(&overrides_path)?;
+    let audit = EnforcementAuditEvent {
+        schema: omasafe_report::enforcement::ENFORCEMENT_AUDIT_SCHEMA_VERSION.to_owned(),
+        audit_event_id: format!("override-create:{id}:{}", binding.commit),
+        plugin_id: id.to_owned(),
+        operation: "override-create".to_owned(),
+        attempted_at: binding.created_at.clone(),
+        completed: true,
+        outcome: EnforcementOutcome::Allow,
+        authorization_basis: Some(AuthorizationBasis::Override),
+        reason_codes: Vec::new(),
+        blocking_rule_ids: binding.rule_ids.clone(),
+    };
+    persist_enforcement_audit_event(&paths, &audit)?;
+
+    let result = OverrideCreateResult {
+        status: "created".to_owned(),
+        binding,
+    };
+    println!(
+        "Override created for {} at {} (expires {})",
+        safe_text(&result.binding.plugin_id),
+        safe_text(&result.binding.commit),
+        safe_text(&result.binding.expires_at)
+    );
+    Ok(())
+}
+
+fn override_list(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let format = format_arg(args)?;
+    let paths = XdgPaths::discover()?;
+    paths.ensure()?;
+    let history = OverrideHistory::load(&override_path(&paths))?;
+    let result = OverrideListResult {
+        overrides: history
+            .overrides
+            .into_iter()
+            .map(|binding| OverrideListEntry {
+                status: if parse_timestamp_seconds(&binding.expires_at)
+                    .is_some_and(|expiry| expiry > unix_now())
+                {
+                    "active".to_owned()
+                } else {
+                    "expired".to_owned()
+                },
+                binding,
+            })
+            .collect(),
+    };
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&Report::new(TOOL_VERSION, now(), result))?
+        );
+    } else if result.overrides.is_empty() {
+        println!("No enforcement overrides recorded.");
+    } else {
+        for entry in result.overrides {
+            println!(
+                "{} {} commit={} expires={} ({})",
+                safe_text(&entry.binding.plugin_id),
+                entry.binding.rule_ids.join(","),
+                safe_text(&entry.binding.commit),
+                safe_text(&entry.binding.expires_at),
+                entry.status
+            );
+        }
     }
     Ok(())
 }
@@ -3136,6 +4424,51 @@ fn diff(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn enforcement_inventory_summary(
+    plugins: &[omasafe_plugin_trust::PluginRecord],
+) -> serde_json::Value {
+    let path = match XdgPaths::discover() {
+        Ok(paths) => paths.state.join("enforcement-history.json"),
+        Err(_) => {
+            return serde_json::json!({
+                "schema": ENFORCEMENT_SUMMARY_SCHEMA_VERSION,
+                "available": false,
+                "decisions": [],
+                "error": "enforcement history is unavailable"
+            });
+        }
+    };
+    let history = match EnforcementHistory::load(&path) {
+        Ok(history) => history,
+        Err(_) => {
+            return serde_json::json!({
+                "schema": ENFORCEMENT_SUMMARY_SCHEMA_VERSION,
+                "available": false,
+                "decisions": [],
+                "error": "enforcement history is unavailable"
+            });
+        }
+    };
+    let decisions = plugins
+        .iter()
+        .filter_map(|plugin| history.latest(&plugin.id))
+        .map(|decision| {
+            serde_json::json!({
+                "plugin_id": decision.plugin_id,
+                "evaluation_state": decision.evaluation_state,
+                "outcome": decision.outcome,
+                "authorization_basis": decision.authorization_basis,
+                "evaluated_at": decision.evaluated_at
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "schema": ENFORCEMENT_SUMMARY_SCHEMA_VERSION,
+        "available": true,
+        "decisions": decisions
+    })
+}
+
 fn parse_diff_args(args: &[String]) -> Result<(&str, Option<String>), Box<dyn std::error::Error>> {
     let mut format = "text";
     let mut range = None;
@@ -3262,6 +4595,7 @@ fn inventory(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(error) = shell_error {
         result.coverage.limitations.push(error);
     }
+    let enforcement_summary = enforcement_inventory_summary(&result.plugins);
     let mut marketplace_source = None;
     let snapshot = match (catalog_path, catalog_commit, catalog_repository) {
         (Some(path), Some(commit), Some(repository)) => {
@@ -3374,8 +4708,17 @@ fn inventory(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 serde_json::Value::Bool(marketplace_stale),
             );
             value
+                .as_object_mut()
+                .unwrap()
+                .insert("enforcement_summary".into(), enforcement_summary.clone());
+            value
         } else {
-            serde_json::to_value(&result)?
+            let mut value = serde_json::to_value(&result)?;
+            value
+                .as_object_mut()
+                .unwrap()
+                .insert("enforcement_summary".into(), enforcement_summary.clone());
+            value
         };
         let report = Report::new(TOOL_VERSION, now(), output);
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -3523,6 +4866,76 @@ fn rules_list(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn rules_coverage(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut format = "text";
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--format" => {
+                format = next_value(args, index, "rules coverage format")?;
+                index += 2;
+            }
+            value => return Err(format!("unknown rules coverage argument: {value}").into()),
+        }
+    }
+    if !matches!(format, "text" | "json") {
+        return Err("rules coverage format must be text or json".into());
+    }
+    let map = omasafe_analyzer::EquivalenceMap::embedded();
+    let mut entries = map.entries.clone();
+    entries.sort_by(|a, b| {
+        a.external_id
+            .cmp(&b.external_id)
+            .then(a.relation.cmp(&b.relation))
+    });
+    let not_covered: Vec<String> = entries
+        .iter()
+        .filter(|entry| entry.relation == "not-covered")
+        .map(|entry| entry.external_id.clone())
+        .collect();
+    if format == "json" {
+        let result = serde_json::json!({
+            "policy_identity": omasafe_analyzer::policy_identity(),
+            "map_version": map.map_version,
+            "external_system": map.external_system,
+            "external_ruleset_name": map.external_ruleset_name,
+            "external_ruleset_version": map.external_ruleset_version,
+            "verified_at_commit": map.verified_at_commit,
+            "coverage": entries,
+            "not_covered": not_covered,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&Report::new(TOOL_VERSION, now(), result))?
+        );
+    } else {
+        println!(
+            "Marketplace {} v{} coverage map v{} (verified {})",
+            map.external_ruleset_name,
+            map.external_ruleset_version,
+            map.map_version,
+            map.verified_at_commit
+        );
+        for entry in &entries {
+            let owner = entry
+                .oma_rule_id
+                .as_deref()
+                .or(entry.oma_capability.as_deref())
+                .unwrap_or("—");
+            println!("{}  {}  {}", entry.external_id, entry.relation, owner);
+        }
+        println!(
+            "not-covered: {}",
+            if not_covered.is_empty() {
+                "none".to_owned()
+            } else {
+                not_covered.join(", ")
+            }
+        );
+    }
+    Ok(())
+}
+
 fn rules_explain(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut format = "text";
     let mut index = 0;
@@ -3621,6 +5034,7 @@ fn plugins_analyze(id: &str, args: &[String]) -> Result<i32, Box<dyn std::error:
     }
     interruption_checkpoint("before analysis started")?;
     let fail_on = parse_fail_on(fail_on)?;
+    apply_scan_memory_limit()?;
     let plugin_root = plugin_root()?;
     let (shell_json, _shell_error) = query_shell();
     let inventory = collect_one(&plugin_root, id, shell_json.as_deref());
@@ -3690,6 +5104,7 @@ fn scan_plugin(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         return Err("scan-plugin format must be text or json".into());
     }
     let fail_on = parse_fail_on(fail_on)?;
+    apply_scan_memory_limit()?;
 
     match (path_target, git_url, revision) {
         (Some(path), None, None) => {
@@ -3753,6 +5168,47 @@ fn scan_plugin(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             "scan-plugin accepts either --path or the --git URL + --revision pair, not both".into(),
         ),
     }
+}
+
+/// Contain scanner regressions to the CLI process. This is a last-resort
+/// boundary for direct callers such as the desktop app: parser budgets should
+/// make normal scans complete, while a future allocation bug must terminate
+/// this child instead of taking down the caller's cgroup.
+fn apply_scan_memory_limit() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    {
+        let configured = std::env::var("OMASAFE_SCAN_MEMORY_LIMIT_MB")
+            .ok()
+            .map(|value| value.parse::<u64>())
+            .transpose()?;
+        let megabytes = configured.unwrap_or(DEFAULT_SCAN_MEMORY_LIMIT_MB);
+        if megabytes == 0 {
+            return Ok(());
+        }
+        let desired = megabytes
+            .checked_mul(1024 * 1024)
+            .ok_or("OMASAFE_SCAN_MEMORY_LIMIT_MB is too large")?
+            as libc::rlim_t;
+        // Respect a tighter limit inherited from a supervisor; never raise
+        // the hard limit or make a caller's existing sandbox less strict.
+        let mut current = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        if unsafe { libc::getrlimit(libc::RLIMIT_AS, current.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let mut current = unsafe { current.assume_init() };
+        let effective = if current.rlim_max == libc::RLIM_INFINITY {
+            desired
+        } else {
+            desired.min(current.rlim_max)
+        };
+        if current.rlim_cur > effective {
+            current.rlim_cur = effective;
+            if unsafe { libc::setrlimit(libc::RLIMIT_AS, &current) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_fail_on(value: Option<String>) -> Result<Option<omasafe_analyzer::Severity>, String> {
@@ -3933,6 +5389,8 @@ fn emit_analysis_report(
     // emitted, and the caller unwinds to a 130 exit.
     interruption_checkpoint("analysis finished; report not yet emitted")?;
     let rendered = artifacts.rendered_findings();
+    let policy_identity = omasafe_analyzer::policy_identity();
+    let policy_identity_string = serde_json::to_string(&serde_json::to_value(&policy_identity)?)?;
 
     // Suppressions are presentation/enforcement filters over the RENDERED
     // findings only. Stored results, capabilities, invocation edges, and the
@@ -3955,11 +5413,29 @@ fn emit_analysis_report(
         None => (omasafe_core::suppress::SuppressionState::default(), None),
     };
     let mut applied_suppressions: Vec<serde_json::Value> = Vec::new();
+    let mut suppression_reconfirmations: Vec<serde_json::Value> = Vec::new();
     let findings: Vec<_> = rendered
         .into_iter()
         .filter(|finding| {
-            let hit =
-                suppressions.matches(&finding.rule_id, plugin_context, &finding.relative_path);
+            let stale = suppressions.requires_reconfirmation(
+                &finding.rule_id,
+                plugin_context,
+                &finding.relative_path,
+                &policy_identity_string,
+            );
+            if stale {
+                suppression_reconfirmations.push(serde_json::json!({
+                    "rule_id": finding.rule_id,
+                    "relative_path": finding.relative_path,
+                    "reason": "analyzer-policy-changed",
+                }));
+            }
+            let hit = suppressions.matches_policy(
+                &finding.rule_id,
+                plugin_context,
+                &finding.relative_path,
+                &policy_identity_string,
+            );
             if hit {
                 applied_suppressions.push(serde_json::json!({
                     "rule_id": finding.rule_id,
@@ -3970,13 +5446,18 @@ fn emit_analysis_report(
         })
         .collect();
 
-    let policy_identity = omasafe_analyzer::policy_identity();
     let fingerprint =
         omasafe_analyzer::fingerprint_analysis(&artifacts.results, &artifacts.capabilities);
     let mut coverage_limitations = inventory.limitations.clone();
     coverage_limitations.extend(artifacts.limitations.clone());
     if let Some(limitation) = suppressions_limitation {
         coverage_limitations.push(limitation);
+    }
+    if !suppression_reconfirmations.is_empty() {
+        coverage_limitations.push(format!(
+            "suppression-reconfirmation-required:{}",
+            suppression_reconfirmations.len()
+        ));
     }
 
     // Equivalence summary + staleness against the locally cached snapshot's
@@ -4040,6 +5521,7 @@ fn emit_analysis_report(
             "analysis": analysis,
             "suppressions": {
                 "applied": applied_suppressions,
+                "reconfirmation_required": suppression_reconfirmations,
                 "active_records": suppressions.active().count(),
             },
             "payload_inventory": {
@@ -4108,6 +5590,19 @@ fn emit_analysis_report(
                     "  suppressed\t{}\t{}",
                     applied["rule_id"].as_str().unwrap_or("?"),
                     applied["relative_path"].as_str().unwrap_or("?")
+                );
+            }
+        }
+        if !suppression_reconfirmations.is_empty() {
+            println!(
+                "Suppressions requiring re-confirmation: {}",
+                suppression_reconfirmations.len()
+            );
+            for stale in &suppression_reconfirmations {
+                println!(
+                    "  re-confirm\t{}\t{}",
+                    stale["rule_id"].as_str().unwrap_or("?"),
+                    stale["relative_path"].as_str().unwrap_or("?")
                 );
             }
         }
@@ -4250,28 +5745,39 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 }
 
 fn timestamp_age_seconds(timestamp: &str) -> Option<i64> {
-    let parsed = if let Ok(seconds) = timestamp.parse::<i64>() {
-        seconds
-    } else {
-        let date = timestamp.get(0..19)?;
-        let bytes = date.as_bytes();
-        if bytes.get(4) != Some(&b'-')
-            || bytes.get(7) != Some(&b'-')
-            || bytes.get(10) != Some(&b'T')
-            || bytes.get(13) != Some(&b':')
-            || bytes.get(16) != Some(&b':')
-        {
-            return None;
-        }
-        let year = date[0..4].parse::<i64>().ok()?;
-        let month = date[5..7].parse::<i64>().ok()?;
-        let day = date[8..10].parse::<i64>().ok()?;
-        let hour = date[11..13].parse::<i64>().ok()?;
-        let minute = date[14..16].parse::<i64>().ok()?;
-        let second = date[17..19].parse::<i64>().ok()?;
-        days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second
-    };
+    let parsed = parse_timestamp_seconds(timestamp)?;
     Some((unix_now() - parsed).max(0))
+}
+
+fn parse_timestamp_seconds(timestamp: &str) -> Option<i64> {
+    if let Ok(seconds) = timestamp.parse::<i64>() {
+        return Some(seconds);
+    }
+    let date = timestamp.strip_suffix('Z')?.get(0..19)?;
+    let bytes = date.as_bytes();
+    if bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes.get(10) != Some(&b'T')
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+    {
+        return None;
+    }
+    let year = date[0..4].parse::<i64>().ok()?;
+    let month = date[5..7].parse::<i64>().ok()?;
+    let day = date[8..10].parse::<i64>().ok()?;
+    let hour = date[11..13].parse::<i64>().ok()?;
+    let minute = date[14..16].parse::<i64>().ok()?;
+    let second = date[17..19].parse::<i64>().ok()?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    Some(days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second)
 }
 
 fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {

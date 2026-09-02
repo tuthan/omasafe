@@ -16,6 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from corpus_common import load_ledger, resolve_plugin_dir, sample_plugins  # noqa: E402
+from bounded_process import run_bounded  # noqa: E402
 
 ROOT = Path(__file__).parent.parent
 FAILURES = []
@@ -72,11 +73,117 @@ def main():
     # Both runner scripts share one sampler implementation.
     parity_source = (ROOT / "scripts" / "validator-parity.py").read_text(encoding="utf-8")
     runner_source = (ROOT / "scripts" / "run-corpus.py").read_text(encoding="utf-8")
+    ground_truth_source = (ROOT / "scripts" / "measure-ground-truth.py").read_text(
+        encoding="utf-8"
+    )
     check(
         "both runners import the shared sampler",
         "from corpus_common import" in parity_source
         and "sample_plugins" in parity_source
         and "from corpus_common import" in runner_source,
+    )
+    check(
+        "corpus reports precision and blocking eligibility",
+        '"blockingEligible"' in runner_source
+        and '"precision"' in runner_source
+        and '"triaged"' in runner_source,
+    )
+    check(
+        "corpus scans use process bounds",
+        "run_bounded" in runner_source
+        and "SCAN_MEMORY_LIMIT_BYTES" in runner_source
+        and "SCAN_TIMEOUT_SECONDS" in runner_source,
+    )
+    check(
+        "all CLI test runners use process bounds",
+        "run_bounded" in parity_source and "run_bounded" in ground_truth_source,
+    )
+
+    parity_invocations = []
+    workflows = ROOT / ".github" / "workflows"
+    for workflow in sorted(workflows.glob("*.y*ml")):
+        lines = workflow.read_text(encoding="utf-8").splitlines()
+        for index, line in enumerate(lines):
+            if "python3 scripts/validator-parity.py" not in line:
+                continue
+            invocation = [line]
+            cursor = index
+            while invocation[-1].rstrip().endswith("\\") and cursor + 1 < len(lines):
+                cursor += 1
+                invocation.append(lines[cursor])
+            parity_invocations.append((workflow.name, "\n".join(invocation)))
+    check(
+        "validator parity workflows choose exactly one corpus mode",
+        bool(parity_invocations)
+        and all(
+            sum(f"--{mode}" in invocation for mode in ("sample", "full")) == 1
+            for _, invocation in parity_invocations
+        ),
+        str([name for name, _ in parity_invocations]),
+    )
+
+    bounded = run_bounded(
+        [sys.executable, "-c", "print('x' * 256)"],
+        timeout=5,
+        max_output_bytes=64,
+        memory_limit_bytes=None,
+    )
+    check("bounded runner caps retained output", len(bounded.stdout) <= 64)
+    try:
+        run_bounded(
+            [sys.executable, "-c", "import time; time.sleep(5)"],
+            timeout=0.1,
+            memory_limit_bytes=None,
+        )
+    except subprocess.TimeoutExpired:
+        check("bounded runner stops timed-out children", True)
+    else:
+        check("bounded runner stops timed-out children", False)
+
+    ground_truth = json.loads(
+        (ROOT / "fixtures" / "corpus" / "expectations" / "ground-truth.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    check(
+        "ground-truth manifest is versioned and non-empty",
+        ground_truth.get("schemaVersion") == 1
+        and isinstance(ground_truth.get("fixtures"), list)
+        and bool(ground_truth["fixtures"]),
+    )
+    check(
+        "ground-truth cases declare positive or negative rules",
+        all(
+            isinstance(case.get("expectedRules"), list)
+            or isinstance(case.get("forbiddenRules"), list)
+            for case in ground_truth["fixtures"]
+        ),
+    )
+    case_ids = [case.get("id") for case in ground_truth["fixtures"]]
+    check(
+        "ground-truth case ids are unique",
+        all(isinstance(case_id, str) and case_id for case_id in case_ids)
+        and len(case_ids) == len(set(case_ids)),
+    )
+
+    h8b_admission = json.loads(
+        (ROOT / "docs" / "reports" / "h8b-blocking-admission.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    ledger_count = len(
+        load_ledger(ROOT / "fixtures" / "corpus" / "expectations" / "dispositions.jsonl")
+    )
+    check(
+        "H8b admission report is evidence-gated",
+        h8b_admission.get("schemaVersion") == 1
+        and h8b_admission.get("precisionThreshold") == 1.0
+        and h8b_admission.get("fixtureDetectionThreshold") == 1.0
+        and h8b_admission.get("triagedDispositionCount") == ledger_count
+        and ledger_count > 0
+        and h8b_admission.get("groundTruth", {}).get("passed") is True
+        and h8b_admission.get("blockingEligible") == []
+        and h8b_admission.get("blockingRuleFamilies") == [],
     )
 
     with tempfile.TemporaryDirectory() as temp:

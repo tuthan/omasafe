@@ -40,6 +40,27 @@ pub const MAX_SINK_REJECTIONS: usize = 256;
 /// Hard per-stream cap on captured child-process output. A chatty child can
 /// neither grow memory without bound nor deadlock the polling loop.
 pub const MAX_PROCESS_OUTPUT_BYTES_PER_STREAM: usize = 8 * 1024 * 1024;
+/// Maximum number of QML/JS statement/declaration nodes visited by the
+/// bounded intra-file dataflow pass.
+pub const MAX_DATAFLOW_STATEMENTS: usize = 2048;
+/// Maximum recursive expression/assignment depth followed by dataflow.
+pub const MAX_DATAFLOW_ASSIGNMENT_DEPTH: usize = 16;
+/// Per-file wall-clock budget for QML/JS dataflow.
+pub const DATAFLOW_TIME_BUDGET: Duration = Duration::from_millis(50);
+/// Maximum physical shell lines considered by the staged fetch/chmod/execute
+/// tracker.
+pub const MAX_STAGED_CHAIN_LINES: usize = 1024;
+/// Per-file wall-clock budget for the staged shell tracker.
+pub const STAGED_CHAIN_TIME_BUDGET: Duration = Duration::from_millis(25);
+/// Maximum recursive depth used while constructing typed shell IR.
+pub const MAX_SHELL_PARSE_DEPTH: usize = 16;
+/// Maximum typed shell IR nodes constructed in one source analysis.
+pub const MAX_SHELL_PARSE_NODES: usize = 50_000;
+/// Maximum command/process-substitution child programs constructed in one
+/// source analysis.
+pub const MAX_SHELL_PARSE_CHILD_PROGRAMS: usize = 128;
+/// Aggregate source bytes retained for recursively parsed shell children.
+pub const MAX_SHELL_PARSE_SOURCE_BYTES: usize = 2 * 1024 * 1024;
 
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const DRAIN_CHUNK_BYTES: usize = 64 * 1024;

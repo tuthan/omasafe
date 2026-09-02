@@ -10,7 +10,7 @@ use serde::Serialize;
 
 /// Monotonic version of this catalog. Bump when rules are added, retired, or
 /// redefined; the policy identity changes with it.
-pub const RULE_CATALOG_VERSION: u32 = 5;
+pub const RULE_CATALOG_VERSION: u32 = 7;
 
 /// Monotonic version of the severity table. Severity or rule-meaning changes
 /// require a new version here.
@@ -23,7 +23,7 @@ pub const SUPPORTED_SURFACE_VERSION: &str = "omarchy-security-surface.v1";
 /// Automated Security Baseline is at V3 upstream (V4 is a separate future
 /// policy there), so the shipped map records V3 with its verification commit;
 /// staleness against newer external versions is part of the map API.
-pub const EQUIVALENCE_MAP_VERSION: Option<&str> = Some("omarchy-marketplace-baseline-v3/1");
+pub const EQUIVALENCE_MAP_VERSION: Option<&str> = Some("omarchy-marketplace-baseline-v3/2");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -90,6 +90,10 @@ pub enum Capability {
     SessionLockSurface,
     PamAuthentication,
     ShellIpcInventory,
+    BundledBinary,
+    SensitivePath,
+    InputInjection,
+    ScreenCapture,
     ReplacesBarContext,
 }
 
@@ -108,6 +112,10 @@ impl std::fmt::Display for Capability {
             Capability::SessionLockSurface => "session-lock-surface",
             Capability::PamAuthentication => "pam-authentication",
             Capability::ShellIpcInventory => "shell-ipc-inventory",
+            Capability::BundledBinary => "bundled-binary",
+            Capability::SensitivePath => "sensitive-path",
+            Capability::InputInjection => "input-injection",
+            Capability::ScreenCapture => "screen-capture",
             Capability::ReplacesBarContext => "replaces-bar-context",
         };
         formatter.write_str(rendered)
@@ -148,6 +156,27 @@ const fn qml_rule(
     }
 }
 
+const fn script_rule(
+    id: &'static str,
+    title: &'static str,
+    capability: Capability,
+    default_severity: Severity,
+    surface_anchor: &'static str,
+    summary: &'static str,
+    review_guidance: &'static str,
+) -> RuleDefinition {
+    RuleDefinition {
+        id,
+        title,
+        language: Language::Shell,
+        capability,
+        default_severity,
+        surface_anchor,
+        summary,
+        review_guidance,
+    }
+}
+
 /// The seeded catalog, one entry per verified reachable sink plus the bar-replacement
 /// context capability. Detectors for these rules land in S3/S4; catalog publication
 /// precedes detector availability so IDs are stable from the first emitted report.
@@ -178,6 +207,33 @@ pub const CATALOG: &[RuleDefinition] = &[
         "FileView",
         "QML reads or watches files and may participate in writes.",
         "Raise priority for sensitive paths, persistence locations, or write participation.",
+    ),
+    qml_rule(
+        "oma.qml.sensitive-path",
+        "QML sensitive user-data path",
+        Capability::SensitivePath,
+        Severity::Low,
+        "Sensitive user-data paths",
+        "QML refers to credentials, keyrings, browser profiles, cloud credentials, wallets, or other sensitive user-data locations.",
+        "Capability indicator only: confirm whether the path is actually read and whether any dataflow reaches an outbound sink.",
+    ),
+    qml_rule(
+        "oma.qml.input-injection",
+        "QML input injection capability",
+        Capability::InputInjection,
+        Severity::Info,
+        "ydotool/wtype/wlrctl/hyprctl sendshortcut",
+        "QML can synthesize keyboard or pointer input through desktop automation tools.",
+        "Interactive accessibility workflows are legitimate; prioritize hidden, timer-driven, or dynamically controlled input.",
+    ),
+    qml_rule(
+        "oma.qml.screen-capture",
+        "QML screen capture capability",
+        Capability::ScreenCapture,
+        Severity::Info,
+        "grim/slurp/wf-recorder/hyprshot",
+        "QML can capture screen pixels or select a capture region.",
+        "Review the user-visible trigger and whether captured material reaches an outbound sink.",
     ),
     qml_rule(
         "oma.qml.network-access",
@@ -296,6 +352,123 @@ pub const CATALOG: &[RuleDefinition] = &[
         "Long base64-shaped literals suggest hidden payload material.",
         "Indicator only: decode the material manually and judge the decoded content.",
     ),
+    qml_rule(
+        "oma.qml.sensitive-data-egress",
+        "QML sends sensitive user data outward",
+        Capability::NetworkAccess,
+        Severity::High,
+        "Sensitive read connected to QML/Qt networking",
+        "Bounded dataflow connects a sensitive local-user-data read to an outbound network sink.",
+        "Treat as a concrete exfiltration path: identify the exact bytes read, destination, and user-visible consent boundary.",
+    ),
+    qml_rule(
+        "oma.qml.input-injection-background",
+        "QML performs background input injection",
+        Capability::InputInjection,
+        Severity::Medium,
+        "Input injection from timer/service/background lifecycle",
+        "Input automation is reachable from a background or lifecycle trigger rather than an explicit user action.",
+        "Verify whether the automation is an expected accessibility workflow; dynamic keystrokes increase concern.",
+    ),
+    qml_rule(
+        "oma.qml.screen-capture-background",
+        "QML captures the screen in the background",
+        Capability::ScreenCapture,
+        Severity::Medium,
+        "Screen capture from timer/service/background lifecycle",
+        "Screen capture is reachable without a clear user-visible trigger.",
+        "Review capture frequency, visibility, retention, and any outbound dataflow.",
+    ),
+    qml_rule(
+        "oma.qml.persistence-background",
+        "QML installs hidden persistence",
+        Capability::PersistenceScheduling,
+        Severity::Medium,
+        "Persistence location plus background activation",
+        "A persistence target is written or enabled from a background lifecycle path.",
+        "Confirm the declared plugin need and inspect the exact startup command and payload provenance.",
+    ),
+    script_rule(
+        "oma.script.sensitive-path",
+        "Script sensitive user-data path",
+        Capability::SensitivePath,
+        Severity::Low,
+        "Sensitive user-data paths in bundled scripts",
+        "A bundled script refers to credentials, keyrings, browser profiles, cloud credentials, wallets, or other sensitive user-data locations.",
+        "Capability indicator only: confirm whether the path is read and whether any dataflow reaches an outbound sink.",
+    ),
+    script_rule(
+        "oma.script.input-injection",
+        "Script input injection capability",
+        Capability::InputInjection,
+        Severity::Info,
+        "ydotool/wtype/wlrctl/hyprctl sendshortcut",
+        "A bundled script can synthesize keyboard or pointer input through desktop automation tools.",
+        "Interactive accessibility workflows are legitimate; prioritize hidden, timer-driven, or dynamically controlled input.",
+    ),
+    script_rule(
+        "oma.script.screen-capture",
+        "Script screen capture capability",
+        Capability::ScreenCapture,
+        Severity::Info,
+        "grim/slurp/wf-recorder/hyprshot",
+        "A bundled script can capture screen pixels or select a capture region.",
+        "Review the user-visible trigger and whether captured material reaches an outbound sink.",
+    ),
+    script_rule(
+        "oma.script.clipboard-access",
+        "Script clipboard capability",
+        Capability::ClipboardAccess,
+        Severity::Info,
+        "wl-paste/cliphist/xclip clipboard helpers",
+        "A bundled script reads, watches, or writes clipboard contents.",
+        "Reading or watching clipboard data is more sensitive than wl-copy writes; inspect lifecycle and destinations.",
+    ),
+    script_rule(
+        "oma.script.persistence-scheduling",
+        "Script persistence capability",
+        Capability::PersistenceScheduling,
+        Severity::Info,
+        "XDG autostart/systemd/user/cron/Hyprland persistence paths",
+        "A bundled script can install or enable user-level persistence.",
+        "Installing a declared user service can be legitimate; inspect hidden activation and dynamic payload provenance.",
+    ),
+    script_rule(
+        "oma.script.sensitive-data-egress",
+        "Script sends sensitive user data outward",
+        Capability::NetworkAccess,
+        Severity::High,
+        "Sensitive read connected to script network egress",
+        "Bounded lexical/dataflow evidence connects a sensitive local-user-data read to a network egress command.",
+        "Treat as a concrete exfiltration path: identify the exact bytes read, destination, and user-visible consent boundary.",
+    ),
+    script_rule(
+        "oma.script.input-injection-background",
+        "Script performs background input injection",
+        Capability::InputInjection,
+        Severity::Medium,
+        "Input injection from timer/service/background lifecycle",
+        "Input automation is reachable from a background or lifecycle trigger rather than an explicit user action.",
+        "Verify whether the automation is an expected accessibility workflow; dynamic keystrokes increase concern.",
+    ),
+    script_rule(
+        "oma.script.screen-capture-background",
+        "Script captures the screen in the background",
+        Capability::ScreenCapture,
+        Severity::Medium,
+        "Screen capture from timer/service/background lifecycle",
+        "Screen capture is reachable without a clear user-visible trigger.",
+        "Review capture frequency, visibility, retention, and any outbound dataflow.",
+    ),
+    script_rule(
+        "oma.script.persistence-background",
+        "Script installs hidden persistence",
+        Capability::PersistenceScheduling,
+        Severity::Medium,
+        "Persistence location plus background activation",
+        "A persistence target is written or enabled from a background lifecycle path.",
+        "Confirm the declared plugin need and inspect the exact startup command and payload provenance.",
+    ),
     RuleDefinition {
         id: "oma.script.download-execute",
         title: "Script downloads and executes remote content",
@@ -405,6 +578,26 @@ pub const CATALOG: &[RuleDefinition] = &[
         surface_anchor: "Plugin-kind prioritization (bar)",
         summary: "A third-party whole-bar plugin suppresses ambient bar widgets including OmaSafe's.",
         review_guidance: "Critical alerts must remain reachable via desktop notification/CLI independent of the bar.",
+    },
+    RuleDefinition {
+        id: "oma.payload.bundled-binary",
+        title: "Bundled executable binary",
+        language: Language::PayloadBinary,
+        capability: Capability::BundledBinary,
+        default_severity: Severity::Medium,
+        surface_anchor: "Payload inventory native-format classification and invocation edges",
+        summary: "A bundled executable binary is reachable from reviewed plugin code; unreferenced binaries remain inventory capability context.",
+        review_guidance: "Review the binary's provenance and digest. Reachability is a Medium finding, not proof of malicious behavior; remote downloads or digest changes require separate provenance controls.",
+    },
+    RuleDefinition {
+        id: "oma.context.omasafe-state-tamper",
+        title: "OmaSafe state or plugin checkout tamper intent",
+        language: Language::Context,
+        capability: Capability::FilesystemAccess,
+        default_severity: Severity::Medium,
+        surface_anchor: "OmaSafe state directory, sibling plugin checkouts, and git control paths",
+        summary: "Plugin code appears to write OmaSafe state, modify a sibling plugin checkout, or invoke git against another plugin directory.",
+        review_guidance: "This detects intent, not protection: a quiet result does not mean the plugin is protected. Same-user authority is unbounded; real protection is deferred to v0.5.",
     },
 ];
 
@@ -542,6 +735,12 @@ mod tests {
             ),
             ("oma.qml.detached-execution", "Quickshell.execDetached"),
             ("oma.qml.filesystem-access", "FileView"),
+            ("oma.qml.sensitive-path", "Sensitive user-data paths"),
+            (
+                "oma.qml.input-injection",
+                "ydotool/wtype/wlrctl/hyprctl sendshortcut",
+            ),
+            ("oma.qml.screen-capture", "grim/slurp/wf-recorder/hyprshot"),
             ("oma.qml.network-access", "QML/Qt networking"),
             (
                 "oma.qml.remote-component-load",
@@ -571,12 +770,72 @@ mod tests {
                 "PamContext using Omarchy lock services",
             ),
             (
+                "oma.qml.sensitive-data-egress",
+                "Sensitive read connected to QML/Qt networking",
+            ),
+            (
+                "oma.qml.input-injection-background",
+                "Input injection from timer/service/background lifecycle",
+            ),
+            (
+                "oma.qml.screen-capture-background",
+                "Screen capture from timer/service/background lifecycle",
+            ),
+            (
+                "oma.qml.persistence-background",
+                "Persistence location plus background activation",
+            ),
+            (
+                "oma.script.sensitive-path",
+                "Sensitive user-data paths in bundled scripts",
+            ),
+            (
+                "oma.script.input-injection",
+                "ydotool/wtype/wlrctl/hyprctl sendshortcut",
+            ),
+            (
+                "oma.script.screen-capture",
+                "grim/slurp/wf-recorder/hyprshot",
+            ),
+            (
+                "oma.script.clipboard-access",
+                "wl-paste/cliphist/xclip clipboard helpers",
+            ),
+            (
+                "oma.script.persistence-scheduling",
+                "XDG autostart/systemd/user/cron/Hyprland persistence paths",
+            ),
+            (
+                "oma.script.sensitive-data-egress",
+                "Sensitive read connected to script network egress",
+            ),
+            (
+                "oma.script.input-injection-background",
+                "Input injection from timer/service/background lifecycle",
+            ),
+            (
+                "oma.script.screen-capture-background",
+                "Screen capture from timer/service/background lifecycle",
+            ),
+            (
+                "oma.script.persistence-background",
+                "Persistence location plus background activation",
+            ),
+            (
                 "oma.shell.ipc-injected-objects",
                 "Plugin/shell injected objects and IPC",
             ),
             (
                 "oma.context.replaces-bar",
                 "Plugin-kind prioritization (bar)",
+            ),
+            (
+                "oma.payload.bundled-binary",
+                "Payload inventory native-format classification and invocation edges",
+            ),
+            (
+                "oma.context.omasafe-state-tamper",
+                "OmaSafe state directory, sibling plugin checkouts, and git control paths",
             ),
         ];
         assert_eq!(CATALOG.len(), expected.len());

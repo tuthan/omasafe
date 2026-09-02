@@ -5,6 +5,7 @@ complete -c omasafe-cli -l notify
 complete -c omasafe-cli -l only-new
 complete -c omasafe-cli -l include-analysis
 complete -c omasafe-cli -l yes
+complete -c omasafe-cli -l policy -r -a "advisory hardened"
 complete -c omasafe-cli -l expected-head -r
 complete -c omasafe-cli -l expected-tree -r
 complete -c omasafe-cli -l expected-digest -r
@@ -12,6 +13,7 @@ complete -c omasafe-cli -l action -r -a "acknowledge exclude rebaseline restore 
 complete -c omasafe-cli -l reason -r
 complete -c omasafe-cli -l rule -r
 complete -c omasafe-cli -l commit -r
+complete -c omasafe-cli -l expires -r
 complete -c omasafe-cli -l path -r
 complete -c omasafe-cli -l git -r
 complete -c omasafe-cli -l revision -r

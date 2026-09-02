@@ -26,6 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from corpus_common import resolve_plugin_dir, run_git, sample_plugins  # noqa: E402
+from bounded_process import run_bounded  # noqa: E402
 
 
 def log(message):
@@ -34,15 +35,14 @@ def log(message):
 
 def omarchy_version():
     try:
-        result = subprocess.run(
-            ["omarchy", "version"], capture_output=True, text=True, timeout=30
-        )
+        result = run_bounded(["omarchy", "version"], timeout=30)
     except (OSError, subprocess.TimeoutExpired):
         return None
     if result.returncode != 0:
         return None
     # e.g. "4.0.1-1" or "omarchy 4.0.1"
-    for token in result.stdout.split():
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    for token in stdout.split():
         if token[0:1].isdigit():
             return token.split("-")[0]
     return None
@@ -75,7 +75,7 @@ def verdict(command):
     label = "error"
     detail = ""
     try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=120)
+        result = run_bounded(command, timeout=120)
     except (OSError, subprocess.TimeoutExpired) as error:
         detail = str(error)[:200]
         return (label, detail)
@@ -84,7 +84,8 @@ def verdict(command):
     elif result.returncode == 1:
         label = "invalid"
     else:
-        detail = f"exit {result.returncode}: {result.stderr.strip()[:180]}"
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        detail = f"exit {result.returncode}: {stderr.strip()[:180]}"
     return (label, detail)
 
 

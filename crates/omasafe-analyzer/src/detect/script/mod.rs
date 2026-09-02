@@ -11,6 +11,7 @@ use crate::detect::model::{
     PYTHON_REVERSE_SHELL_RULE, SCRIPT_DOWNLOAD_EXECUTE_RULE, SCRIPT_PRIVILEGE_RULE,
     disclose_budget_limitation, find_word, occurrence, parts, strip_line_comment, unquoted_text,
 };
+use crate::detect::references::{ReferenceCandidate, SinkPosition, is_path_shaped};
 use crate::detect::shell::budget::ShellBudget;
 use crate::detect::shell::command::{
     ScriptCommand, command_arguments, command_basename, env_split_string_command,
@@ -30,6 +31,9 @@ use crate::detect::shell::xargs::xargs_body_fate;
 use crate::fingerprint::Confidence;
 use crate::payload::PayloadKind;
 use crate::rules::{Capability, Language};
+use omasafe_core::bounds::{MAX_STAGED_CHAIN_LINES, STAGED_CHAIN_TIME_BUDGET};
+use std::collections::BTreeMap;
+use std::time::Instant;
 
 /// Minimal high-signal lexical rules for bundled shell/Python payloads.
 /// Coverage is always labelled `partial`; no match never implies clean.
@@ -266,11 +270,216 @@ pub(in crate::detect) fn analyze_script_source(source: &str, kind: PayloadKind) 
         }
     }
 
+    if matches!(kind, PayloadKind::Shell) {
+        analyze_staged_script_chain(source, &mut outcome);
+    }
+
     if budget_exhausted {
         disclose_budget_limitation(&mut outcome);
     }
 
     outcome
+}
+
+#[derive(Clone, Copy)]
+struct StagedDownload {
+    chmod_x: bool,
+    fetch_line: u32,
+}
+
+/// Bounded lexical state tracker for the multi-line shell shape
+/// `curl/wget -> -o PATH -> chmod +x PATH -> PATH`. This intentionally does
+/// not parse shell dataflow; it only carries exact static path words between
+/// adjacent command statements and reports a lexical-fallback finding once
+/// the same path is both released and executed.
+fn analyze_staged_script_chain(source: &str, outcome: &mut FileOutcome) {
+    let deadline = Instant::now() + STAGED_CHAIN_TIME_BUDGET;
+    let mut downloads: BTreeMap<String, StagedDownload> = BTreeMap::new();
+    for (line_index, raw_line) in source.lines().enumerate() {
+        if line_index >= MAX_STAGED_CHAIN_LINES || Instant::now() >= deadline {
+            outcome
+                .limitations
+                .push("staged-script-analysis-budget-exhausted".to_owned());
+            break;
+        }
+        let number = line_index as u32 + 1;
+        let line = strip_shell_comment(raw_line);
+        if line.trim().is_empty() {
+            continue;
+        }
+        let tokens = tokenize(line);
+        for (statement, guard) in conditional_statements(&tokens) {
+            if guard.is_some_and(|guard| guard == "false") {
+                continue;
+            }
+            for segment in pipeline_segments(statement) {
+                let commands = segment_commands(segment);
+                let Some(head) = commands.last().map(|command| command.head) else {
+                    continue;
+                };
+                if matches!(head, "curl" | "wget")
+                    && let Some(path) = fetch_output_path(segment)
+                {
+                    downloads.insert(
+                        path,
+                        StagedDownload {
+                            chmod_x: false,
+                            fetch_line: number,
+                        },
+                    );
+                    continue;
+                }
+                if head == "chmod"
+                    && let Some(path) = chmod_x_path(segment)
+                    && let Some(download) = downloads.get_mut(&path)
+                {
+                    download.chmod_x = true;
+                    continue;
+                }
+                let Some(path) = executed_path(segment) else {
+                    continue;
+                };
+                if let Some(download) = downloads.get(&path).copied()
+                    && download.chmod_x
+                {
+                    outcome.result_parts.push(parts(
+                        SCRIPT_DOWNLOAD_EXECUTE_RULE,
+                        number,
+                        format!(
+                            "staged-download-execute:{path}:fetched-line-{}",
+                            download.fetch_line
+                        ),
+                        Confidence::LexicalFallback,
+                    ));
+                    downloads.remove(&path);
+                }
+            }
+        }
+    }
+}
+
+/// Strip shell comments for the staged-chain pass without treating URL
+/// fragments (`https://host/#payload`) as comments. In shell grammar `#`
+/// starts a comment at the beginning of a word, outside quotes, unless it is
+/// escaped; a `#` embedded in a word is ordinary data.
+pub(in crate::detect) fn strip_shell_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut quote = None;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(active) = quote {
+            if byte == b'\\' && active == b'"' {
+                index += 2;
+                continue;
+            }
+            if byte == active {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'\'' | b'"' => quote = Some(byte),
+            b'#' if index == 0 || is_shell_word_boundary(bytes[index - 1]) => {
+                return &line[..index];
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    line
+}
+
+fn is_shell_word_boundary(byte: u8) -> bool {
+    byte.is_ascii_whitespace() || matches!(byte, b';' | b'|' | b'&' | b'(' | b')' | b'{' | b'}')
+}
+
+fn fetch_output_path(segment: &[ShellToken]) -> Option<String> {
+    let mut index = 0usize;
+    while index < segment.len() {
+        match &segment[index] {
+            ShellToken::Word { value, dynamic, .. } if !*dynamic => {
+                if matches!(value.as_str(), "-o" | "--output" | "--output-document") {
+                    return segment.get(index + 1).and_then(static_word);
+                }
+                if let Some(path) = value
+                    .strip_prefix("--output=")
+                    .or_else(|| value.strip_prefix("--output-document="))
+                {
+                    return (!path.is_empty()).then(|| path.to_owned());
+                }
+            }
+            ShellToken::Operator(operator) if is_redirect_operator(operator) => {
+                return segment.get(index + 1).and_then(static_word);
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+fn chmod_x_path(segment: &[ShellToken]) -> Option<String> {
+    let command = segment_commands(segment)
+        .into_iter()
+        .find(|command| command.head == "chmod")?;
+    let releases = command
+        .args
+        .iter()
+        .any(|arg| matches!(*arg, "+x" | "a+x" | "u+x" | "go+x" | "o+x" | "g+x"));
+    if !releases {
+        return None;
+    }
+    command
+        .args
+        .iter()
+        .rev()
+        .find(|arg| !arg.starts_with('-') && !arg.contains('+'))
+        .map(|arg| (*arg).to_owned())
+}
+
+fn executed_path(segment: &[ShellToken]) -> Option<String> {
+    let commands = segment_commands(segment);
+    if commands.iter().any(|command| {
+        matches!(
+            command.head,
+            "sudo" | "pkexec" | "doas" | "env" | "exec" | "time"
+        )
+    }) {
+        // Wrapper command arguments retain the exact path spelling even
+        // though `ScriptCommand.head` is normalized to a basename.
+        if let Some(path) = commands
+            .iter()
+            .flat_map(|command| command.args.iter().copied())
+            .rev()
+            .find(|argument| argument.contains('/'))
+        {
+            return Some(path.to_owned());
+        }
+    }
+    let mut index = 0usize;
+    skip_command_prefixes(segment, &mut index);
+    let head = segment.get(index).and_then(static_word)?;
+    if head.starts_with('/') || head.starts_with("./") || head.contains('/') {
+        return Some(head);
+    }
+    if matches!(
+        command_basename(&head),
+        "sh" | "bash" | "dash" | "zsh" | "ksh" | "ash"
+    ) {
+        return segment
+            .get(index + 1..)
+            .and_then(|tail| tail.iter().find_map(static_word));
+    }
+    None
+}
+
+fn static_word(token: &ShellToken) -> Option<String> {
+    match token {
+        ShellToken::Word { value, dynamic, .. } if !*dynamic => Some(value.clone()),
+        _ => None,
+    }
 }
 
 /// Analyze one already-tokenized unit. Shell callers provide the token stream
@@ -300,6 +509,22 @@ fn analyze_script_unit(
     // in separate statements of one line. Shell consumption families below
     // are statement-scoped instead.
     let code = unquoted_text(line);
+    if matches!(kind, PayloadKind::Shell) {
+        // A script's command position is a verified execution sink too. Keep
+        // only static path-shaped words; dynamic shell expansions remain
+        // capability context and never become guessed cross-file edges.
+        for segment in pipeline_segments(tokens) {
+            if let Some(path) = executed_path(segment)
+                && is_path_shaped(&path)
+            {
+                outcome.references.push(ReferenceCandidate {
+                    line: number,
+                    value: path,
+                    sink: Some(SinkPosition::ProcessCommand),
+                });
+            }
+        }
+    }
     let python_fetch_to_exec = matches!(kind, PayloadKind::Python)
         && (code.contains("urlopen") || code.contains("requests.get") || code.contains("urllib"))
         && (code.contains("os.system")

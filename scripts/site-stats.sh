@@ -7,7 +7,7 @@
 # copy the values into site/index.html, and move the snapshot dates with them.
 #
 # Sources:
-#   - Omarchy plugin catalog: https://omarchyplugins.com/catalog.json
+#   - Omarchy plugin catalog: https://plugins.omarchy.org/catalog.json
 #       (the site is a client-rendered SPA; the real catalog is this JSON, not the
 #        rendered HTML, so a plain page fetch reports zero plugins.)
 #   - Arch User Repository:   https://aur.archlinux.org/packages-meta-ext-v1.json.gz
@@ -16,7 +16,7 @@
 #
 set -euo pipefail
 
-CATALOG_URL="https://omarchyplugins.com/catalog.json"
+CATALOG_URL="https://plugins.omarchy.org/catalog.json"
 AUR_URL="https://aur.archlinux.org/packages-meta-ext-v1.json.gz"
 
 work="$(mktemp -d)"

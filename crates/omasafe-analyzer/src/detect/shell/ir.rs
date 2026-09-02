@@ -5,7 +5,9 @@
 //! depth-capped children retain a bounded token fallback. Compound groups
 //! remain nodes of their own instead of being mistaken for ordinary argv.
 
-use super::budget::MAX_SHELL_ANALYSIS_DEPTH;
+use std::sync::Arc;
+
+use super::budget::{MAX_SHELL_PARSE_DEPTH, ShellParseBudget};
 use super::command::{
     ScriptCommand, command_arguments, command_basename, env_split_string_command,
     is_redirect_operator, segment_commands, skip_command_prefixes, skip_wrapper_options,
@@ -66,7 +68,7 @@ pub(in crate::detect) struct Word {
 pub(in crate::detect) struct ExecutedSubstitution {
     pub(in crate::detect) kind: SubstKind,
     pub(in crate::detect) source: String,
-    pub(in crate::detect) program: Option<Box<ShellProgram>>,
+    pub(in crate::detect) program: Option<Arc<ShellProgram>>,
 }
 
 /// One redirection at the command node's own nesting depth.
@@ -102,7 +104,7 @@ pub(in crate::detect) struct Command {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::detect) struct ExecutedBody {
     pub(in crate::detect) source: String,
-    pub(in crate::detect) program: Option<Box<ShellProgram>>,
+    pub(in crate::detect) program: Option<Arc<ShellProgram>>,
 }
 
 /// Reachability of a statement or branch under the shell's known status
@@ -212,6 +214,7 @@ pub(in crate::detect) struct LogicalUnit {
     source: String,
     tokens: Vec<ShellToken>,
     pub(in crate::detect) statements: Vec<Statement>,
+    parse_budget_exhausted: bool,
 }
 
 impl LogicalUnit {
@@ -226,7 +229,7 @@ impl LogicalUnit {
     /// Whether this unit contains an opaque or depth-capped child that needs
     /// the bounded token fallback.
     pub(in crate::detect) fn requires_legacy_fallback(&self) -> bool {
-        statements_require_legacy_fallback(&self.statements)
+        self.parse_budget_exhausted || statements_require_legacy_fallback(&self.statements)
     }
 }
 
@@ -235,32 +238,45 @@ impl LogicalUnit {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(in crate::detect) struct ShellProgram {
     pub(in crate::detect) units: Vec<LogicalUnit>,
+    parse_budget_exhausted: bool,
 }
 
 impl ShellProgram {
     /// Parse the source units emitted by the shell source assembler.
     pub(in crate::detect) fn from_units(units: Vec<(u32, String)>) -> Self {
-        Self::from_units_at_depth(units, 0)
+        let mut budget = ShellParseBudget::new();
+        Self::from_units_at_depth(units, 0, &mut budget)
     }
 
-    fn from_units_at_depth(units: Vec<(u32, String)>, depth: usize) -> Self {
+    fn from_units_at_depth(
+        units: Vec<(u32, String)>,
+        depth: usize,
+        budget: &mut ShellParseBudget,
+    ) -> Self {
+        let parsed_units = units
+            .into_iter()
+            .map(|(start_line, source)| parse_unit_with_depth(start_line, source, depth, budget))
+            .collect();
         Self {
-            units: units
-                .into_iter()
-                .map(|(start_line, source)| parse_unit_with_depth(start_line, source, depth))
-                .collect(),
+            units: parsed_units,
+            parse_budget_exhausted: budget.exhausted(),
         }
     }
 
     /// Parse shell text through the same logical-unit and heredoc assembler
     /// used by top-level source, preserving the caller's recursion depth.
     pub(in crate::detect) fn from_source(source: &str, depth: usize) -> Self {
+        let mut budget = ShellParseBudget::new();
+        Self::from_source_with_budget(source, depth, &mut budget)
+    }
+
+    fn from_source_with_budget(source: &str, depth: usize, budget: &mut ShellParseBudget) -> Self {
         let units = super::source::shell_logical_units(
             source,
             &crate::detect::script::classify_heredoc_owner,
             &crate::detect::script::forwarded_body_fate,
         );
-        Self::from_units_at_depth(units, depth)
+        Self::from_units_at_depth(units, depth, budget)
     }
 
     pub(in crate::detect) fn units(&self) -> &[LogicalUnit] {
@@ -272,7 +288,7 @@ impl ShellProgram {
     /// through the typed IR; callers use this bit to keep opaque/depth-capped
     /// syntax conservative and disclose the resulting coverage limitation.
     pub(in crate::detect) fn requires_legacy_fallback(&self) -> bool {
-        self.units.iter().any(LogicalUnit::requires_legacy_fallback)
+        self.parse_budget_exhausted || self.units.iter().any(LogicalUnit::requires_legacy_fallback)
     }
 }
 
@@ -286,6 +302,13 @@ fn statements_require_legacy_fallback(statements: &[Statement]) -> bool {
 }
 
 fn node_requires_legacy_fallback(node: &CommandNode) -> bool {
+    if node_redirects(node)
+        .iter()
+        .filter_map(|redirect| redirect.target.as_ref())
+        .any(word_requires_legacy_fallback)
+    {
+        return true;
+    }
     match node {
         CommandNode::Simple(command) => {
             command.body.as_ref().is_some_and(|body| {
@@ -352,6 +375,20 @@ fn node_requires_legacy_fallback(node: &CommandNode) -> bool {
     }
 }
 
+fn node_redirects(node: &CommandNode) -> &[Redirect] {
+    match node {
+        CommandNode::Simple(command) => &command.redirects,
+        CommandNode::Subshell { redirects, .. }
+        | CommandNode::BraceGroup { redirects, .. }
+        | CommandNode::Arithmetic { redirects, .. }
+        | CommandNode::If { redirects, .. }
+        | CommandNode::Loop { redirects, .. }
+        | CommandNode::For { redirects, .. }
+        | CommandNode::Case { redirects, .. }
+        | CommandNode::Opaque { redirects, .. } => redirects,
+    }
+}
+
 fn word_requires_legacy_fallback(word: &Word) -> bool {
     word.substitutions
         .iter()
@@ -367,91 +404,139 @@ fn substitution_requires_legacy_fallback(substitution: &ExecutedSubstitution) ->
             .is_some_and(ShellProgram::requires_legacy_fallback)
 }
 
-fn parse_unit_with_depth(start_line: u32, source: String, depth: usize) -> LogicalUnit {
+fn parse_unit_with_depth(
+    start_line: u32,
+    source: String,
+    depth: usize,
+    budget: &mut ShellParseBudget,
+) -> LogicalUnit {
     let tokens = super::lexer::tokenize(&source);
-    let statements = parse_statements(&tokens, depth);
+    let statements = if budget.spend_node() {
+        parse_statements(&tokens, depth, budget)
+    } else {
+        vec![opaque_statement()]
+    };
     LogicalUnit {
         start_line,
         source,
         tokens,
         statements,
+        parse_budget_exhausted: budget.exhausted(),
     }
 }
 
-fn child_program(source: &str, depth: usize) -> Option<Box<ShellProgram>> {
-    (depth < MAX_SHELL_ANALYSIS_DEPTH as usize)
-        .then(|| Box::new(ShellProgram::from_source(source, depth)))
+fn child_program(
+    source: &str,
+    depth: usize,
+    budget: &mut ShellParseBudget,
+) -> Option<Arc<ShellProgram>> {
+    if depth >= MAX_SHELL_PARSE_DEPTH || !budget.reserve_child(source.len()) {
+        return None;
+    }
+    Some(Arc::new(ShellProgram::from_source_with_budget(
+        source, depth, budget,
+    )))
 }
 
-fn parse_statements(tokens: &[ShellToken], depth: usize) -> Vec<Statement> {
+fn parse_statements(
+    tokens: &[ShellToken],
+    depth: usize,
+    budget: &mut ShellParseBudget,
+) -> Vec<Statement> {
     let mut outcomes = Outcomes::ANY;
-    control_aware_statements(tokens)
+    let mut parsed_statements = Vec::new();
+    for (statement, guard) in control_aware_statements(tokens)
         .into_iter()
         .filter(|(statement, _)| !statement.is_empty())
-        .map(|(statement, guard)| {
-            let reachable = statement_reachability(outcomes, guard);
-            let commands: Vec<CommandNode> = pipeline_segments(statement)
-                .into_iter()
-                .filter(|segment| !segment.is_empty())
-                .map(|segment| parse_command_node(segment, depth))
-                .collect();
-            let parsed = Statement {
-                guard: Guard::from_operator(guard),
-                reachable,
-                pipelines: if commands.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![Pipeline {
-                        negated: pipeline_negated(statement),
-                        commands,
-                    }]
-                },
-            };
-            outcomes = outcomes.advance(guard, statement_outcomes(statement));
-            parsed
-        })
-        .collect()
+    {
+        if !budget.spend_node() {
+            parsed_statements.push(opaque_statement());
+            break;
+        }
+        let reachable = statement_reachability(outcomes, guard);
+        let commands: Vec<CommandNode> = pipeline_segments(statement)
+            .into_iter()
+            .filter(|segment| !segment.is_empty())
+            .map(|segment| parse_command_node(segment, depth, budget))
+            .collect();
+        let parsed = Statement {
+            guard: Guard::from_operator(guard),
+            reachable,
+            pipelines: if commands.is_empty() {
+                Vec::new()
+            } else {
+                vec![Pipeline {
+                    negated: pipeline_negated(statement),
+                    commands,
+                }]
+            },
+        };
+        outcomes = outcomes.advance(guard, statement_outcomes(statement));
+        parsed_statements.push(parsed);
+    }
+    parsed_statements
 }
 
-fn parse_command_node(segment: &[ShellToken], depth: usize) -> CommandNode {
+fn opaque_statement() -> Statement {
+    Statement {
+        guard: Guard::Unconditional,
+        reachable: Reachability::Maybe,
+        pipelines: vec![Pipeline {
+            negated: false,
+            commands: vec![CommandNode::Opaque {
+                words: Vec::new(),
+                redirects: Vec::new(),
+            }],
+        }],
+    }
+}
+
+fn parse_command_node(
+    segment: &[ShellToken],
+    depth: usize,
+    budget: &mut ShellParseBudget,
+) -> CommandNode {
+    if !budget.spend_node() {
+        return opaque_node();
+    }
     if let Some((open, kind)) = compound_open(segment) {
         let Some(close) = matching_group_close(segment, open) else {
-            return opaque_node(segment, depth);
+            return opaque_node();
         };
-        if depth >= MAX_SHELL_ANALYSIS_DEPTH as usize {
-            return opaque_node(segment, depth);
+        if depth >= MAX_SHELL_PARSE_DEPTH {
+            return opaque_node();
         }
-        let redirects = redirects_at_depth_zero(segment, depth);
+        let redirects = redirects_at_depth_zero(segment, depth, budget);
         return match kind {
             GroupKind::List if segment[open].operator() == Some("{") => CommandNode::BraceGroup {
-                body: parse_statements(&segment[open + 1..close], depth + 1),
+                body: parse_statements(&segment[open + 1..close], depth + 1, budget),
                 redirects,
             },
             GroupKind::List => CommandNode::Subshell {
-                body: parse_statements(&segment[open + 1..close], depth + 1),
+                body: parse_statements(&segment[open + 1..close], depth + 1, budget),
                 redirects,
             },
             GroupKind::Arithmetic => CommandNode::Arithmetic {
                 expression: segment[open + 1..close]
                     .iter()
-                    .filter_map(|token| word_from_token_at_depth(token, depth + 1))
+                    .filter_map(|token| word_from_token_at_depth(token, depth + 1, budget))
                     .collect(),
                 redirects,
             },
         };
     }
 
-    if depth < MAX_SHELL_ANALYSIS_DEPTH as usize
-        && let Some(node) = parse_control_flow(segment, depth)
+    if depth < MAX_SHELL_PARSE_DEPTH
+        && let Some(node) = parse_control_flow(segment, depth, budget)
     {
         return node;
     }
 
     let commands = segment_commands(segment);
     let Some(last) = commands.last() else {
-        return opaque_node(segment, depth);
+        return opaque_node();
     };
-    let args = command_args(segment, last, depth).unwrap_or_else(|| {
+    let args = command_args(segment, last, depth, budget).unwrap_or_else(|| {
         last.args
             .iter()
             .zip(last.arg_dynamic.iter().copied())
@@ -459,7 +544,7 @@ fn parse_command_node(segment: &[ShellToken], depth: usize) -> CommandNode {
             .collect()
     });
     let head_substitutions = command_start(segment)
-        .and_then(|start| word_from_token_at_depth(segment.get(start)?, depth))
+        .and_then(|start| word_from_token_at_depth(segment.get(start)?, depth, budget))
         .map(|word| word.substitutions)
         .unwrap_or_default();
     let wrappers = commands[..commands.len() - 1]
@@ -467,14 +552,14 @@ fn parse_command_node(segment: &[ShellToken], depth: usize) -> CommandNode {
         .map(command_wrapper)
         .collect();
     let body = super::interpreter::static_command_body(last).map(|source| ExecutedBody {
-        program: child_program(&source, depth + 1),
+        program: child_program(&source, depth + 1, budget),
         source,
     });
     CommandNode::Simple(Command {
         head: last.head.to_owned(),
         head_substitutions,
         args,
-        redirects: redirects_at_depth_zero(segment, depth),
+        redirects: redirects_at_depth_zero(segment, depth, budget),
         wrappers,
         body,
     })
@@ -511,15 +596,19 @@ fn compound_open(segment: &[ShellToken]) -> Option<(usize, GroupKind)> {
     None
 }
 
-fn parse_control_flow(segment: &[ShellToken], depth: usize) -> Option<CommandNode> {
+fn parse_control_flow(
+    segment: &[ShellToken],
+    depth: usize,
+    budget: &mut ShellParseBudget,
+) -> Option<CommandNode> {
     let mut index = 0usize;
     skip_command_prefixes(segment, &mut index);
     match segment.get(index).and_then(ShellToken::syntax_word)? {
-        "if" => parse_if(segment, index, depth),
-        "while" => parse_loop(segment, index, depth, WhileOrUntil::While),
-        "until" => parse_loop(segment, index, depth, WhileOrUntil::Until),
-        "for" => parse_for(segment, index, depth),
-        "case" => parse_case(segment, index, depth),
+        "if" => parse_if(segment, index, depth, budget),
+        "while" => parse_loop(segment, index, depth, WhileOrUntil::While, budget),
+        "until" => parse_loop(segment, index, depth, WhileOrUntil::Until, budget),
+        "for" => parse_for(segment, index, depth, budget),
+        "case" => parse_case(segment, index, depth, budget),
         _ => None,
     }
 }
@@ -692,14 +781,19 @@ fn command_node_outcomes(node: &CommandNode) -> Outcomes {
     }
 }
 
-fn parse_if(segment: &[ShellToken], start: usize, depth: usize) -> Option<CommandNode> {
+fn parse_if(
+    segment: &[ShellToken],
+    start: usize,
+    depth: usize,
+    budget: &mut ShellParseBudget,
+) -> Option<CommandNode> {
     let then_index = control_marker_index(segment, &["then"], start + 1)?;
-    let condition = parse_statements(&segment[start + 1..then_index], depth + 1);
+    let condition = parse_statements(&segment[start + 1..then_index], depth + 1, budget);
     let fi_index = control_marker_index(segment, &["fi"], then_index + 1)?;
     let then_end = control_marker_index(segment, &["elif", "else", "fi"], then_index + 1)
         .filter(|index| *index < fi_index)
         .unwrap_or(fi_index);
-    let mut then_body = parse_statements(&segment[then_index + 1..then_end], depth + 1);
+    let mut then_body = parse_statements(&segment[then_index + 1..then_end], depth + 1, budget);
     let condition_gate = condition_reachability(&condition);
     let mut remaining = gate_with_condition(Reachability::Always, condition_gate, true);
     apply_gate_reachability(&mut then_body, remaining);
@@ -715,8 +809,9 @@ fn parse_if(segment: &[ShellToken], start: usize, depth: usize) -> Option<Comman
                     .filter(|index| *index < fi_index)
                     .unwrap_or(fi_index);
             let mut branch_condition =
-                parse_statements(&segment[cursor + 1..branch_then], depth + 1);
-            let mut body = parse_statements(&segment[branch_then + 1..branch_end], depth + 1);
+                parse_statements(&segment[cursor + 1..branch_then], depth + 1, budget);
+            let mut body =
+                parse_statements(&segment[branch_then + 1..branch_end], depth + 1, budget);
             let branch_condition_reachability = condition_reachability(&branch_condition);
             apply_gate_reachability(&mut branch_condition, remaining);
             let branch_gate = gate_with_condition(remaining, branch_condition_reachability, true);
@@ -732,7 +827,7 @@ fn parse_if(segment: &[ShellToken], start: usize, depth: usize) -> Option<Comman
         }
     }
     let else_body = if cursor < fi_index && segment[cursor].syntax_word() == Some("else") {
-        let mut body = parse_statements(&segment[cursor + 1..fi_index], depth + 1);
+        let mut body = parse_statements(&segment[cursor + 1..fi_index], depth + 1, budget);
         apply_gate_reachability(&mut body, remaining);
         body
     } else {
@@ -743,7 +838,7 @@ fn parse_if(segment: &[ShellToken], start: usize, depth: usize) -> Option<Comman
         then_body,
         elif_branches,
         else_body,
-        redirects: redirects_around_control(segment, depth, start, fi_index),
+        redirects: redirects_around_control(segment, depth, start, fi_index, budget),
     })
 }
 
@@ -752,11 +847,12 @@ fn parse_loop(
     start: usize,
     depth: usize,
     kind: WhileOrUntil,
+    budget: &mut ShellParseBudget,
 ) -> Option<CommandNode> {
     let do_index = control_marker_index(segment, &["do"], start + 1)?;
     let done_index = control_marker_index(segment, &["done"], do_index + 1)?;
-    let condition = parse_statements(&segment[start + 1..do_index], depth + 1);
-    let mut body = parse_statements(&segment[do_index + 1..done_index], depth + 1);
+    let condition = parse_statements(&segment[start + 1..do_index], depth + 1, budget);
+    let mut body = parse_statements(&segment[do_index + 1..done_index], depth + 1, budget);
     let condition_reachability = condition_reachability(&condition);
     let body_reachability = match (kind, condition_reachability) {
         (WhileOrUntil::While, Reachability::Never)
@@ -778,22 +874,27 @@ fn parse_loop(
         kind,
         condition,
         body,
-        redirects: redirects_around_control(segment, depth, start, done_index),
+        redirects: redirects_around_control(segment, depth, start, done_index, budget),
     })
 }
 
-fn parse_for(segment: &[ShellToken], start: usize, depth: usize) -> Option<CommandNode> {
-    let variable = word_from_token_at_depth(segment.get(start + 1)?, depth)?;
+fn parse_for(
+    segment: &[ShellToken],
+    start: usize,
+    depth: usize,
+    budget: &mut ShellParseBudget,
+) -> Option<CommandNode> {
+    let variable = word_from_token_at_depth(segment.get(start + 1)?, depth, budget)?;
     let do_index = control_marker_index(segment, &["do"], start + 2)?;
     let in_index = control_marker_index(segment, &["in"], start + 2);
     let words_start = in_index.map_or(start + 2, |index| index + 1);
     let words_end = do_index;
     let words: Vec<Word> = segment[words_start..words_end]
         .iter()
-        .filter_map(|token| word_from_token_at_depth(token, depth))
+        .filter_map(|token| word_from_token_at_depth(token, depth, budget))
         .collect();
     let done_index = control_marker_index(segment, &["done"], do_index + 1)?;
-    let mut body = parse_statements(&segment[do_index + 1..done_index], depth + 1);
+    let mut body = parse_statements(&segment[do_index + 1..done_index], depth + 1, budget);
     let body_reachability = if in_index.is_none() {
         Reachability::Maybe
     } else if words.is_empty() {
@@ -806,16 +907,21 @@ fn parse_for(segment: &[ShellToken], start: usize, depth: usize) -> Option<Comma
         variable,
         words,
         body,
-        redirects: redirects_around_control(segment, depth, start, done_index),
+        redirects: redirects_around_control(segment, depth, start, done_index, budget),
     })
 }
 
-fn parse_case(segment: &[ShellToken], start: usize, depth: usize) -> Option<CommandNode> {
+fn parse_case(
+    segment: &[ShellToken],
+    start: usize,
+    depth: usize,
+    budget: &mut ShellParseBudget,
+) -> Option<CommandNode> {
     let in_index = control_marker_index(segment, &["in"], start + 1)?;
     let end = control_marker_index(segment, &["esac"], in_index + 1)?;
     let word = segment[start + 1..in_index]
         .iter()
-        .find_map(|token| word_from_token_at_depth(token, depth))?;
+        .find_map(|token| word_from_token_at_depth(token, depth, budget))?;
     let mut branches = Vec::new();
     let mut cursor = in_index + 1;
     while cursor < end {
@@ -831,7 +937,7 @@ fn parse_case(segment: &[ShellToken], start: usize, depth: usize) -> Option<Comm
         }
         let patterns = segment[cursor..close]
             .iter()
-            .filter_map(|token| word_from_token_at_depth(token, depth))
+            .filter_map(|token| word_from_token_at_depth(token, depth, budget))
             .collect();
         let body_start = close + 1;
         let mut body_end = end;
@@ -846,20 +952,24 @@ fn parse_case(segment: &[ShellToken], start: usize, depth: usize) -> Option<Comm
             }
             index += 1;
         }
-        let body = parse_statements(&segment[body_start..body_end], depth + 1);
+        let body = parse_statements(&segment[body_start..body_end], depth + 1, budget);
         branches.push(CaseBranch { patterns, body });
         cursor = terminator.unwrap_or(end);
     }
     Some(CommandNode::Case {
         word,
         branches,
-        redirects: redirects_around_control(segment, depth, start, end),
+        redirects: redirects_around_control(segment, depth, start, end, budget),
     })
 }
 
 /// Collect redirects that belong to the command node itself. Redirects in a
 /// nested compound body are left with that body's node.
-fn redirects_at_depth_zero(segment: &[ShellToken], depth: usize) -> Vec<Redirect> {
+fn redirects_at_depth_zero(
+    segment: &[ShellToken],
+    depth: usize,
+    budget: &mut ShellParseBudget,
+) -> Vec<Redirect> {
     let mut redirects = Vec::new();
     let mut nesting = 0i32;
     let mut index = 0usize;
@@ -869,11 +979,14 @@ fn redirects_at_depth_zero(segment: &[ShellToken], depth: usize) -> Vec<Redirect
                 "(" | "{" | "((" => nesting += 1,
                 ")" | "}" | "))" => nesting = (nesting - 1).max(0),
                 operator if nesting == 0 && is_redirect_operator(operator) => {
+                    if !budget.spend_node() {
+                        break;
+                    }
                     redirects.push(Redirect {
                         operator: operator.to_owned(),
                         target: segment
                             .get(index + 1)
-                            .and_then(|token| word_from_token_at_depth(token, depth)),
+                            .and_then(|token| word_from_token_at_depth(token, depth, budget)),
                     });
                     index += 1; // the target is data, not another redirect
                 }
@@ -894,9 +1007,14 @@ fn redirects_around_control(
     depth: usize,
     opener: usize,
     closer: usize,
+    budget: &mut ShellParseBudget,
 ) -> Vec<Redirect> {
-    let mut redirects = redirects_at_depth_zero(&segment[..opener], depth);
-    redirects.extend(redirects_at_depth_zero(&segment[closer + 1..], depth));
+    let mut redirects = redirects_at_depth_zero(&segment[..opener], depth, budget);
+    redirects.extend(redirects_at_depth_zero(
+        &segment[closer + 1..],
+        depth,
+        budget,
+    ));
     redirects
 }
 
@@ -929,6 +1047,7 @@ fn command_args(
     segment: &[ShellToken],
     command: &ScriptCommand<'_>,
     depth: usize,
+    budget: &mut ShellParseBudget,
 ) -> Option<Vec<Word>> {
     let start = command_start(segment)?;
     let arguments = command_arguments(segment, start + 1);
@@ -946,7 +1065,9 @@ fn command_args(
                 }
             }
             ShellToken::Word { .. } => {
-                args.push(word_from_token_at_depth(&segment[index], depth).expect("word token"));
+                args.push(
+                    word_from_token_at_depth(&segment[index], depth, budget).expect("word token"),
+                );
                 index += 1;
             }
             ShellToken::Operator(_) => index += 1,
@@ -967,17 +1088,18 @@ fn command_wrapper(command: &ScriptCommand<'_>) -> CommandWrapper {
     }
 }
 
-fn opaque_node(segment: &[ShellToken], depth: usize) -> CommandNode {
+fn opaque_node() -> CommandNode {
     CommandNode::Opaque {
-        words: segment
-            .iter()
-            .filter_map(|token| word_from_token_at_depth(token, depth))
-            .collect(),
-        redirects: redirects_at_depth_zero(segment, depth),
+        words: Vec::new(),
+        redirects: Vec::new(),
     }
 }
 
-fn word_from_token_at_depth(token: &ShellToken, depth: usize) -> Option<Word> {
+fn word_from_token_at_depth(
+    token: &ShellToken,
+    depth: usize,
+    budget: &mut ShellParseBudget,
+) -> Option<Word> {
     let ShellToken::Word {
         value,
         substitutions,
@@ -987,23 +1109,33 @@ fn word_from_token_at_depth(token: &ShellToken, depth: usize) -> Option<Word> {
     else {
         return None;
     };
-    let substitutions = substitutions
-        .iter()
-        .map(|substitution| ExecutedSubstitution {
+    if !budget.spend_node() {
+        return Some(Word {
+            value: value.clone(),
+            provenance: *provenance,
+            substitutions: Vec::new(),
+        });
+    }
+    let mut parsed_substitutions = Vec::new();
+    for substitution in substitutions {
+        if !budget.spend_node() {
+            break;
+        }
+        parsed_substitutions.push(ExecutedSubstitution {
             kind: substitution.kind,
             source: substitution.inner.clone(),
             program: match substitution.kind {
                 SubstKind::Command | SubstKind::Process => {
-                    child_program(&substitution.inner, depth + 1)
+                    child_program(&substitution.inner, depth + 1, budget)
                 }
                 SubstKind::Arithmetic => None,
             },
-        })
-        .collect();
+        });
+    }
     Some(Word {
         value: value.clone(),
         provenance: *provenance,
-        substitutions,
+        substitutions: parsed_substitutions,
     })
 }
 
@@ -1401,6 +1533,20 @@ mod tests {
     fn deeply_nested_substitutions_stop_at_the_analysis_depth_cap() {
         let source = format!("{}safe{}", "echo $(".repeat(5_000), ")".repeat(5_000));
         let program = ShellProgram::from_units(vec![(1, source)]);
+        assert_eq!(program.units().len(), 1);
+        assert!(!program.units()[0].statements.is_empty());
+        assert!(program.requires_legacy_fallback());
+    }
+
+    #[test]
+    fn multiline_process_substitution_is_bounded() {
+        let source = "mapfile -t pids < <(\n  pgrep -x quickshell || true\n)\n";
+        let units = super::super::source::shell_logical_units(
+            source,
+            &crate::detect::script::classify_heredoc_owner,
+            &crate::detect::script::forwarded_body_fate,
+        );
+        let program = ShellProgram::from_units(units);
         assert_eq!(program.units().len(), 1);
         assert!(!program.units()[0].statements.is_empty());
     }

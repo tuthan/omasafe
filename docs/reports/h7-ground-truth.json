@@ -1,0 +1,245 @@
+{
+  "errors": [],
+  "failedFixtures": [],
+  "fixtures": [
+    {
+      "detectedRules": [
+        "oma.script.reverse-shell"
+      ],
+      "expectedRules": [
+        "oma.script.reverse-shell"
+      ],
+      "forbiddenHits": [],
+      "id": "reverse-shell-positive",
+      "missingRules": [],
+      "passed": true,
+      "path": "fixtures/plugins/reverse-shell"
+    },
+    {
+      "detectedRules": [],
+      "expectedRules": [],
+      "forbiddenHits": [],
+      "id": "reverse-shell-negative",
+      "missingRules": [],
+      "passed": true,
+      "path": "fixtures/plugins/benign-scripts"
+    },
+    {
+      "detectedRules": [
+        "oma.script.privileged-shared-temp-controlled"
+      ],
+      "expectedRules": [
+        "oma.script.privileged-shared-temp-controlled"
+      ],
+      "forbiddenHits": [],
+      "id": "shared-temp-controlled-positive",
+      "missingRules": [],
+      "passed": true,
+      "path": "fixtures/plugins/privileged-shared-temp-controlled"
+    },
+    {
+      "detectedRules": [
+        "oma.script.privileged-shared-temp"
+      ],
+      "expectedRules": [],
+      "forbiddenHits": [],
+      "id": "shared-temp-indicator-negative",
+      "missingRules": [],
+      "passed": true,
+      "path": "fixtures/plugins/privileged-shared-temp"
+    },
+    {
+      "detectedRules": [
+        "oma.qml.remote-component-load"
+      ],
+      "expectedRules": [
+        "oma.qml.remote-component-load"
+      ],
+      "forbiddenHits": [],
+      "id": "remote-component-loader-positive",
+      "missingRules": [],
+      "passed": true,
+      "path": "fixtures/plugins/remote-component-loader"
+    },
+    {
+      "detectedRules": [
+        "oma.qml.remote-directory-import"
+      ],
+      "expectedRules": [
+        "oma.qml.remote-directory-import"
+      ],
+      "forbiddenHits": [],
+      "id": "remote-directory-import-indicator",
+      "missingRules": [],
+      "passed": true,
+      "path": "fixtures/plugins/remote-directory-import"
+    },
+    {
+      "detectedRules": [
+        "oma.script.download-execute"
+      ],
+      "expectedRules": [
+        "oma.script.download-execute"
+      ],
+      "forbiddenHits": [],
+      "id": "download-execute-positive",
+      "missingRules": [],
+      "passed": true,
+      "path": "fixtures/plugins/download-execute-nopipe"
+    },
+    {
+      "detectedRules": [
+        "oma.script.decode-execute"
+      ],
+      "expectedRules": [
+        "oma.script.decode-execute"
+      ],
+      "forbiddenHits": [],
+      "id": "decode-execute-positive",
+      "missingRules": [],
+      "passed": true,
+      "path": "fixtures/plugins/decode-execute"
+    },
+    {
+      "detectedRules": [
+        "oma.qml.detached-execution",
+        "oma.qml.dynamic-code",
+        "oma.qml.dynamic-reference",
+        "oma.qml.out-of-tree-reference",
+        "oma.qml.process-execution",
+        "oma.qml.remote-component-load",
+        "oma.script.download-execute",
+        "oma.script.privileged-shared-temp"
+      ],
+      "expectedRules": [
+        "oma.qml.detached-execution",
+        "oma.qml.dynamic-code",
+        "oma.qml.out-of-tree-reference",
+        "oma.qml.process-execution",
+        "oma.qml.remote-component-load",
+        "oma.script.download-execute"
+      ],
+      "forbiddenHits": [],
+      "id": "h4-variable-indirection-positive",
+      "missingRules": [],
+      "passed": true,
+      "path": "fixtures/plugins/h4-variable-indirection"
+    },
+    {
+      "detectedRules": [
+        "oma.qml.sensitive-data-egress"
+      ],
+      "expectedRules": [
+        "oma.qml.sensitive-data-egress"
+      ],
+      "forbiddenHits": [],
+      "id": "sensitive-data-egress-positive",
+      "missingRules": [],
+      "passed": true,
+      "path": "fixtures/plugins/h6-user-data"
+    },
+    {
+      "detectedRules": [],
+      "expectedRules": [],
+      "forbiddenHits": [],
+      "id": "h4-boundary-negative",
+      "missingRules": [],
+      "passed": true,
+      "path": "fixtures/plugins/h4-bound-exhaustion"
+    }
+  ],
+  "manifest": "fixtures/corpus/expectations/ground-truth.json",
+  "passed": true,
+  "perRule": {
+    "oma.qml.detached-execution": {
+      "detected": 1,
+      "detectionRate": 1.0,
+      "expected": 1,
+      "missed": 0,
+      "negativeCases": 0,
+      "negativeViolations": 0
+    },
+    "oma.qml.dynamic-code": {
+      "detected": 1,
+      "detectionRate": 1.0,
+      "expected": 1,
+      "missed": 0,
+      "negativeCases": 0,
+      "negativeViolations": 0
+    },
+    "oma.qml.out-of-tree-reference": {
+      "detected": 1,
+      "detectionRate": 1.0,
+      "expected": 1,
+      "missed": 0,
+      "negativeCases": 0,
+      "negativeViolations": 0
+    },
+    "oma.qml.process-execution": {
+      "detected": 1,
+      "detectionRate": 1.0,
+      "expected": 1,
+      "missed": 0,
+      "negativeCases": 0,
+      "negativeViolations": 0
+    },
+    "oma.qml.remote-component-load": {
+      "detected": 2,
+      "detectionRate": 1.0,
+      "expected": 2,
+      "missed": 0,
+      "negativeCases": 1,
+      "negativeViolations": 0
+    },
+    "oma.qml.remote-directory-import": {
+      "detected": 1,
+      "detectionRate": 1.0,
+      "expected": 1,
+      "missed": 0,
+      "negativeCases": 0,
+      "negativeViolations": 0
+    },
+    "oma.qml.sensitive-data-egress": {
+      "detected": 1,
+      "detectionRate": 1.0,
+      "expected": 1,
+      "missed": 0,
+      "negativeCases": 1,
+      "negativeViolations": 0
+    },
+    "oma.script.decode-execute": {
+      "detected": 1,
+      "detectionRate": 1.0,
+      "expected": 1,
+      "missed": 0,
+      "negativeCases": 0,
+      "negativeViolations": 0
+    },
+    "oma.script.download-execute": {
+      "detected": 2,
+      "detectionRate": 1.0,
+      "expected": 2,
+      "missed": 0,
+      "negativeCases": 1,
+      "negativeViolations": 0
+    },
+    "oma.script.privileged-shared-temp-controlled": {
+      "detected": 1,
+      "detectionRate": 1.0,
+      "expected": 1,
+      "missed": 0,
+      "negativeCases": 1,
+      "negativeViolations": 0
+    },
+    "oma.script.reverse-shell": {
+      "detected": 1,
+      "detectionRate": 1.0,
+      "expected": 1,
+      "missed": 0,
+      "negativeCases": 1,
+      "negativeViolations": 0
+    }
+  },
+  "reportVersion": 1,
+  "suite": "h7-ground-truth"
+}

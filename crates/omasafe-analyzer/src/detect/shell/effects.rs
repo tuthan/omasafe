@@ -5,6 +5,8 @@
 //! xargs input model, and the fetch/decode command classifications the
 //! detector families share.
 
+use std::sync::Arc;
+
 use super::budget::{CachedStdinSummary, ShellBudget};
 use super::command::{
     ScriptCommand, compound_position, depth_zero_redirect_moves_stdin_away,
@@ -121,7 +123,7 @@ fn static_body_summary(body: &str, budget: &mut ShellBudget) -> ShellSummary {
         return body_summary_from_ir(
             &ExecutedBody {
                 source: body.to_owned(),
-                program: Some(Box::new(program)),
+                program: Some(Arc::new(program)),
             },
             budget,
         );
@@ -406,12 +408,12 @@ fn ir_command_consumes_stdin_substitution(command: &IrCommand, budget: &mut Shel
             if substitution.kind != SubstKind::Command {
                 return false;
             }
-            let Some(program) = substitution.program.as_deref() else {
+            let Some(program) = substitution.program.as_ref() else {
                 return false;
             };
             let body = ExecutedBody {
                 source: substitution.source.clone(),
-                program: Some(Box::new(program.clone())),
+                program: Some(Arc::clone(program)),
             };
             let summary = body_summary_from_ir(&body, budget);
             summary.consumes_stdin_as_code || (eval && summary.forwards_stdin_body)

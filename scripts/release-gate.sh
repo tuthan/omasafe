@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Release gate for every OmaSafe version. Implements the release checklist
 # verbatim: both test configurations, lint/format gates, generated-asset
-# consistency, the determinism canary, corpus-tooling self-tests, a bounded
-# pinned-corpus sample run, native-validator parity, and the self-scan.
-# Produces the three evidence reports under release-reports/.
+# consistency, the determinism canary, corpus-tooling self-tests, the H7
+# ground-truth fixture suite, a bounded pinned-corpus sample run,
+# native-validator parity, and the self-scan. Produces evidence reports under
+# release-reports/.
 #
 # Usage:
 #   scripts/release-gate.sh [--sample N] [--skip-network]
@@ -41,6 +42,9 @@ for features in "" "--no-default-features"; do
   cargo test --workspace $features
 done
 
+step "build parser-backed CLI for analysis gates"
+cargo build --quiet -p omasafe-cli
+
 step "generated assets are current"
 ./scripts/generate-cli-assets.sh --check
 
@@ -49,6 +53,10 @@ step "determinism canary"
 
 step "corpus tooling self-tests"
 python3 scripts/test_corpus_tooling.py
+
+step "H7 ground-truth fixture detection"
+python3 scripts/measure-ground-truth.py \
+  --output release-reports/h7-ground-truth.json
 
 if [[ $skip_network == false ]]; then
   cache="${OMASAFE_RELEASE_CACHE:-$root_dir/release-reports/corpus-cache}"
@@ -96,7 +104,17 @@ fi
 
 step "self-scan of OmaSafe's own source"
 cargo build --quiet -p omasafe-cli
-./target/debug/omasafe-cli scan-plugin --path . --format json > release-reports/self-scan.json
+self_scan_root=$(mktemp -d "${TMPDIR:-/tmp}/omasafe-self-scan.XXXXXX")
+trap 'rm -rf -- "$self_scan_root"' EXIT
+rsync -a \
+  --exclude='/target/***' \
+  --exclude='/release-reports/***' \
+  --exclude='/.git/***' \
+  --exclude='/.agents/***' \
+  --exclude='/.codex/***' \
+  --exclude='__pycache__/***' \
+  ./ "$self_scan_root/"
+./target/debug/omasafe-cli scan-plugin --path "$self_scan_root" --format json > release-reports/self-scan.json
 
 step "provenance"
 ./target/debug/omasafe-cli provenance --format json > release-reports/provenance.json

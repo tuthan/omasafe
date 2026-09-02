@@ -2462,6 +2462,279 @@ scripts/determinism-canary.sh                            # exit 0
 git diff --check                                         # clean
 ```
 
+## v0.2.1 H4 — Bounded Intra-File Dataflow
+
+Status: **complete**
+
+The H4 slice, adversarial fixture matrix, and baseline-migration coverage are
+complete. The implementation remains deliberately intra-file and bounded;
+cross-file dataflow and shell dataflow are deferred to later work.
+
+- Added a bounded QML/JavaScript abstract interpreter in
+  `detect/qml/dataflow.rs`. It tracks local declarations and assignments in
+  source order, recognizes static/network/user-input provenance, and carries
+  promise/XHR callback parameters without attempting cross-file or shell
+  interpretation.
+- `Loader.source` and `FileView.path` now resolve earlier static assignments
+  into ordinary invocation edges. Network- or user-input-tainted computed
+  references remain visible as typed dynamic-reference findings. Network
+  provenance now reaches execution sinks through simple indirection, including
+  `var d = xhr.responseText; Quickshell.execDetached(d)` and mixed command
+  arrays.
+- Retired raw `responseText`/`.response`/`.text(` substring provenance from
+  the AST sink classifier and removed the write-only `LexFlags` state.
+  Standalone-JavaScript lexical fallback remains direct and low-confidence;
+  unrelated AST properties such as `foo.body` no longer inherit network
+  provenance.
+- Added explicit policy-identity inputs and visible coverage degradation for
+  2,048 statements, 16 expression/assignment levels, and a 50 ms per-file
+  dataflow budget. The staged shell fetch → `chmod +x` → execute tracker has
+  independent 1,024-line/25 ms limits and ignores shell comments while
+  retaining URL fragments.
+- Added analyzer-improvement event wording for unchanged source whose findings
+  change under a policy update; trust baselines remain valid. New suppression
+  records carry policy identity, and stale scoped records are surfaced under
+  `reconfirmation_required` instead of being applied.
+- Added parser-backed regression coverage for static/tainted indirection,
+  mixed provenance, staged chains and near-misses, shell comments, statement
+  and assignment-depth exhaustion, plus core suppression-policy mismatch.
+- Added end-to-end fixtures `h4-variable-indirection` (H2/H3 sink matrix and
+  staged shell chain), `h4-bound-exhaustion`, and `h4-baseline-migration`.
+  CLI coverage proves the unchanged-source analyzer-improvement event keeps
+  the trust baseline valid while newly discovered findings are surfaced.
+
+ADR: `docs/adr/0002-bounded-dataflow.md`.
+
+Focused verification:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --features qml-parser -- -D warnings
+cargo test --workspace
+cargo test -p omasafe-analyzer --features qml-parser
+python3 scripts/test_corpus_tooling.py
+scripts/determinism-canary.sh
+```
+
+## v0.2.1 H5 — Payload Reachability, Anti-OmaSafe Intent, and Equivalence Gaps
+
+Status: **complete**
+
+Implemented:
+
+- Native ELF, Mach-O, and PE payloads now participate in the alert path. A
+  literal invocation edge from reviewed QML/JavaScript or a shell command
+  position makes the payload a Medium `oma.payload.bundled-binary` finding;
+  an unreferenced payload remains an explicit `bundled-binary` inventory
+  capability with no false clean claim.
+- Added Medium `oma.context.omasafe-state-tamper` intent detection for writes
+  into `~/.local/state/omasafe`, sibling plugin checkout paths under
+  `~/.config/omarchy/plugins/`, and `git` commands aimed at those checkouts.
+  Catalog guidance explicitly says this is detection of intent, not
+  protection: same-user authority is unbounded and real self-protection is a
+  v0.5 boundary feature.
+- Lifecycle method observations (`setPluginEnabled`, `setPluginDisabled`,
+  `rescanPlugins`, `reloadPlugins`, and `restartPlugin`) now emit the published
+  `oma.shell.ipc-injected-objects` catalog context and `ShellIpcInventory`
+  capability without escalating severity.
+- Bumped the rule catalog to v6 and the embedded Baseline V3 equivalence map to
+  revision 2. Binary coverage is honestly `partial-overlap`; the staged
+  shared-temp subset is retained as `partial-overlap` rather than erasing the
+  external gap.
+- Added `rules coverage [--format text|json]`, which prints every Baseline V3
+  relation and the deterministic current `not-covered` set. CLI surface,
+  generated man page, and completions include the command.
+
+Verification:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+cargo test --workspace --no-default-features
+./scripts/generate-cli-assets.sh --check
+scripts/determinism-canary.sh
+```
+
+Known limitation: a static analyzer cannot prove remote binary download
+provenance or an approved-update digest transition from the inventory alone;
+those remain enforcement/provenance controls (H8a and the v0.5 boundary), and
+are not guessed from an `unsigned` label.
+
+## v0.2.1 H6 — User-Data Capabilities and Bounded Escalation
+
+Status: **complete**
+
+Implemented:
+
+- Added capability-only coverage for sensitive user-data paths (SSH/GnuPG,
+  keyrings, browser profiles, cloud credentials, Kubernetes configuration, and
+  wallet locations), desktop input injection (`ydotool`, `wtype`, `wlrctl`, and
+  Hyprland `sendshortcut`), screen capture helpers, script clipboard helpers,
+  and user-level persistence targets.
+- Added bounded same-file assignment tracking so a sensitive read becomes a
+  High finding only when the value reaches a recognized QML/Qt or script
+  network egress. Capability co-occurrence on unrelated lines remains
+  non-escalating; `/etc/shadow` is retained as intent context and never feeds
+  the High sensitive-egress rule.
+- Added Medium background findings for timer/service/lifecycle input injection,
+  screen capture, and persistence writes. Clipboard reads/watches are exposed
+  as capabilities while `wl-copy` remains write-only capability context.
+- Bumped the rule catalog to v7 with language-specific script attribution and
+  added the `h6-user-data` end-to-end fixture plus analyzer/CLI regression
+  coverage.
+
+Verification:
+
+```text
+cargo fmt --all -- --check
+cargo test --workspace
+cargo test --workspace --no-default-features
+cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+./scripts/generate-cli-assets.sh --check
+scripts/determinism-canary.sh
+git diff --check
+```
+
+Known limitation: the H6 correlation pass is deliberately bounded to one file
+and assignment names; multi-file taint, encrypted clipboard material, and
+runtime-generated tool names remain outside this slice.
+
+## v0.2.1 H7 — Corpus Dispositions and Precision Measurement
+
+Status: **complete — measurement infrastructure; real-plugin triage remains an explicit input**
+
+Implemented:
+
+- Extended `scripts/run-corpus.py` reports with per-family `triaged` counts,
+  nullable precision (`true_positive / (true_positive + false_positive)`), a
+  fixed 1.0 eligibility threshold, and a deterministic `blockingEligible`
+  set. No rule family is eligible without complete disposition evidence;
+  missing evidence is never represented as zero precision.
+- Added the independently labelled H2–H6 ground-truth manifest and
+  `scripts/measure-ground-truth.py`. Positive cases require their declared
+  findings; negative cases reject forbidden families. The current 11-case
+  suite passes 100% for every covered family and is explicitly reported as
+  fixture detection rate, not ecosystem recall.
+- Added the published report pair under `docs/reports/`, expanded corpus
+  tooling self-tests, and wired the local ground-truth suite into
+  `scripts/release-gate.sh`. The checked-in ledger now records 8 reviewed
+  observations from the pinned sample; no High family is admitted because no
+  High family has complete precision evidence yet.
+
+Reports: [`h7-precision.md`](reports/h7-precision.md) and
+[`h7-ground-truth.json`](reports/h7-ground-truth.json).
+
+Known limitation: the current reviewed sample has no emitted High-severity
+family, so High-family precision remains `N/A` and the blocking set is empty
+until maintainers review additional High findings at their pinned commits.
+
+## v0.2.1 H8a — Enforcement Policy and Decision Foundation (2026-09-01)
+
+Status: **complete — enforcement foundation and lifecycle slices shipped**
+
+The first H8a increment adds `omasafe-report::enforcement`, a versioned,
+serializable contract for the opt-in enforcement surface. It keeps enforcement
+identity separate from analyzer identity and models the three orthogonal H9
+outcome fields (`evaluation_state`, `outcome`, and `authorization_basis`).
+
+`EnforcementPolicy::identity()` hashes the canonical policy, including the H7
+blocking-family set, coverage requirements, installed-tree postconditions, and
+override schema. An empty blocking-family set is valid. The pure evaluator
+blocks hardened operations on incomplete coverage, stale analyzer or
+enforcement identities, failed installed-tree postconditions, unapproved
+unsupported executables, and admitted blocking-rule families. Advisory mode
+continues to allow while reporting the evaluated contract. A valid exact
+override can authorize an allow without discarding blocker reasons or rule
+IDs; invalid overrides fail closed when a blocker exists.
+
+The wire types and semantics are recorded in
+[`docs/adr/0003-enforcement-staging.md`](adr/0003-enforcement-staging.md).
+`plugins review-update` now accepts the explicit `--policy advisory|hardened`
+selection (defaulting to advisory) and performs a pre-mutation evaluation of
+the candidate. Hardened review stops before approval or mutation when a
+precision-independent blocker is already known; the installed-tree
+postcondition check remains a second, mandatory evaluation after native update.
+Durable policy decisions are appended to an enforcement-history record and
+exposed through `plugins enforcement-status`. `plugins enable --policy`
+provides the same pre-mutation gate for an already-installed, provably
+inactive tree, then rechecks enablement and source identity after the native
+transition; failed postconditions are handled fail-closed. Override-attempt
+state is now stored in a private append-only override file. Creation is
+interactive-only and binds the exact commit/tree/content digest, analyzer and
+enforcement identities, coverage limitations, operator reason, and expiry;
+enable/review-update consume only unexpired exact matches, persist attempted
+and completed audit events, and emit a best-effort warning notification for a
+successful override-authorized transition. `schedule install` now accepts the
+explicit policy, with hardened schedules opting into analysis while advisory
+remains the compatibility default.
+
+The CLI surface, generated man page/completions, and end-to-end tests now pin
+the flag, the advisory compatibility default, invalid-policy rejection, and a
+hardened block for an unanalyzable executable before any disable/update action.
+
+## v0.2.1 H8b — Blocking-Eligible Rule Families (2026-09-01)
+
+Status: **complete — evidence-gated admission is wired; the measured set is empty**
+
+H8b now consumes H7's two independent measurements through the typed
+`admit_blocking_rule_families` helper. A family must have complete, finite
+precision and fixture-detection metrics at the fixed `1.0` thresholds before
+it can enter hardened blocking. The helper is deterministic, rejects missing
+or below-threshold evidence, and deduplicates rule IDs. Analyzer rules and
+their semantics are untouched; admitted-family metrics remain part of the
+enforcement-policy identity.
+
+The checked-in H7 disposition ledger has 8 reviewed records, but none belongs
+to a High-severity family. The ground-truth suite passes all 11 cases, but that
+fixture result cannot stand in for High-family real-plugin precision, so H8b
+correctly admits no family. Hardened mode therefore remains limited to H8a's
+precision-independent conditions until maintainers append complete High-family
+dispositions and publish a new admission report.
+
+The measured decision is published in
+[`h8b-blocking-admission.md`](reports/h8b-blocking-admission.md) and
+[`h8b-blocking-admission.json`](reports/h8b-blocking-admission.json).
+
+## v0.2.1 H9 — Consumer Visibility and Safe Controls (2026-09-02)
+
+Status: **complete — versioned CLI handoff and read-only visibility slice**
+
+The CLI now exposes `schedule status --format json` as a versioned, fail-safe
+handoff. It reports installation, CLI-owned policy metadata, deterministic unit
+identity, and structured systemd execution state without scraping unit text.
+Schedule metadata is private, mode-restricted, and bound to the exact service
+and timer bytes installed by the CLI. Inventory JSON also carries a bounded
+`omasafe.enforcement-summary.v1` containing only the latest decision per
+installed plugin, so consumers do not need a second status sweep.
+
+The sibling plugin consumes both contracts with strict schema/enum handling,
+bounded lazy processes, and separate Overview and selected-plugin enforcement
+surfaces. The selected-plugin view can expand the full decision provenance,
+coverage counts/limitations, identities, override binding, audit event, and
+residual native-install boundary. Findings also has a bounded, lazy Baseline V3
+coverage drawer with explicit structural-equivalent, partial-overlap, and
+not-covered relations; Overview shows schedule policy, unit identity, and last
+execution state. Unknown or unavailable data is rendered as
+unsupported/unavailable; the plugin does not recreate policy, expiry, override,
+or unit identity rules.
+
+The Overview also offers explicitly confirmed advisory/hardened schedule
+installation through the CLI, with report-only behavior stated beside the
+control and bounded failure handling.
+
+The panel refreshes selected decisions and override records periodically while
+open, so an override that expires is re-read from the CLI rather than judged in
+QML. Blocked decisions also expose a read-only recovery command for the
+persisted CLI status; full lifecycle recovery actions remain CLI-owned.
+
+The workspace and CLI package floor are now 0.2.1. The contracts remain
+read-only and fail-safe; the sibling consumer can adopt them without taking
+ownership of policy, expiry, or lifecycle mutation decisions.
+
 ## Plan Step 8 — Typed Shell IR Foundation (2026-08-31)
 
 Status: **in progress — foundation slice complete**

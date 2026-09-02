@@ -1,5 +1,5 @@
 {
-  "mapVersion": "1",
+  "mapVersion": "2",
   "externalSystem": "omarchy-plugin-marketplace",
   "externalRulesetName": "automated-security-baseline",
   "externalRulesetVersion": "3",
@@ -56,8 +56,8 @@
     {
       "omaRuleId": null,
       "externalId": "privileged-process-control-from-shared-temp",
-      "relation": "not-covered",
-      "note": "PID-from-shared-temp patterns require data-flow evidence OmaSafe does not model yet."
+      "relation": "partial-overlap",
+      "note": "Bounded staged shell dataflow now covers the explicit shared-temp write-to-privileged-execution shape; broader PID provenance remains outside this map."
     },
     {
       "omaCapability": "process-execution",
@@ -86,8 +86,8 @@
     {
       "omaCapability": null,
       "externalId": "bundled-executable-binary",
-      "relation": "structural-equivalent",
-      "note": "OmaSafe's payload inventory structurally detects executable binaries with native-format classification; this maps to inventory facts, not a Capability enum member."
+      "relation": "partial-overlap",
+      "note": "OmaSafe inventories native-format executable binaries and now distinguishes reachable Medium findings from unreferenced capability context; remote-download and digest-approval enforcement remains outside this slice."
     },
     {
       "omaCapability": "persistence-scheduling",

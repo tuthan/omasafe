@@ -255,7 +255,10 @@ pub(in crate::detect) fn tokenize(input: &str) -> Vec<ShellToken> {
                         }
                         other => tokens.push(other),
                     }
-                    i = next;
+                    // Malformed/incomplete process substitutions can make a
+                    // word parser stop before consuming the opening byte.
+                    // Never let a lexer retry the same byte forever.
+                    i = next.max(i + 1);
                 }
             }
         }
@@ -397,6 +400,20 @@ fn read_word(input: &str, start: usize) -> (ShellToken, usize) {
                     value.extend_from_slice(&bytes[i..=close]);
                     provenance |= WordProvenance::PROCESS_SUBST;
                     i = close + 1;
+                    continue;
+                }
+                if bytes.get(i + 1) == Some(&b'(') {
+                    // Keep malformed `<(` / `>(` bounded. The complete
+                    // logical unit may close the group on a later line, but
+                    // this physical line must still make progress while it
+                    // is being assembled.
+                    syntax_eligible = false;
+                    if assignment_lhs {
+                        assignment_eligible = false;
+                    }
+                    provenance |= WordProvenance::PROCESS_SUBST;
+                    value.push(bytes[i]);
+                    i += 1;
                     continue;
                 }
                 break; // a redirection operator terminates the word
@@ -701,5 +718,21 @@ fn add_substitution_provenance(provenance: &mut WordProvenance, kind: SubstKind,
     };
     if !quoted && matches!(kind, SubstKind::Command) {
         *provenance |= WordProvenance::FIELD_SPLIT;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ShellToken, tokenize};
+
+    #[test]
+    fn incomplete_process_substitution_makes_lexer_progress() {
+        let tokens = tokenize("mapfile -t pids < <(");
+        assert!(tokens.len() < 16);
+        assert!(
+            tokens.iter().any(|token| {
+                matches!(token, ShellToken::Operator(operator) if operator == "(")
+            })
+        );
     }
 }

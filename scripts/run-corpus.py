@@ -39,8 +39,16 @@ from corpus_common import (  # noqa: E402
     run_git,
     sample_plugins,
 )
+from bounded_process import run_bounded  # noqa: E402
 
 HIGH_SEVERITIES = {"high", "critical"}
+SCAN_TIMEOUT_SECONDS = float(os.environ.get("OMASAFE_CORPUS_SCAN_TIMEOUT_SECONDS", "60"))
+SCAN_MEMORY_LIMIT_BYTES = int(
+    os.environ.get("OMASAFE_CORPUS_SCAN_MEMORY_MB", "768")
+) * 1024 * 1024
+SCAN_OUTPUT_LIMIT_BYTES = int(
+    os.environ.get("OMASAFE_CORPUS_SCAN_OUTPUT_MB", "4")
+) * 1024 * 1024
 
 
 def log(message):
@@ -103,16 +111,19 @@ def run_scan(bin_path, plugin_dir):
             "XDG_CACHE_HOME": f"{xdg}/cache",
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         }
-        result = subprocess.run(
+        result = run_bounded(
             [str(bin_path), "scan-plugin", "--path", str(plugin_dir), "--format", "json"],
-            capture_output=True,
-            text=True,
             env=environment,
-            timeout=300,
+            timeout=SCAN_TIMEOUT_SECONDS,
+            max_output_bytes=SCAN_OUTPUT_LIMIT_BYTES,
+            memory_limit_bytes=SCAN_MEMORY_LIMIT_BYTES,
+            cpu_limit_seconds=max(1, int(SCAN_TIMEOUT_SECONDS)),
         )
     if result.returncode != 0:
-        raise RuntimeError(f"scan-plugin failed: {result.stderr.strip()[:400]}")
-    report = json.loads(result.stdout)
+        stderr = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"scan-plugin failed: {stderr[:400]}")
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    report = json.loads(stdout)
     analysis = report["result"]["analysis"]
     inventory_section = report["result"]["payload_inventory"]
     loss = [
@@ -161,7 +172,8 @@ def main():
     if not bin_path.exists():
         log(f"building {bin_path}")
         subprocess.run(
-            ["cargo", "build", "--quiet", "--bin", "omasafe-cli"], check=True
+            ["cargo", "build", "--quiet", "--bin", "omasafe-cli", "--features", "qml-parser"],
+            check=True,
         )
 
     per_rule = {}
@@ -240,6 +252,21 @@ def main():
         "totals": totals,
         "perRule": dict(sorted(per_rule.items())),
     }
+    # Precision is defined only for emitted results with a completed human
+    # disposition.  A null value is deliberate: zero triaged observations are
+    # not zero-percent precision, and must not accidentally admit a rule to a
+    # hardened blocking set.
+    blocking_eligible = []
+    for rule_id, stats in report["perRule"].items():
+        triaged = stats["true_positive"] + stats["false_positive"]
+        stats["triaged"] = triaged
+        stats["precision"] = (
+            stats["true_positive"] / triaged if triaged else None
+        )
+        if triaged and stats["false_positive"] == 0 and stats["untriaged"] == 0:
+            blocking_eligible.append(rule_id)
+    report["precisionThreshold"] = 1.0
+    report["blockingEligible"] = sorted(blocking_eligible)
     output = json.dumps(report, indent=2, sort_keys=True)
     if arguments.output:
         Path(arguments.output).write_text(output + "\n", encoding="utf-8")

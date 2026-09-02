@@ -167,7 +167,7 @@ For each supported Omarchy release:
 - Omarchy plugin manual: https://omarchy.org/manual/shell-plugins/
 - Omarchy source: https://github.com/basecamp/omarchy
 - Marketplace security baseline:
-  https://github.com/HANCORE-linux/omarchy-plugin-marketplace/blob/main/SECURITY.md
+  https://github.com/omacom/omarchy-plugin-marketplace/blob/main/SECURITY.md
 - Installed source anchors for the verified version:
   `/usr/share/omarchy/shell/shell.qml`,
   `/usr/share/omarchy/shell/services/PluginRegistry.qml`,

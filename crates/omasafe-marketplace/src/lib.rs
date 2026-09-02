@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const MAX_CATALOG_BYTES: usize = 32 * 1024 * 1024;
-pub const OFFICIAL_REPOSITORY: &str = "https://github.com/HANCORE-linux/omarchy-plugin-marketplace";
+pub const OFFICIAL_REPOSITORY: &str = "https://github.com/omacom/omarchy-plugin-marketplace";
 pub const DISCLAIMER: &str = "Marketplace fields are claims made by the named registry snapshot, not local security guarantees.";
 
 pub fn valid_commit(value: &str) -> bool {
@@ -279,11 +279,20 @@ pub fn fetch_pinned_catalog(
             ],
         )?;
     }
-    if run_git(&repository_dir, &["remote", "get-url", "origin"]).is_err() {
-        run_git(
-            &repository_dir,
-            &["remote", "add", "origin", repository_url],
-        )?;
+    match run_git_output(&repository_dir, &["remote", "get-url", "origin"]) {
+        Ok(remote) if String::from_utf8_lossy(&remote).trim() == repository_url => {}
+        Ok(_) => {
+            run_git(
+                &repository_dir,
+                &["remote", "set-url", "origin", repository_url],
+            )?;
+        }
+        Err(_) => {
+            run_git(
+                &repository_dir,
+                &["remote", "add", "origin", repository_url],
+            )?;
+        }
     }
     run_git(
         &repository_dir,
@@ -292,6 +301,7 @@ pub fn fetch_pinned_catalog(
     let metadata_path = cache_dir.join("catalog.meta.json");
     if let Ok(metadata) = fs::read(&metadata_path)
         && let Ok(previous) = serde_json::from_slice::<CacheMetadata>(&metadata)
+        && previous.repository_url.as_deref() == Some(repository_url)
         && previous.repository_commit != repository_commit
         && !is_ancestor(
             &repository_dir,

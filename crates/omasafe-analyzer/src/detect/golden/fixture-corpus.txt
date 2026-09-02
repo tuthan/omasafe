@@ -14,4 +14,5 @@ capability network-access shell script-fp-fn/install.sh 8 - curl -fsSL https://e
 capability network-access shell script-fp-fn/install.sh 9 - curl -fsSL https://example.test/omarchy/notes.txt | xargs sh local-helper -c
 capability process-execution shell benign-scripts/install.sh 5 - sudo pacman -S --noconfirm omarchy-theme
 capability process-execution shell privileged-shared-temp/install.sh 2 - sudo /tmp/omarchy-helper --install
+limitation sink-reference-rejected:absolute:privileged-shared-temp/install.sh:2:/tmp/omarchy-helper
 fingerprint 07d53d66537020938be46133d34b9b74208b6411422ac691ebfe4a1b79672eee

@@ -7,8 +7,61 @@
 /// coverage limitation instead of unbounded recursion.
 pub(in crate::detect) const MAX_SHELL_ANALYSIS_DEPTH: u32 = 64;
 pub(in crate::detect) const MAX_SHELL_ANALYSIS_NODES: u32 = 250_000;
+/// Construction limits are deliberately lower than detector-walk limits.
+/// Parsing must be bounded before an AST can consume memory, and exhausted
+/// construction falls back to the existing token-level compatibility path.
+pub(in crate::detect) use omasafe_core::bounds::{
+    MAX_SHELL_PARSE_CHILD_PROGRAMS, MAX_SHELL_PARSE_DEPTH, MAX_SHELL_PARSE_NODES,
+    MAX_SHELL_PARSE_SOURCE_BYTES,
+};
 const MAX_BODY_SUMMARY_ENTRIES: usize = 64;
 const MAX_BODY_SUMMARY_BYTES: usize = 64 * 1024;
+
+/// Budget for constructing typed shell IR from untrusted source.
+///
+/// This is separate from [`ShellBudget`]. The latter limits detector work
+/// after an AST exists; this budget prevents the AST construction itself from
+/// recursively allocating without bound.
+pub(in crate::detect) struct ShellParseBudget {
+    nodes: usize,
+    child_programs: usize,
+    source_bytes: usize,
+    exhausted: bool,
+}
+
+impl ShellParseBudget {
+    pub(in crate::detect) fn new() -> Self {
+        Self {
+            nodes: MAX_SHELL_PARSE_NODES,
+            child_programs: MAX_SHELL_PARSE_CHILD_PROGRAMS,
+            source_bytes: MAX_SHELL_PARSE_SOURCE_BYTES,
+            exhausted: false,
+        }
+    }
+
+    pub(in crate::detect) fn spend_node(&mut self) -> bool {
+        if self.exhausted || self.nodes == 0 {
+            self.exhausted = true;
+            return false;
+        }
+        self.nodes -= 1;
+        true
+    }
+
+    pub(in crate::detect) fn reserve_child(&mut self, source_bytes: usize) -> bool {
+        if self.exhausted || self.child_programs == 0 || source_bytes > self.source_bytes {
+            self.exhausted = true;
+            return false;
+        }
+        self.child_programs -= 1;
+        self.source_bytes -= source_bytes;
+        true
+    }
+
+    pub(in crate::detect) fn exhausted(&self) -> bool {
+        self.exhausted
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(in crate::detect) struct CachedStdinSummary {

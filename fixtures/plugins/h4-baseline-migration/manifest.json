@@ -1,0 +1,5 @@
+{
+  "schemaVersion": 1,
+  "id": "io.omasafe.h4.baseline-migration",
+  "kinds": ["bar-widget"]
+}

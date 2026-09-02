@@ -8,10 +8,16 @@ plugins trust PLUGIN_ID	[--yes] [--expected-head VALUE] [--expected-tree VALUE] 
 plugins status PLUGIN_ID	[--format text|json]
 plugins diff PLUGIN_ID	[--format text|json]
 plugins review PLUGIN_ID	--action acknowledge|exclude|rebaseline|restore|untrust|revoke|suppress|reinstate [--rule RULE_ID] [--path SCOPE] [--reason TEXT] [--yes]
-plugins review-update PLUGIN_ID	[--expected-commit SHA] [--yes]
+plugins enable PLUGIN_ID	[--policy advisory|hardened] [--format text|json]
+plugins review-update PLUGIN_ID	[--expected-commit SHA] [--yes] [--policy advisory|hardened]
+plugins enforcement-status PLUGIN_ID	[--format text|json]
+plugins override create PLUGIN_ID	--rule RULE_ID [--rule RULE_ID ...] --commit SHA --reason TEXT --expires TIMESTAMP
+plugins override list	[--format text|json]
 plugins analyze PLUGIN_ID	[--format text|json] [--fail-on info|low|medium|high|critical]
 scan-plugin	(--path DIR | --git URL --revision COMMIT) [--format text|json] [--fail-on info|low|medium|high|critical]
 rules list	[--format text|json]
+rules coverage	[--format text|json]
 rules explain RULE_ID	[--format text|json]
 marketplace refresh	(--commit COMMIT | --latest)
-schedule install
+schedule install	[--policy advisory|hardened]
+schedule status	[--format text|json]

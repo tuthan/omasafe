@@ -268,7 +268,7 @@ fn inventory_discloses_unverified_cached_marketplace_snapshot() {
         cache.join("catalog.meta.json"),
         serde_json::json!({
             "repository_commit": "0123456789abcdef0123456789abcdef01234567",
-            "repository_url": "https://github.com/HANCORE-linux/omarchy-plugin-marketplace",
+            "repository_url": "https://github.com/omacom/omarchy-plugin-marketplace",
             "retrieved_at": "2026-08-20T00:00:00Z"
         })
         .to_string(),
@@ -283,7 +283,7 @@ fn inventory_discloses_unverified_cached_marketplace_snapshot() {
     );
     assert_eq!(
         report["result"]["marketplace_repository"],
-        "https://github.com/HANCORE-linux/omarchy-plugin-marketplace"
+        "https://github.com/omacom/omarchy-plugin-marketplace"
     );
     assert_eq!(
         report["result"]["marketplace_file_digest"]
@@ -356,7 +356,7 @@ fn inventory_discloses_verified_snapshot_without_a_matching_listing() {
         cache.join("catalog.meta.json"),
         serde_json::json!({
             "repository_commit": revision,
-            "repository_url": "https://github.com/HANCORE-linux/omarchy-plugin-marketplace",
+            "repository_url": "https://github.com/omacom/omarchy-plugin-marketplace",
             "retrieved_at": "2026-08-22T00:00:00Z",
             "file_digest": format!("{:x}", Sha256::digest(catalog))
         })
@@ -502,7 +502,7 @@ fn schedule_unit_accepts_outstanding_exit_code() {
     fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
     fixture
         .command()
-        .args(["schedule", "install"])
+        .args(["schedule", "install", "--policy", "hardened"])
         .assert()
         .success();
     let unit = fs::read_to_string(
@@ -513,6 +513,310 @@ fn schedule_unit_accepts_outstanding_exit_code() {
     )
     .unwrap();
     assert!(unit.contains("SuccessExitStatus=3"));
+    assert!(unit.contains("scan --notify --only-new --include-analysis"));
+    assert!(unit.contains("Description=OmaSafe hardened plugin drift scan"));
+}
+
+#[test]
+#[cfg(unix)]
+fn schedule_install_defaults_to_advisory_without_analysis_flag() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let systemctl = fixture.bin.path().join("systemctl");
+    fs::write(&systemctl, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+    fixture
+        .command()
+        .args(["schedule", "install"])
+        .assert()
+        .success();
+    let unit = fs::read_to_string(
+        fixture
+            .config
+            .path()
+            .join("systemd/user/omasafe-scan.service"),
+    )
+    .unwrap();
+    assert!(unit.contains("scan --notify --only-new\n"));
+    assert!(!unit.contains("--include-analysis"));
+    assert!(unit.contains("Description=OmaSafe advisory plugin drift scan"));
+}
+
+#[test]
+#[cfg(unix)]
+fn schedule_status_reports_cli_owned_policy_and_systemd_result() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let systemctl = fixture.bin.path().join("systemctl");
+    fs::write(
+        &systemctl,
+        "#!/bin/sh\nif [ \"$2\" = \"show\" ]; then\n  printf '%s\\n' 'ActiveState=inactive' 'SubState=dead' 'ExecMainStatus=0' 'ExecMainExitTimestamp=Tue 2026-09-01 12:00:00 UTC'\nfi\nexit 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+    fixture
+        .command()
+        .args(["schedule", "install", "--policy", "hardened"])
+        .assert()
+        .success();
+
+    let output = fixture
+        .command()
+        .args(["schedule", "status", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let result = &report["result"];
+    assert_eq!(result["schema"], "omasafe.schedule.v1");
+    assert_eq!(result["installed"], true);
+    assert_eq!(result["policy"], "hardened");
+    assert_eq!(result["report_only"], true);
+    assert_eq!(result["metadata_consistent"], true);
+    assert_eq!(result["unit_identity"].as_str().unwrap().len(), 64);
+    assert_eq!(result["last_known_execution"]["available"], true);
+    assert_eq!(result["last_known_execution"]["service_exit_code"], 0);
+}
+
+#[test]
+fn schedule_status_explicitly_reports_not_installed() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .command()
+        .args(["schedule", "status", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["result"]["installed"], false);
+    assert!(report["result"]["policy"].is_null());
+    assert!(report["result"]["last_known_execution"].is_null());
+}
+
+#[test]
+#[cfg(unix)]
+fn schedule_install_rejects_a_hanging_systemctl() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    let systemctl = fixture.bin.path().join("systemctl");
+    fs::write(&systemctl, "#!/bin/sh\nwhile :; do :; done\n").unwrap();
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = fixture
+        .command()
+        .args(["schedule", "install"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("timed out"), "{error}");
+    assert!(!error.contains("Installed and enabled"), "{error}");
+}
+
+#[test]
+#[cfg(unix)]
+fn schedule_status_rejects_flooded_systemctl_output_as_unavailable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    let unit_dir = fixture.config.path().join("systemd/user");
+    fs::create_dir_all(&unit_dir).unwrap();
+    fs::write(unit_dir.join("omasafe-scan.service"), b"service\n").unwrap();
+    fs::write(unit_dir.join("omasafe-scan.timer"), b"timer\n").unwrap();
+    let systemctl = fixture.bin.path().join("systemctl");
+    fs::write(&systemctl, "#!/bin/sh\nwhile :; do printf 'x'; done\n").unwrap();
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = fixture
+        .command()
+        .args(["schedule", "status", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "status should report unavailable in JSON: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let execution = &report["result"]["last_known_execution"];
+    assert_eq!(execution["available"], false);
+    assert!(
+        execution["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("truncated")),
+        "{execution}"
+    );
+}
+
+#[test]
+fn inventory_includes_small_enforcement_decision_summary() {
+    let fixture = Fixture::new();
+    let result = &fixture.inventory()["result"];
+    assert_eq!(
+        result["enforcement_summary"]["schema"],
+        "omasafe.enforcement-summary.v1"
+    );
+    assert_eq!(result["enforcement_summary"]["available"], true);
+    assert!(
+        result["enforcement_summary"]["decisions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn override_creation_requires_interactive_terminal_and_list_is_read_only() {
+    let fixture = Fixture::new();
+    fixture
+        .command()
+        .args([
+            "plugins",
+            "override",
+            "create",
+            "io.example.cli",
+            "--rule",
+            "oma.test.rule",
+            "--commit",
+            &"a".repeat(40),
+            "--reason",
+            "operator review",
+            "--expires",
+            "2099-01-01T00:00:00Z",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "override creation requires an interactive terminal",
+        ));
+    assert!(
+        !fixture
+            .state
+            .path()
+            .join("omasafe/enforcement-overrides.json")
+            .exists()
+    );
+
+    let output = fixture
+        .command()
+        .args(["plugins", "override", "list", "--format", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(report["result"]["overrides"], serde_json::json!([]));
+}
+
+#[test]
+#[cfg(unix)]
+fn exact_override_authorizes_hardened_enable_and_emits_audit_event() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let update = UpdateFixture::new();
+    update.fake.set_enabled(false);
+    fs::write(update.fixture.plugin.join("tool"), b"opaque executable\n").unwrap();
+    fs::set_permissions(
+        update.fixture.plugin.join("tool"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let commit = git_commit_all(&update.fixture.plugin, "opaque executable");
+    let tree = run_git(&update.fixture.plugin, &["rev-parse", "HEAD^{tree}"]);
+    let identity = omasafe_plugin_trust::source_identity(
+        "io.example.cli",
+        &update.fixture.plugin,
+        Some("https://plugins.test/cli.git".into()),
+        Some(commit.clone()),
+        Some(tree.clone()),
+    );
+    let policy = omasafe_report::enforcement::EnforcementPolicy::new(
+        omasafe_report::enforcement::EnforcementMode::Hardened,
+    );
+    let notification_log = update.fixture.state.path().join("notify-send.log");
+    let notify_send = update.fixture.bin.path().join("notify-send");
+    fs::write(
+        &notify_send,
+        format!("#!/bin/sh\necho \"$*\" > {}\n", notification_log.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&notify_send, fs::Permissions::from_mode(0o755)).unwrap();
+    let binding = serde_json::json!({
+        "schema": "omasafe.override.v1",
+        "plugin_id": "io.example.cli",
+        "commit": commit,
+        "tree": tree,
+        "content_digest": identity.content_digest,
+        "analyzer_policy_identity": omasafe_analyzer::policy_identity(),
+        "enforcement_policy_identity": policy.identity(),
+        "rule_ids": ["operator-reviewed-unsupported-executable"],
+        "coverage_limitations": [],
+        "reason": "manually reviewed opaque executable",
+        "created_at": "2026-09-01T00:00:00Z",
+        "expires_at": "2099-01-01T00:00:00Z"
+    });
+    let overrides_path = update
+        .fixture
+        .state
+        .path()
+        .join("omasafe/enforcement-overrides.json");
+    fs::create_dir_all(overrides_path.parent().unwrap()).unwrap();
+    fs::write(
+        &overrides_path,
+        serde_json::json!({"schema_version":1,"overrides":[binding]}).to_string(),
+    )
+    .unwrap();
+
+    let (stdout, stderr, code) = update.enable(&["--policy", "hardened"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(code, Some(0), "{text}");
+    assert!(text.contains("io.example.cli: enabled"), "{text}");
+    assert!(update.fake.enabled());
+
+    let history: Value = serde_json::from_slice(
+        &fs::read(
+            update
+                .fixture
+                .state
+                .path()
+                .join("omasafe/enforcement-history.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        history["audit_events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| {
+                event["operation"] == "enable"
+                    && event["completed"] == true
+                    && event["authorization_basis"] == "override"
+            })
+    );
+    assert_eq!(
+        history["decisions"].as_array().unwrap().last().unwrap()["authorization_basis"],
+        "override"
+    );
+    let notification = fs::read_to_string(notification_log).unwrap();
+    assert!(notification.contains("--urgency=normal"), "{notification}");
+    assert!(notification.contains("io.example.cli"), "{notification}");
+    assert!(!notification.contains("manually reviewed opaque executable"));
 }
 
 #[test]
@@ -525,7 +829,7 @@ fn stale_cached_snapshot_is_disclosed() {
         cache.join("catalog.meta.json"),
         serde_json::json!({
             "repository_commit": "0123456789abcdef0123456789abcdef01234567",
-            "repository_url": "https://github.com/HANCORE-linux/omarchy-plugin-marketplace",
+            "repository_url": "https://github.com/omacom/omarchy-plugin-marketplace",
             "retrieved_at": "2020-01-01T00:00:00Z"
         })
         .to_string(),
@@ -622,7 +926,7 @@ fn rules_list_reports_catalog_and_policy_identity() {
     // S4 ships the marketplace baseline equivalence map.
     assert_eq!(
         report["result"]["equivalence_map_version"],
-        "omarchy-marketplace-baseline-v3/1"
+        "omarchy-marketplace-baseline-v3/2"
     );
     let rules = report["result"]["rules"].as_array().unwrap();
     assert!(!rules.is_empty());
@@ -637,6 +941,8 @@ fn rules_list_reports_catalog_and_policy_identity() {
         "oma.qml.session-lock",
         "oma.qml.pam-authentication",
         "oma.context.replaces-bar",
+        "oma.payload.bundled-binary",
+        "oma.context.omasafe-state-tamper",
     ] {
         assert!(ids.contains(required), "missing {required}");
     }
@@ -663,7 +969,7 @@ fn rules_list_text_is_deterministic() {
         .clone();
     assert_eq!(first, second);
     let rendered = String::from_utf8(first).unwrap();
-    assert!(rendered.contains("rule catalog v5"));
+    assert!(rendered.contains("rule catalog v7"));
     assert!(rendered.contains("oma.qml.session-lock"));
 }
 
@@ -682,6 +988,37 @@ fn rules_list_rejects_unknown_arguments_and_formats() {
         .assert()
         .failure()
         .stderr(predicates::str::contains("text or json"));
+}
+
+#[test]
+fn rules_coverage_reports_every_baseline_entry_and_current_gaps() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .command()
+        .args(["rules", "coverage", "--format", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(report["result"]["map_version"], "2");
+    let entries = report["result"]["coverage"].as_array().unwrap();
+    assert!(entries.iter().any(|entry| {
+        entry["externalId"] == "bundled-executable-binary" && entry["relation"] == "partial-overlap"
+    }));
+    assert!(entries.iter().any(|entry| {
+        entry["externalId"] == "privileged-process-control-from-shared-temp"
+            && entry["relation"] == "partial-overlap"
+    }));
+    assert_eq!(
+        report["result"]["not_covered"],
+        serde_json::json!([
+            "cargo-git-unpinned",
+            "remote-build",
+            "remote-git-execution-unpinned"
+        ])
+    );
 }
 
 /// Enriches the default single-plugin fixture with a full shipped-payload
@@ -728,14 +1065,18 @@ fn analyze_reports_full_payload_inventory_end_to_end() {
     assert_eq!(report["result"]["target"]["source"], "installed-plugin");
     let analysis = &report["result"]["analysis"];
     assert_eq!(analysis["schema"], "omasafe.analysis.v1");
-    assert_eq!(analysis["policy_identity"]["rule_catalog_version"], 5);
+    assert_eq!(analysis["policy_identity"]["rule_catalog_version"], 7);
     let inventory = &report["result"]["payload_inventory"];
     let states = &inventory["coverage_states"];
     // S3+S4: analyzable files land in analyzed/unreferenced/partial; only
     // non-analyzable payloads stay unsupported.
     let unsupported = states["unsupported"].as_u64().unwrap();
     let partial = states["partial"].as_u64().unwrap();
-    assert!(unsupported + partial >= 5, "states: {states}");
+    assert!(unsupported + partial >= 3, "states: {states}");
+    assert!(
+        states["analyzed"].as_u64().unwrap() >= 1,
+        "states: {states}"
+    );
     let entries = inventory["entries"].as_array().unwrap();
     let kinds: Vec<&str> = entries
         .iter()
@@ -747,11 +1088,7 @@ fn analyze_reports_full_payload_inventory_end_to_end() {
         .iter()
         .find(|entry| entry["relative_path"] == "payload")
         .expect("ELF payload inventoried");
-    assert_eq!(payload_entry["coverage_state"], "unsupported");
-    assert!(
-        !kinds.contains(&"analyzed"),
-        "S1 never claims analyzed coverage"
-    );
+    assert_eq!(payload_entry["coverage_state"], "analyzed");
 }
 
 #[test]
@@ -1467,6 +1804,161 @@ fn h3_continued_headers_fixture_pins_bodies_after_the_whole_command() {
     );
 }
 
+/// Scan an H4 fixture plugin tree from `fixtures/plugins/`.
+fn scan_h4_fixture(name: &str) -> Value {
+    scan_h2_fixture(name)
+}
+
+/// Scan an H6 user-data fixture plugin tree from `fixtures/plugins/`.
+fn scan_h6_fixture(name: &str) -> Value {
+    scan_h2_fixture(name)
+}
+
+#[test]
+fn h6_fixture_separates_capabilities_from_sensitive_egress() {
+    let report = scan_h6_fixture("h6-user-data");
+    let analysis = &report["result"]["analysis"];
+    let findings = analysis["findings"].as_array().unwrap();
+    assert!(
+        findings.iter().any(
+            |finding| finding["rule_id"] == "oma.qml.sensitive-data-egress"
+                && finding["severity"] == "high"
+        ),
+        "{findings:?}"
+    );
+    let capabilities = analysis["capabilities"].as_array().unwrap();
+    assert!(
+        capabilities
+            .iter()
+            .any(|capability| capability["capability"] == "sensitive-path"),
+        "{capabilities:?}"
+    );
+    assert!(
+        capabilities
+            .iter()
+            .any(|capability| capability["capability"] == "clipboard-access"),
+        "{capabilities:?}"
+    );
+}
+
+#[test]
+#[cfg(feature = "qml-parser")]
+fn h4_variable_indirection_fixture_covers_reference_and_execution_sinks() {
+    let report = scan_h4_fixture("h4-variable-indirection");
+    let analysis = &report["result"]["analysis"];
+    let findings = analysis["findings"].as_array().unwrap();
+
+    let remote_loads: Vec<&Value> = findings
+        .iter()
+        .filter(|finding| finding["rule_id"] == "oma.qml.remote-component-load")
+        .collect();
+    assert_eq!(remote_loads.len(), 2, "{findings:?}");
+    assert!(
+        remote_loads.iter().any(|finding| finding["evidence"]
+            .as_str()
+            .unwrap()
+            .contains("Loader.source")),
+        "{findings:?}"
+    );
+    assert!(
+        remote_loads.iter().any(|finding| {
+            finding["evidence"]
+                .as_str()
+                .unwrap()
+                .contains("Qt.createComponent")
+        }),
+        "{findings:?}"
+    );
+
+    assert!(findings.iter().any(|finding| {
+        finding["rule_id"] == "oma.qml.out-of-tree-reference"
+            && finding["evidence"]
+                .as_str()
+                .unwrap()
+                .contains("../outside/Indirect.qml")
+    }));
+    assert_eq!(
+        findings
+            .iter()
+            .filter(|finding| finding["rule_id"] == "oma.qml.dynamic-reference")
+            .count(),
+        2,
+        "network-tainted Loader and FileView sinks must remain visible: {findings:?}"
+    );
+    assert_eq!(
+        findings
+            .iter()
+            .filter(|finding| finding["rule_id"] == "oma.qml.detached-execution")
+            .count(),
+        1,
+        "one-assignment detached execution must be detected: {findings:?}"
+    );
+    assert_eq!(
+        findings
+            .iter()
+            .filter(|finding| finding["rule_id"] == "oma.qml.process-execution")
+            .count(),
+        1,
+        "mixed command-array network provenance must be detected: {findings:?}"
+    );
+    assert!(
+        analysis["invocation_edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|edge| edge["target_path"] == "Panel.qml"),
+        "static indirection must still resolve a local edge"
+    );
+}
+
+#[test]
+fn h4_staged_chain_fixture_tracks_only_the_chmod_released_path() {
+    let report = scan_h4_fixture("h4-variable-indirection");
+    let findings = report["result"]["analysis"]["findings"].as_array().unwrap();
+    let staged: Vec<&Value> = findings
+        .iter()
+        .filter(|finding| {
+            finding["rule_id"] == "oma.script.download-execute"
+                && finding["evidence"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("staged-download-execute:")
+        })
+        .collect();
+    assert_eq!(staged.len(), 1, "{findings:?}");
+    assert!(
+        staged[0]["evidence"]
+            .as_str()
+            .unwrap()
+            .contains("/tmp/h4-payload"),
+        "{findings:?}"
+    );
+}
+
+#[test]
+#[cfg(feature = "qml-parser")]
+fn h4_bound_exhaustion_fixture_is_partial() {
+    let report = scan_h4_fixture("h4-bound-exhaustion");
+    let analysis = &report["result"]["analysis"];
+    assert!(analysis["findings"].as_array().unwrap().is_empty());
+    assert!(
+        analysis["coverage_limitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|limitation| {
+                limitation
+                    .as_str()
+                    .unwrap()
+                    .starts_with("dataflow-assignment-depth-limit:")
+            })
+    );
+    assert_eq!(
+        report["result"]["payload_inventory"]["coverage_states"]["partial"],
+        1
+    );
+}
+
 #[test]
 fn equivalence_staleness_is_disclosed_when_cached_snapshot_moves() {
     let temp = tempfile::TempDir::new().unwrap();
@@ -1742,6 +2234,76 @@ fn suppression_hides_finding_and_de_enforces_without_touching_stored_analysis() 
         ])
         .assert()
         .code(4);
+}
+
+#[test]
+fn stale_suppression_is_reported_for_reconfirmation_after_policy_change() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.plugin.join("main.qml"),
+        "Process { command: [\"sh\", \"-c\", \"ls\"] }\n",
+    )
+    .unwrap();
+    fixture
+        .command()
+        .args([
+            "plugins",
+            "review",
+            "io.example.cli",
+            "--action",
+            "suppress",
+            "--rule",
+            "oma.qml.process-execution",
+            "--reason",
+            "reviewed before analyzer update",
+            "--yes",
+        ])
+        .assert()
+        .success();
+
+    let path = fixture.config.path().join("omasafe/suppressions.json");
+    let mut state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    state["suppressions"][0]["policy_identity"] = Value::String("old-policy".into());
+    fs::write(&path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+    let output = fixture
+        .command()
+        .args([
+            "plugins",
+            "analyze",
+            "io.example.cli",
+            "--format",
+            "json",
+            "--fail-on",
+            "low",
+        ])
+        .assert()
+        .code(4)
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(
+        report["result"]["suppressions"]["applied"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        report["result"]["suppressions"]["reconfirmation_required"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        report["result"]["analysis"]["findings"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -2036,6 +2598,10 @@ fn include_analysis_distinguishes_policy_update_from_drift_and_stays_quiet_by_de
         "{kinds:?}"
     );
     assert!(
+        kinds.contains(&"analyzer-improvement".to_owned()),
+        "changed findings under unchanged source need a distinct improvement event: {kinds:?}"
+    );
+    assert!(
         !kinds.contains(&"fingerprint-instability".to_owned()),
         "{kinds:?}"
     );
@@ -2044,6 +2610,80 @@ fn include_analysis_distinguishes_policy_update_from_drift_and_stays_quiet_by_de
         "{kinds:?}"
     );
     assert!(!kinds.contains(&"new-capability".to_owned()), "{kinds:?}");
+}
+
+#[test]
+#[cfg(feature = "qml-parser")]
+fn h4_baseline_fixture_emits_improvement_without_source_drift() {
+    let fixture = Fixture::new();
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fixtures/plugins/h4-baseline-migration/Main.qml"
+    ));
+    fs::write(fixture.plugin.join("main.qml"), source).unwrap();
+    fixture.trust_current();
+    let inventory = fixture.inventory();
+    let digest = inventory["result"]["plugins"][0]["content_digest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // This is the pre-H4 snapshot: the source identity is unchanged, but
+    // the old sink-local classifier had no detached finding for this file.
+    seed_analysis_event(
+        &fixture,
+        "io.example.cli",
+        &digest,
+        "\"pre-h4-policy\"",
+        "pre-h4-fingerprint",
+        &[],
+        &["detached-process-execution"],
+    );
+
+    let output = fixture
+        .command()
+        .args(["scan", "--include-analysis", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let alerts = report["result"]["alerts"].as_array().unwrap();
+    assert!(
+        alerts
+            .iter()
+            .any(|alert| alert["kind"] == "analyzer-improvement"),
+        "{alerts:?}"
+    );
+    assert!(
+        alerts
+            .iter()
+            .any(|alert| alert["kind"] == "analyzer-policy-update"),
+        "{alerts:?}"
+    );
+    assert!(
+        !alerts.iter().any(|alert| alert["kind"] == "source-drift"),
+        "analyzer changes must not be reported as source drift: {alerts:?}"
+    );
+    assert!(
+        alerts
+            .iter()
+            .any(|alert| alert["kind"] == "finding-regression"),
+        "the newly discovered H4 finding must be surfaced: {alerts:?}"
+    );
+
+    // The trust baseline remains valid because only the analyzer policy
+    // changed; source identity and accepted digest stay pinned.
+    let status = fixture
+        .command()
+        .args(["plugins", "status", "io.example.cli", "--format", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let status: Value = serde_json::from_slice(&status).unwrap();
+    assert_eq!(status["result"]["state"], "unchanged");
+    assert_eq!(status["result"]["trusted"]["content_digest"], digest);
 }
 
 #[test]
@@ -2243,6 +2883,10 @@ impl FakeOmarchy {
         let state_path = state_dir.join("omarchy-fake.json");
         let log_path = state_dir.join("omarchy-fake.log");
         let script = r#"#!/bin/bash
+if [[ -z "${OMASAFE_FAKE_STATE:-}" || -z "${OMASAFE_FAKE_LOG:-}" ]]; then
+  echo "fake omarchy: OMASAFE_FAKE_STATE and OMASAFE_FAKE_LOG are required" >&2
+  exit 78
+fi
 STATE="$OMASAFE_FAKE_STATE"
 ORIGIN="$OMASAFE_FAKE_ORIGIN"
 RACE_ORIGIN="$OMASAFE_FAKE_RACE_ORIGIN"
@@ -2251,7 +2895,17 @@ LOG="$OMASAFE_FAKE_LOG"
 echo "$*" >> "$LOG"
 get() { jq -r "$1" "$STATE"; }
 # Only bash builtins and jq are guaranteed on the restricted fixture PATH.
-set() { jq "$1" "$STATE" > "$STATE.new" && mapfile -t lines < "$STATE.new" && printf '%s\n' "${lines[@]}" > "$STATE"; return 0; }
+set() {
+  local temporary="${STATE}.tmp"
+  if jq "$1" "$STATE" > "$temporary" &&
+    mapfile -t lines < "$temporary" &&
+    printf '%s\n' "${lines[@]}" > "$STATE"; then
+    rm -f -- "$temporary"
+    return 0
+  fi
+  rm -f -- "$temporary"
+  return 1
+}
 case "$*" in
   "plugin list --json")
     calls=$(get '.listCalls // 0')
@@ -2361,6 +3015,13 @@ esac
         let mut state: Value =
             serde_json::from_str(&fs::read_to_string(&self.state_path).unwrap()).unwrap();
         state["updateMode"] = Value::String(mode.into());
+        fs::write(&self.state_path, state.to_string()).unwrap();
+    }
+
+    fn set_enabled(&self, enabled: bool) {
+        let mut state: Value =
+            serde_json::from_str(&fs::read_to_string(&self.state_path).unwrap()).unwrap();
+        state["plugin"]["enabled"] = Value::Bool(enabled);
         fs::write(&self.state_path, state.to_string()).unwrap();
     }
 
@@ -2625,6 +3286,31 @@ impl UpdateFixture {
             .expect("review-update runs");
         (output.stdout, output.stderr, output.status.code())
     }
+
+    fn enable(&self, extra_args: &[&str]) -> (Vec<u8>, Vec<u8>, Option<i32>) {
+        let output = self
+            .fixture
+            .command()
+            .env("OMASAFE_FAKE_STATE", &self.fake.state_path)
+            .env("OMASAFE_FAKE_LOG", &self.fake.log_path)
+            .env(
+                "OMASAFE_FAKE_ORIGIN",
+                self.origin.path().to_string_lossy().as_ref(),
+            )
+            .env(
+                "OMASAFE_FAKE_RACE_ORIGIN",
+                self.race_origin.path().to_string_lossy().as_ref(),
+            )
+            .env(
+                "OMASAFE_FAKE_PLUGIN_DIR",
+                self.fixture.plugin.to_string_lossy().as_ref(),
+            )
+            .args(["plugins", "enable", "io.example.cli"])
+            .args(extra_args)
+            .output()
+            .expect("enable runs");
+        (output.stdout, output.stderr, output.status.code())
+    }
 }
 
 fn flow_record(fixture: &Fixture) -> Option<Value> {
@@ -2678,6 +3364,64 @@ fn review_update_requires_a_trusted_baseline() {
 
 #[test]
 #[cfg(unix)]
+fn hardened_review_update_blocks_when_trusted_baseline_diff_is_unavailable() {
+    let update = UpdateFixture::new();
+    update.seed_trust();
+    let history_path = update
+        .fixture
+        .state
+        .path()
+        .join("omasafe/trust-history.json");
+    let mut history: Value = serde_json::from_slice(&fs::read(&history_path).unwrap()).unwrap();
+    history["records"][0]["accepted"]["head"] = Value::String("f".repeat(40));
+    fs::write(&history_path, serde_json::to_vec(&history).unwrap()).unwrap();
+
+    let (stdout, stderr, code) = update.review_update(&[
+        "--yes",
+        "--policy",
+        "hardened",
+        "--expected-commit",
+        &update.candidate,
+    ]);
+    assert_eq!(code, Some(1));
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(text.contains("coverage-incomplete"), "{text}");
+    assert!(update.fake.enabled());
+    assert!(!update.fake.log_contains("plugin disable"));
+    assert!(!update.fake.log_contains("plugin update"));
+
+    let enforcement_history: Value = serde_json::from_slice(
+        &fs::read(
+            update
+                .fixture
+                .state
+                .path()
+                .join("omasafe/enforcement-history.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let decision = enforcement_history["decisions"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap();
+    assert_eq!(decision["outcome"], "block");
+    assert!(
+        decision["coverage_limitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item == "trusted-baseline-diff-unavailable")
+    );
+}
+
+#[test]
+#[cfg(unix)]
 fn review_update_yes_requires_expected_commit() {
     let update = UpdateFixture::new();
     update.seed_trust();
@@ -2687,6 +3431,206 @@ fn review_update_yes_requires_expected_commit() {
     assert!(text.contains("--expected-commit"), "{text}");
     // Fail-fast: no fetch, no evaluation, no mutation.
     assert!(!update.fake.log_contains("plugin update"));
+}
+
+#[test]
+#[cfg(unix)]
+fn review_update_rejects_unknown_enforcement_policy_before_evaluation() {
+    let update = UpdateFixture::new();
+    update.seed_trust();
+    let (_stdout, stderr, code) = update.review_update(&[
+        "--yes",
+        "--expected-commit",
+        &update.candidate,
+        "--policy",
+        "experimental",
+    ]);
+    assert_eq!(code, Some(1));
+    assert!(
+        String::from_utf8_lossy(&stderr).contains("policy must be advisory or hardened"),
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(!update.fake.log_contains("plugin update"));
+    assert!(!update.fake.log_contains("plugin disable"));
+}
+
+#[test]
+#[cfg(unix)]
+fn hardened_review_update_blocks_unanalyzable_executable_before_mutation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let update = UpdateFixture::new();
+    update.seed_trust();
+
+    let candidate_work = TempDir::new().unwrap();
+    init_repo(candidate_work.path(), false);
+    run_git(
+        candidate_work.path(),
+        &[
+            "pull",
+            "--quiet",
+            update.origin.path().to_string_lossy().as_ref(),
+            "main",
+        ],
+    );
+    // An extensionless executable has no analyzer in the current policy. Its
+    // exact bytes must be approved separately before hardened review can
+    // consider enabling the candidate.
+    fs::write(candidate_work.path().join("tool"), b"opaque executable\n").unwrap();
+    fs::set_permissions(
+        candidate_work.path().join("tool"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let blocked = git_commit_all(candidate_work.path(), "opaque executable");
+    run_git(
+        candidate_work.path(),
+        &[
+            "push",
+            "--quiet",
+            update.origin.path().to_string_lossy().as_ref(),
+            "HEAD:refs/heads/main",
+        ],
+    );
+
+    let (stdout, stderr, code) = update.review_update(&[
+        "--yes",
+        "--expected-commit",
+        &blocked,
+        "--policy",
+        "hardened",
+    ]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(code, Some(1), "{text}");
+    assert!(text.contains("hardened policy blocked"), "{text}");
+    assert!(text.contains("unsupported-executable"), "{text}");
+    assert!(!update.fake.log_contains("plugin update"));
+    assert!(!update.fake.log_contains("plugin disable"));
+    assert_eq!(
+        run_git(&update.fixture.plugin, &["rev-parse", "HEAD"]),
+        installed_head_of(&update),
+        "blocked review moved the live tree"
+    );
+
+    // A fail-closed pre-mutation block is durable even though no native
+    // update happened, so operators can inspect why it was denied later.
+    let enforcement_history: Value = serde_json::from_slice(
+        &fs::read(
+            update
+                .fixture
+                .state
+                .path()
+                .join("omasafe/enforcement-history.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let decisions = enforcement_history["decisions"].as_array().unwrap();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0]["outcome"], "block");
+    assert!(
+        decisions[0]["reason_codes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason == "unsupported-executable")
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn advisory_enable_gates_inactive_tree_and_persists_final_decision() {
+    let update = UpdateFixture::new();
+    update.fake.set_enabled(false);
+
+    let (stdout, stderr, code) = update.enable(&["--policy", "advisory"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(code, Some(0), "{text}");
+    assert!(text.contains("io.example.cli: enabled"), "{text}");
+    assert!(update.fake.enabled());
+    assert!(update.fake.log_contains("plugin enable io.example.cli"));
+
+    let history: Value = serde_json::from_slice(
+        &fs::read(
+            update
+                .fixture
+                .state
+                .path()
+                .join("omasafe/enforcement-history.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let decisions = history["decisions"].as_array().unwrap();
+    assert_eq!(
+        decisions.len(),
+        2,
+        "pre- and post-enable decisions are retained"
+    );
+    assert_eq!(decisions.last().unwrap()["operation"], "enable");
+    assert_eq!(decisions.last().unwrap()["outcome"], "allow");
+    assert_eq!(decisions.last().unwrap()["authorization_basis"], "policy");
+}
+
+#[test]
+#[cfg(unix)]
+fn hardened_enable_blocks_unsupported_executable_before_native_enable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let update = UpdateFixture::new();
+    update.fake.set_enabled(false);
+    fs::write(update.fixture.plugin.join("tool"), b"opaque executable\n").unwrap();
+    fs::set_permissions(
+        update.fixture.plugin.join("tool"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    git_commit_all(&update.fixture.plugin, "opaque executable");
+
+    let (stdout, stderr, code) = update.enable(&["--policy", "hardened"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(code, Some(1), "{text}");
+    assert!(
+        text.contains("hardened policy blocked enable before mutation"),
+        "{text}"
+    );
+    assert!(text.contains("unsupported-executable"), "{text}");
+    assert!(!update.fake.enabled());
+    assert!(!update.fake.log_contains("plugin enable"));
+
+    let history: Value = serde_json::from_slice(
+        &fs::read(
+            update
+                .fixture
+                .state
+                .path()
+                .join("omasafe/enforcement-history.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let decision = history["decisions"].as_array().unwrap().last().unwrap();
+    assert_eq!(decision["outcome"], "block");
+    assert!(
+        decision["reason_codes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason == "unsupported-executable")
+    );
 }
 
 #[test]
@@ -2706,6 +3650,7 @@ fn review_update_happy_path_updates_enables_and_advances_trust() {
     );
     let text = String::from_utf8_lossy(&stdout);
     assert!(text.contains("Reviewed update preview"), "{text}");
+    assert!(text.contains("enforcement: allow"), "{text}");
     assert!(text.contains("Reviewed update complete"), "{text}");
 
     // Postconditions: exact reviewed commit installed and enabled again.
@@ -2741,6 +3686,63 @@ fn review_update_happy_path_updates_enables_and_advances_trust() {
     assert!(
         !flow_record(&update.fixture).is_some(),
         "flow record left behind"
+    );
+
+    // Every evaluated lifecycle operation leaves a durable decision that the
+    // read-only status surface can retrieve without re-running analysis.
+    let enforcement_history: Value = serde_json::from_slice(
+        &fs::read(
+            update
+                .fixture
+                .state
+                .path()
+                .join("omasafe/enforcement-history.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let decisions = enforcement_history["decisions"].as_array().unwrap();
+    assert_eq!(decisions.len(), 2);
+    assert_eq!(decisions[0]["plugin_id"], "io.example.cli");
+    assert_eq!(decisions[0]["outcome"], "allow");
+    assert_eq!(decisions[0]["installed_tree_postconditions_passed"], true);
+    let decision = decisions.last().unwrap();
+    assert_eq!(decision["plugin_id"], "io.example.cli");
+    assert_eq!(decision["operation"], "review-update");
+    assert_eq!(decision["outcome"], "allow");
+    assert_eq!(decision["authorization_basis"], "policy");
+    assert_eq!(decision["installed_tree_postconditions_passed"], true);
+    assert_eq!(
+        decision["enforcement_policy_identity"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+
+    let status = update
+        .fixture
+        .command()
+        .args([
+            "plugins",
+            "enforcement-status",
+            "io.example.cli",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status_json: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status_json["result"]["plugin_id"], "io.example.cli");
+    assert_eq!(status_json["result"]["decision"]["outcome"], "allow");
+    assert_eq!(
+        status_json["result"]["decision"]["installed_tree_postconditions_passed"],
+        true
     );
 }
 
@@ -2824,6 +3826,19 @@ fn review_update_native_failure_leaves_disabled_with_guidance() {
     );
     let record = flow_record(&update.fixture).expect("recovery record kept");
     assert_eq!(record["phase"], Value::String("failed".into()));
+    let history: Value = serde_json::from_slice(
+        &fs::read(
+            update
+                .fixture
+                .state
+                .path()
+                .join("omasafe/enforcement-history.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let decision = history["decisions"].as_array().unwrap().last().unwrap();
+    assert_eq!(decision["installed_tree_postconditions_passed"], false);
 }
 
 #[test]
@@ -2895,6 +3910,48 @@ fn review_update_rescan_failure_after_mutation_reports_guidance() {
         flow_record(&update.fixture).unwrap()["phase"],
         Value::String("failed".into())
     );
+    let history: Value = serde_json::from_slice(
+        &fs::read(
+            update
+                .fixture
+                .state
+                .path()
+                .join("omasafe/enforcement-history.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let decision = history["decisions"].as_array().unwrap().last().unwrap();
+    assert_eq!(decision["outcome"], "allow");
+    assert_eq!(decision["installed_tree_postconditions_passed"], false);
+}
+
+#[test]
+#[cfg(unix)]
+fn review_update_refuses_unknown_preflight_inventory_before_mutation() {
+    let update = UpdateFixture::new();
+    update.seed_trust();
+    let mut state: Value =
+        serde_json::from_str(&fs::read_to_string(&update.fake.state_path).unwrap()).unwrap();
+    state["listFails"] = Value::Bool(true);
+    state["listCalls"] = Value::Number(1.into());
+    fs::write(&update.fake.state_path, state.to_string()).unwrap();
+
+    let (stdout, stderr, code) =
+        update.review_update(&["--yes", "--expected-commit", &update.candidate]);
+    assert_eq!(code, Some(1));
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(
+        text.contains("pre-update Omarchy plugin inventory"),
+        "{text}"
+    );
+    assert!(update.fake.enabled(), "unknown state must not be mutated");
+    assert!(!update.fake.log_contains("plugin disable"));
+    assert!(!update.fake.log_contains("plugin update"));
 }
 
 #[test]
@@ -3480,7 +4537,7 @@ fn install_verified_catalog(fixture: &Fixture, candidate: &str) {
         cache.join("catalog.meta.json"),
         serde_json::json!({
             "repository_commit": revision,
-            "repository_url": "https://github.com/HANCORE-linux/omarchy-plugin-marketplace",
+            "repository_url": "https://github.com/omacom/omarchy-plugin-marketplace",
             "retrieved_at": "2026-08-22T00:00:00Z",
             "file_digest": format!("{:x}", Sha256::digest(catalog.as_bytes()))
         })

@@ -141,7 +141,9 @@ and removal lifecycles.
   [`docs/release-signing.md`](docs/release-signing.md).
 - **UI plugin** — the standalone bar-widget lives in the
   [`omasafe-plugin`](https://github.com/tuthan/omasafe-plugin) repository, which
-  carries a repository-root `manifest.json` for direct Omarchy publishing.
+  carries a repository-root `manifest.json` for direct Omarchy publishing. It is
+  listed in the [Omarchy plugin marketplace](https://plugins.omarchy.org/index.html),
+  whose catalog is maintained in the [marketplace repository](https://github.com/omacom/omarchy-plugin-marketplace).
 
 Installing an Omarchy plugin only clones and validates the plugin checkout; it does
 **not** install native binaries or run dependency installers. If the plugin is

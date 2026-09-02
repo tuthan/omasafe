@@ -3,6 +3,8 @@
 
 #[cfg(feature = "qml-parser")]
 pub(in crate::detect) mod ast;
+#[cfg(feature = "qml-parser")]
+pub(in crate::detect) mod dataflow;
 pub(in crate::detect) mod lexical;
 pub(in crate::detect) mod strings;
 

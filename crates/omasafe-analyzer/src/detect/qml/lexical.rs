@@ -18,11 +18,6 @@ use crate::detect::model::balanced_bracket_span;
 use crate::detect::shell::egress::script_body_fetches;
 use crate::detect::shell::interpreter::INTERPRETER_BASENAMES;
 
-pub(in crate::detect) struct LexFlags {
-    pub(in crate::detect) detached_any: Option<u32>,
-    pub(in crate::detect) network: Option<u32>,
-}
-
 /// Shell-interpreter invocation inside a command string: an interpreter word
 /// followed (after whitespace) by a `-c`-style flag. Returns the byte offset
 /// of the interpreter word for evidence trimming.
@@ -87,11 +82,6 @@ pub(in crate::detect) fn lexical_scan(source: &str, language: Language) -> FileO
         confidence: Confidence::LexicalFallback,
         limitations: Vec::new(),
     };
-    let mut flags = LexFlags {
-        detached_any: None,
-        network: None,
-    };
-
     for (index, raw_line) in source.lines().enumerate() {
         let number = index as u32 + 1;
         // One shared quote-aware trim: commented-out code is invisible to
@@ -106,7 +96,6 @@ pub(in crate::detect) fn lexical_scan(source: &str, language: Language) -> FileO
         while let Some(relative_offset) = find_word(&line[search_from..], "execDetached") {
             let offset = search_from + relative_offset;
             search_from = offset + "execDetached".len();
-            flags.detached_any.get_or_insert(number);
             outcome.capabilities.push(occurrence(
                 Capability::DetachedProcessExecution,
                 language,
@@ -145,7 +134,6 @@ pub(in crate::detect) fn lexical_scan(source: &str, language: Language) -> FileO
             || find_word(line, "fetch(").is_some()
             || line.contains("WebSocket");
         if is_network_line {
-            flags.network.get_or_insert(number);
             outcome.capabilities.push(occurrence(
                 Capability::NetworkAccess,
                 language,

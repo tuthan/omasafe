@@ -48,6 +48,7 @@ jobs:
         run: |
           python3 scripts/validator-parity.py \
             --manifest fixtures/corpus/manifest.json \
+            --full \
             --cache "$RUNNER_TEMP/corpus-cache" \
             --output parity-report.json
       - name: Upload corpus reports

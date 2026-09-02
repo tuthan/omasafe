@@ -86,18 +86,44 @@ Suppress/reinstate manage scoped analysis suppressions
 with a reason in XDG config; they hide and de-enforce findings without ever
 altering stored analysis results, and reinstating preserves the audit trail.
 .TP
+.B plugins enable PLUGIN_ID [--policy advisory|hardened] [--format text|json]
+Enable an already-installed, provably inactive plugin through an explicit
+policy gate. Hardened mode analyzes the exact installed tree before the native
+enable and verifies state and source identity afterwards; first-install
+staging and native calls outside OmaSafe remain outside this boundary.
+.TP
 .B plugins review-update PLUGIN_ID [--expected-commit SHA] [--yes]
+    [--policy advisory|hardened]
 Review an exact candidate commit before updating: refuses on a dirty installed
 worktree, fetches the pinned candidate into the bounded cache, validates it,
 presents the delta versus the trusted baseline, then delegates the mutation to
 the native updater. Unattended use requires --expected-commit with --yes;
-postconditions (exact HEAD, rescan) must pass before the plugin is re-enabled
-or trusted.
+--policy defaults to advisory; hardened performs a fail-closed pre-mutation
+enforcement evaluation and retains the same installed-tree postconditions
+before the plugin is re-enabled or trusted.
+.TP
+.B plugins enforcement-status PLUGIN_ID [--format text|json]
+Print the last persisted enforcement decision for a plugin. This is
+read-only; a missing decision is reported explicitly rather than treated as
+an allow.
+.TP
+.B plugins override create PLUGIN_ID --rule RULE_ID [--rule RULE_ID ...]
+    --commit SHA --reason TEXT --expires TIMESTAMP
+Interactively create an exact-identity, expiring hardened-policy override for
+an inactive installed tree. The record is auditable user-owned state, not a
+separate authority boundary.
+.TP
+.B plugins override list [--format text|json]
+List recorded enforcement overrides and whether their expiry is still active.
 .TP
 .B rules list [--format text|json]
 Print the OmaSafe-owned capability rule catalog with severities, capabilities,
 and review guidance. The catalog is static and versioned through the analyzer
 policy identity.
+.TP
+.B rules coverage [--format text|json]
+Print every external Baseline V3 equivalence entry, its current relation, and
+the deterministic set of external entries not covered by OmaSafe.
 .TP
 .B rules explain RULE_ID [--format text|json]
 Print one rule's full definition: severity, capability, verified surface
@@ -118,8 +144,15 @@ submodules). URLs carrying credentials are rejected.
 .B marketplace refresh (--commit COMMIT | --latest)
 Fetch and verify a pinned marketplace snapshot.
 .TP
-.B schedule install
-Install the user-level scheduled scan unit.
+.B schedule install [--policy advisory|hardened]
+Install the user-level scheduled scan unit. Advisory keeps the lightweight
+drift scan; hardened explicitly includes analysis and never changes an
+existing timer policy silently.
+.TP
+.B schedule status [--format text|json]
+Print the CLI-owned installed schedule policy, unit identity, report-only
+behavior, and last known systemd execution result. Missing or stale metadata is
+reported as unavailable rather than inferred from unit text.
 .SH FILES
 The configuration, state, and cache roots follow XDG_CONFIG_HOME,
 XDG_STATE_HOME, and XDG_CACHE_HOME, defaulting to ~/.config/omasafe,
@@ -162,7 +195,7 @@ _omasafe_cli() {
     fi
     case "\${COMP_WORDS[1]}" in
         scan|provenance|plugins|marketplace|rules|scan-plugin)
-            COMPREPLY=(\$(compgen -W "--format --notify --only-new --include-analysis --yes --expected-head --expected-tree --expected-digest --action --reason --rule --path --commit --latest --git --revision --fail-on" -- "\${cur}"))
+            COMPREPLY=(\$(compgen -W "--format --notify --only-new --include-analysis --yes --expected-head --expected-tree --expected-digest --policy --action --reason --rule --path --commit --expires --latest --git --revision --fail-on" -- "\${cur}"))
             ;;
         paths|schedule)
             COMPREPLY=()
@@ -176,7 +209,7 @@ EOF
 write_asset docs/completions/_omasafe-cli "$(cat <<EOF
 #compdef omasafe-cli
 # zsh completion for omasafe-cli; generated from docs/cli-surface.txt
-_arguments '1:command:($top_level)' '*:option:(--format --notify --only-new --include-analysis --yes --expected-head --expected-tree --expected-digest --action --reason --rule --path --commit --latest --git --revision --fail-on)'
+_arguments '1:command:($top_level)' '*:option:(--format --notify --only-new --include-analysis --yes --expected-head --expected-tree --expected-digest --policy --action --reason --rule --path --commit --expires --latest --git --revision --fail-on)'
 EOF
 )"
 
@@ -188,6 +221,7 @@ complete -c omasafe-cli -l notify
 complete -c omasafe-cli -l only-new
 complete -c omasafe-cli -l include-analysis
 complete -c omasafe-cli -l yes
+complete -c omasafe-cli -l policy -r -a "advisory hardened"
 complete -c omasafe-cli -l expected-head -r
 complete -c omasafe-cli -l expected-tree -r
 complete -c omasafe-cli -l expected-digest -r
@@ -195,6 +229,7 @@ complete -c omasafe-cli -l action -r -a "acknowledge exclude rebaseline restore 
 complete -c omasafe-cli -l reason -r
 complete -c omasafe-cli -l rule -r
 complete -c omasafe-cli -l commit -r
+complete -c omasafe-cli -l expires -r
 complete -c omasafe-cli -l path -r
 complete -c omasafe-cli -l git -r
 complete -c omasafe-cli -l revision -r

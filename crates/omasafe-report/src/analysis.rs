@@ -13,14 +13,14 @@
 
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 pub const ANALYSIS_SCHEMA_VERSION: &str = "omasafe.analysis.v1";
 
 /// Versioned identity of everything that influences analysis output besides
 /// the analyzed source itself. Any change here is labelled "analyzer update",
 /// never plugin drift.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyIdentity {
     /// Version of the `omasafe-analyzer` crate that produced the results.
     pub analyzer_version: String,

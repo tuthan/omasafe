@@ -1,0 +1,72 @@
+{
+  "schemaVersion": 1,
+  "description": "Pinned local adversarial and negative fixtures for H7 detection-rate measurement.",
+  "fixtures": [
+    {
+      "id": "reverse-shell-positive",
+      "path": "fixtures/plugins/reverse-shell",
+      "expectedRules": ["oma.script.reverse-shell"]
+    },
+    {
+      "id": "reverse-shell-negative",
+      "path": "fixtures/plugins/benign-scripts",
+      "expectedRules": [],
+      "forbiddenRules": ["oma.script.reverse-shell"]
+    },
+    {
+      "id": "shared-temp-controlled-positive",
+      "path": "fixtures/plugins/privileged-shared-temp-controlled",
+      "expectedRules": ["oma.script.privileged-shared-temp-controlled"]
+    },
+    {
+      "id": "shared-temp-indicator-negative",
+      "path": "fixtures/plugins/privileged-shared-temp",
+      "expectedRules": [],
+      "forbiddenRules": ["oma.script.privileged-shared-temp-controlled"]
+    },
+    {
+      "id": "remote-component-loader-positive",
+      "path": "fixtures/plugins/remote-component-loader",
+      "expectedRules": ["oma.qml.remote-component-load"]
+    },
+    {
+      "id": "remote-directory-import-indicator",
+      "path": "fixtures/plugins/remote-directory-import",
+      "expectedRules": ["oma.qml.remote-directory-import"],
+      "forbiddenRules": ["oma.qml.remote-component-load"]
+    },
+    {
+      "id": "download-execute-positive",
+      "path": "fixtures/plugins/download-execute-nopipe",
+      "expectedRules": ["oma.script.download-execute"]
+    },
+    {
+      "id": "decode-execute-positive",
+      "path": "fixtures/plugins/decode-execute",
+      "expectedRules": ["oma.script.decode-execute"]
+    },
+    {
+      "id": "h4-variable-indirection-positive",
+      "path": "fixtures/plugins/h4-variable-indirection",
+      "expectedRules": [
+        "oma.qml.remote-component-load",
+        "oma.qml.dynamic-code",
+        "oma.qml.out-of-tree-reference",
+        "oma.qml.detached-execution",
+        "oma.qml.process-execution",
+        "oma.script.download-execute"
+      ]
+    },
+    {
+      "id": "sensitive-data-egress-positive",
+      "path": "fixtures/plugins/h6-user-data",
+      "expectedRules": ["oma.qml.sensitive-data-egress"]
+    },
+    {
+      "id": "h4-boundary-negative",
+      "path": "fixtures/plugins/h4-bound-exhaustion",
+      "expectedRules": [],
+      "forbiddenRules": ["oma.script.download-execute", "oma.qml.sensitive-data-egress"]
+    }
+  ]
+}

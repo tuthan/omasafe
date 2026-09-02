@@ -46,6 +46,11 @@ pub struct SuppressionRecord {
     pub path_scope: Option<String>,
     pub reason: String,
     pub created_at: String,
+    /// Analyzer policy identity that produced the suppressed predicate. A
+    /// mismatch requires explicit re-confirmation; it must never silently
+    /// suppress newly discovered evidence under a changed predicate.
+    #[serde(default)]
+    pub policy_identity: Option<String>,
     #[serde(default = "default_active")]
     pub active: bool,
     #[serde(default)]
@@ -168,6 +173,53 @@ impl SuppressionState {
                     Some(scope) => path_matches_scope(relative_path, scope),
                 }
         })
+    }
+
+    /// True when an active scope match was created under a different analyzer
+    /// policy identity. Callers should surface the finding and request
+    /// re-confirmation rather than applying the stale suppression.
+    pub fn requires_reconfirmation(
+        &self,
+        rule_id: &str,
+        plugin_context: Option<&str>,
+        relative_path: &str,
+        current_policy_identity: &str,
+    ) -> bool {
+        self.active().any(|record| {
+            record.rule_id == rule_id
+                && match &record.plugin_id {
+                    None => true,
+                    Some(target) => plugin_context == Some(target.as_str()),
+                }
+                && match &record.path_scope {
+                    None => true,
+                    Some(scope) => path_matches_scope(relative_path, scope),
+                }
+                // Missing policy identity is legacy state. It cannot prove
+                // that the suppression was created under the current
+                // analyzer predicate, so it must be reconfirmed just like an
+                // explicit mismatch.
+                && record.policy_identity.as_deref() != Some(current_policy_identity)
+        })
+    }
+
+    /// Policy-aware suppression match. Legacy records without an identity are
+    /// retained for auditability but are inactive until explicitly
+    /// reconfirmed under the current policy identity.
+    pub fn matches_policy(
+        &self,
+        rule_id: &str,
+        plugin_context: Option<&str>,
+        relative_path: &str,
+        current_policy_identity: &str,
+    ) -> bool {
+        self.matches(rule_id, plugin_context, relative_path)
+            && !self.requires_reconfirmation(
+                rule_id,
+                plugin_context,
+                relative_path,
+                current_policy_identity,
+            )
     }
 }
 
@@ -292,9 +344,58 @@ mod tests {
             path_scope: scope.map(str::to_owned),
             reason: "reviewed".to_owned(),
             created_at: "t0".to_owned(),
+            policy_identity: None,
             active: true,
             reinstated_at: None,
         }
+    }
+
+    #[test]
+    fn policy_mismatch_requires_reconfirmation_and_does_not_match() {
+        let mut state = SuppressionState::default();
+        let mut stale = record("oma.qml.dynamic-reference", Some("io.example.x"), None);
+        stale.policy_identity = Some("old-policy".to_owned());
+        state.add(stale);
+        assert!(state.requires_reconfirmation(
+            "oma.qml.dynamic-reference",
+            Some("io.example.x"),
+            "Main.qml",
+            "new-policy"
+        ));
+        assert!(!state.matches_policy(
+            "oma.qml.dynamic-reference",
+            Some("io.example.x"),
+            "Main.qml",
+            "new-policy"
+        ));
+        assert!(state.matches_policy(
+            "oma.qml.dynamic-reference",
+            Some("io.example.x"),
+            "Main.qml",
+            "old-policy"
+        ));
+    }
+
+    #[test]
+    fn legacy_policyless_suppression_requires_reconfirmation() {
+        let mut state = SuppressionState::default();
+        state.add(record(
+            "oma.qml.dynamic-reference",
+            Some("io.example.x"),
+            None,
+        ));
+        assert!(state.requires_reconfirmation(
+            "oma.qml.dynamic-reference",
+            Some("io.example.x"),
+            "Main.qml",
+            "current-policy"
+        ));
+        assert!(!state.matches_policy(
+            "oma.qml.dynamic-reference",
+            Some("io.example.x"),
+            "Main.qml",
+            "current-policy"
+        ));
     }
 
     #[test]

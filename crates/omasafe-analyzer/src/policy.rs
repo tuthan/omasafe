@@ -14,9 +14,12 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use omasafe_core::bounds::{
-    DEFAULT_TIME_BUDGET, GIT_PROCESS_BUDGET, MAX_CACHE_BYTES, MAX_EVIDENCE_BYTES_PER_RESULT,
+    DATAFLOW_TIME_BUDGET, DEFAULT_TIME_BUDGET, GIT_PROCESS_BUDGET, MAX_CACHE_BYTES,
+    MAX_DATAFLOW_ASSIGNMENT_DEPTH, MAX_DATAFLOW_STATEMENTS, MAX_EVIDENCE_BYTES_PER_RESULT,
     MAX_FILE_BYTES, MAX_FILES, MAX_METADATA_BYTES, MAX_PROCESS_OUTPUT_BYTES_PER_STREAM,
-    MAX_SINK_REJECTIONS, MAX_TOTAL_BYTES, MAX_TREE_DEPTH, SAMPLE_BYTES,
+    MAX_SHELL_PARSE_CHILD_PROGRAMS, MAX_SHELL_PARSE_DEPTH, MAX_SHELL_PARSE_NODES,
+    MAX_SHELL_PARSE_SOURCE_BYTES, MAX_SINK_REJECTIONS, MAX_STAGED_CHAIN_LINES, MAX_TOTAL_BYTES,
+    MAX_TREE_DEPTH, SAMPLE_BYTES, STAGED_CHAIN_TIME_BUDGET,
 };
 use omasafe_report::analysis::PolicyIdentity;
 
@@ -44,6 +47,24 @@ pub struct LimitsConfiguration {
     pub max_sink_rejections: usize,
     /// Child-output capture cap feeds analysis input and truncation states.
     pub max_process_output_bytes_per_stream: usize,
+    /// Maximum QML/JS statements visited by bounded intra-file dataflow.
+    pub max_dataflow_statements: usize,
+    /// Maximum recursive assignment/expression depth followed by dataflow.
+    pub max_dataflow_assignment_depth: usize,
+    /// Per-file dataflow wall-clock budget in milliseconds.
+    pub dataflow_time_budget_ms: u128,
+    /// Maximum physical shell lines considered by staged chain tracking.
+    pub max_staged_chain_lines: usize,
+    /// Per-file staged shell-chain wall-clock budget in milliseconds.
+    pub staged_chain_time_budget_ms: u128,
+    /// Maximum recursive depth used while constructing typed shell IR.
+    pub max_shell_parse_depth: usize,
+    /// Maximum typed shell IR nodes constructed in one source analysis.
+    pub max_shell_parse_nodes: usize,
+    /// Maximum shell command/process-substitution child programs constructed.
+    pub max_shell_parse_child_programs: usize,
+    /// Aggregate source bytes retained for recursively parsed shell children.
+    pub max_shell_parse_source_bytes: usize,
 }
 
 pub fn limits_configuration() -> LimitsConfiguration {
@@ -60,6 +81,15 @@ pub fn limits_configuration() -> LimitsConfiguration {
         max_evidence_bytes_per_result: MAX_EVIDENCE_BYTES_PER_RESULT,
         max_sink_rejections: MAX_SINK_REJECTIONS,
         max_process_output_bytes_per_stream: MAX_PROCESS_OUTPUT_BYTES_PER_STREAM,
+        max_dataflow_statements: MAX_DATAFLOW_STATEMENTS,
+        max_dataflow_assignment_depth: MAX_DATAFLOW_ASSIGNMENT_DEPTH,
+        dataflow_time_budget_ms: DATAFLOW_TIME_BUDGET.as_millis(),
+        max_staged_chain_lines: MAX_STAGED_CHAIN_LINES,
+        staged_chain_time_budget_ms: STAGED_CHAIN_TIME_BUDGET.as_millis(),
+        max_shell_parse_depth: MAX_SHELL_PARSE_DEPTH,
+        max_shell_parse_nodes: MAX_SHELL_PARSE_NODES,
+        max_shell_parse_child_programs: MAX_SHELL_PARSE_CHILD_PROGRAMS,
+        max_shell_parse_source_bytes: MAX_SHELL_PARSE_SOURCE_BYTES,
     }
 }
 

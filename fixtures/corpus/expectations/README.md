@@ -29,5 +29,28 @@ One JSON object per line (`fixtures/corpus/expectations/dispositions.jsonl`):
   high-severity false positive or any untriaged high-severity finding.
   Genuine high findings are expected and fine.
 
-The ledger intentionally starts empty: dispositions accrue from real triage,
-never pre-seeded.
+The checked-in ledger contains only dispositions from the pinned sample that
+were reviewed against the corresponding source commit. New records must still
+come from real triage; do not pre-seed unknown findings or infer dispositions
+from severity alone.
+
+## H7 measurement outputs
+
+`scripts/run-corpus.py` adds `triaged`, `precision`, and `blockingEligible`
+fields to its report. Precision is `true_positive / (true_positive +
+false_positive)` only when at least one emitted result has a disposition;
+otherwise it is `null`. A family is eligible only when it has at least one
+triaged result, zero false positives, and zero untriaged results. An empty
+ledger therefore admits no blocking family.
+
+The independent fixture suite is described by
+`ground-truth.json` and measured with:
+
+```text
+python3 scripts/measure-ground-truth.py \
+  --output docs/reports/h7-ground-truth.json
+```
+
+Its detection-rate report is separate from corpus precision: fixture labels
+provide independently declared positives and negatives, but do not establish
+ecosystem recall.

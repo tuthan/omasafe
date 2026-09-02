@@ -7,6 +7,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::SourceIdentity;
+use omasafe_report::enforcement::{EnforcementAuditEvent, EnforcementDecision, OverrideBinding};
 
 pub const HISTORY_SCHEMA_VERSION: u64 = 1;
 
@@ -21,6 +22,11 @@ pub enum Error {
     },
     #[error("scan state is malformed at {path}: {source}")]
     ScanStateJson {
+        path: String,
+        source: serde_json::Error,
+    },
+    #[error("enforcement history is malformed at {path}: {source}")]
+    EnforcementJson {
         path: String,
         source: serde_json::Error,
     },
@@ -127,6 +133,145 @@ impl UpdateFlowRecord {
         // at the temp path and have this overwrite an arbitrary target.
         durable_replace(path, &bytes)?;
         Ok(())
+    }
+}
+
+pub const ENFORCEMENT_HISTORY_SCHEMA_VERSION: u64 = 1;
+
+/// Durable, append-only enforcement state. Decisions and audit events are
+/// separate: a read-only policy evaluation is a decision, while an override
+/// attempt is an audit event written at the attempt boundary, even if the
+/// subsequent mutation fails.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EnforcementHistory {
+    pub schema_version: u64,
+    #[serde(default)]
+    pub decisions: Vec<EnforcementDecision>,
+    #[serde(default)]
+    pub audit_events: Vec<EnforcementAuditEvent>,
+}
+
+pub const OVERRIDE_HISTORY_SCHEMA_VERSION: u64 = 1;
+
+/// Durable, private override records. Records are append-only so a later
+/// expiry or policy change never erases the operator's authorization history.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OverrideHistory {
+    pub schema_version: u64,
+    #[serde(default)]
+    pub overrides: Vec<OverrideBinding>,
+}
+
+impl Default for OverrideHistory {
+    fn default() -> Self {
+        Self {
+            schema_version: OVERRIDE_HISTORY_SCHEMA_VERSION,
+            overrides: Vec::new(),
+        }
+    }
+}
+
+impl OverrideHistory {
+    pub fn load(path: &Path) -> Result<Self, Error> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let history: Self =
+            serde_json::from_slice(&fs::read(path)?).map_err(|source| Error::EnforcementJson {
+                path: path.display().to_string(),
+                source,
+            })?;
+        if history.schema_version != OVERRIDE_HISTORY_SCHEMA_VERSION {
+            return Err(Error::Schema {
+                kind: "override history",
+                version: history.schema_version,
+                expected: OVERRIDE_HISTORY_SCHEMA_VERSION,
+            });
+        }
+        Ok(history)
+    }
+
+    pub fn record(&mut self, binding: OverrideBinding) {
+        self.schema_version = OVERRIDE_HISTORY_SCHEMA_VERSION;
+        self.overrides.push(binding);
+    }
+
+    pub fn write_atomic(&self, path: &Path) -> Result<(), Error> {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        let _lock = acquire_lock(path)?;
+        self.write_atomic_locked(path)
+    }
+
+    pub fn write_atomic_locked(&self, path: &Path) -> Result<(), Error> {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        durable_replace(path, &serde_json::to_vec_pretty(self)?)
+    }
+}
+
+impl Default for EnforcementHistory {
+    fn default() -> Self {
+        Self {
+            schema_version: ENFORCEMENT_HISTORY_SCHEMA_VERSION,
+            decisions: Vec::new(),
+            audit_events: Vec::new(),
+        }
+    }
+}
+
+impl EnforcementHistory {
+    pub fn load(path: &Path) -> Result<Self, Error> {
+        if !path.exists() {
+            return Ok(Self {
+                schema_version: ENFORCEMENT_HISTORY_SCHEMA_VERSION,
+                decisions: Vec::new(),
+                audit_events: Vec::new(),
+            });
+        }
+        let history: Self =
+            serde_json::from_slice(&fs::read(path)?).map_err(|source| Error::EnforcementJson {
+                path: path.display().to_string(),
+                source,
+            })?;
+        if history.schema_version != ENFORCEMENT_HISTORY_SCHEMA_VERSION {
+            return Err(Error::Schema {
+                kind: "enforcement history",
+                version: history.schema_version,
+                expected: ENFORCEMENT_HISTORY_SCHEMA_VERSION,
+            });
+        }
+        Ok(history)
+    }
+
+    pub fn record_decision(&mut self, decision: EnforcementDecision) {
+        self.schema_version = ENFORCEMENT_HISTORY_SCHEMA_VERSION;
+        self.decisions.push(decision);
+    }
+
+    pub fn record_audit_event(&mut self, event: EnforcementAuditEvent) {
+        self.schema_version = ENFORCEMENT_HISTORY_SCHEMA_VERSION;
+        self.audit_events.push(event);
+    }
+
+    pub fn latest(&self, plugin_id: &str) -> Option<&EnforcementDecision> {
+        self.decisions
+            .iter()
+            .rev()
+            .find(|decision| decision.plugin_id == plugin_id)
+    }
+
+    pub fn write_atomic(&self, path: &Path) -> Result<(), Error> {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        let _lock = acquire_lock(path)?;
+        self.write_atomic_locked(path)
+    }
+
+    pub fn write_atomic_locked(&self, path: &Path) -> Result<(), Error> {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        durable_replace(path, &serde_json::to_vec_pretty(self)?)
     }
 }
 
@@ -420,6 +565,7 @@ fn random_u64() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use omasafe_report::enforcement::{EnforcementEvaluation, EnforcementMode, EnforcementPolicy};
 
     #[test]
     fn history_round_trips_and_keeps_previous_trust() {
@@ -449,6 +595,98 @@ mod tests {
             loaded.latest("io.example.test").unwrap().accepted_at,
             "first"
         );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("lock"));
+    }
+
+    #[test]
+    fn enforcement_history_round_trips_and_returns_latest_plugin_decision() {
+        let path = std::env::temp_dir().join(format!(
+            "omasafe-enforcement-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let decision =
+            EnforcementPolicy::new(EnforcementMode::Advisory).evaluate(EnforcementEvaluation {
+                plugin_id: "io.example.enforcement".into(),
+                operation: "review-update".into(),
+                coverage_counts: BTreeMap::from([(String::from("analyzed"), 1)]),
+                coverage_limitations: Vec::new(),
+                unsupported_executable_paths: Vec::new(),
+                executable_digest_approved: false,
+                analyzer_identity_current: true,
+                enforcement_policy_identity_current: true,
+                installed_tree_postconditions_passed: true,
+                observed_rule_ids: Vec::new(),
+                commit: Some("a".repeat(40)),
+                tree: Some("b".repeat(40)),
+                content_digest: Some("c".repeat(64)),
+                analyzer_policy_identity: None,
+                override_present: false,
+                override_valid: false,
+                override_binding: None,
+                audit_event_id: "audit-enforcement-1".into(),
+                evaluated_at: "2026-09-01T00:00:00Z".into(),
+                native_install_not_interposed: true,
+            });
+        let mut history = EnforcementHistory::default();
+        history.record_decision(decision.clone());
+        history.write_atomic(&path).unwrap();
+        let loaded = EnforcementHistory::load(&path).unwrap();
+        assert_eq!(loaded.decisions.len(), 1);
+        assert_eq!(loaded.latest("io.example.enforcement"), Some(&decision));
+        assert!(loaded.latest("io.example.other").is_none());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("lock"));
+    }
+
+    #[test]
+    fn override_history_round_trips_and_rejects_unknown_schema() {
+        let path = std::env::temp_dir().join(format!(
+            "omasafe-overrides-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut history = OverrideHistory::default();
+        let binding: OverrideBinding = serde_json::from_value(serde_json::json!({
+            "schema":"omasafe.override.v1",
+            "plugin_id":"io.example.override",
+            "commit":"a", "tree":null, "content_digest":"c",
+            "analyzer_policy_identity": {
+                "analyzer_version":"0.2.1", "rule_catalog_version":1,
+                "rule_catalog_fingerprint":"x", "severity_table_version":1,
+                "parser_versions":{}, "limits_fingerprint":"y",
+                "equivalence_map_version":null, "supported_surface_version":"z"
+            },
+            "enforcement_policy_identity":"p", "rule_ids":["r"],
+            "coverage_limitations":[], "reason":"test",
+            "created_at":"2026-09-01T00:00:00Z",
+            "expires_at":"2099-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        history.record(binding.clone());
+        history.write_atomic(&path).unwrap();
+        let loaded = OverrideHistory::load(&path).unwrap();
+        assert_eq!(loaded.overrides, vec![binding]);
+
+        fs::write(
+            &path,
+            serde_json::json!({"schema_version":99,"overrides":[]}).to_string(),
+        )
+        .unwrap();
+        assert!(matches!(
+            OverrideHistory::load(&path),
+            Err(Error::Schema {
+                kind: "override history",
+                ..
+            })
+        ));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("lock"));
     }
