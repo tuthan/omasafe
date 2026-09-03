@@ -9,7 +9,10 @@ complete -c omasafe-cli -l policy -r -a "advisory hardened"
 complete -c omasafe-cli -l expected-head -r
 complete -c omasafe-cli -l expected-tree -r
 complete -c omasafe-cli -l expected-digest -r
+complete -c omasafe-cli -l note -r
 complete -c omasafe-cli -l action -r -a "acknowledge exclude rebaseline restore untrust revoke suppress reinstate"
+complete -c omasafe-cli -l scope -r
+complete -c omasafe-cli -l to -r
 complete -c omasafe-cli -l reason -r
 complete -c omasafe-cli -l rule -r
 complete -c omasafe-cli -l commit -r

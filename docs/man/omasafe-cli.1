@@ -1,14 +1,17 @@
-.TH OMASAFE-CLI 1 "2026-08-21" "OmaSafe 0.2.1" "User Commands"
+.TH OMASAFE-CLI 1 "2026-09-03" "OmaSafe 0.2.1" "User Commands"
 .SH NAME
-omasafe-cli \- local trust and drift review for Omarchy plugins
+omasafe-cli \- local trust, payload analysis, and drift review for Omarchy plugins
 .SH SYNOPSIS
 .B omasafe-cli
 .I COMMAND
 .RI [ OPTIONS ]
 .SH DESCRIPTION
 OmaSafe inventories installed Omarchy plugins, compares them with trusted
-baselines, and reports source drift. The CLI is the engine used by the optional
-Omarchy bar-widget plugin.
+baselines, analyzes shipped payloads and capabilities, and reports source drift
+and evidence-backed findings. The CLI also provides opt-in advisory or hardened
+lifecycle gates for reviewed updates and enables the optional Omarchy bar-widget
+plugin to consume versioned JSON reports. OmaSafe never declares a plugin safe
+or malicious.
 .SH COMMANDS
 .TP
 .B paths

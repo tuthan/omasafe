@@ -3,6 +3,7 @@ name = "omasafe-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Local trust, payload analysis, and drift review for Omarchy plugins"
 
 [[bin]]
 name = "omasafe-cli"

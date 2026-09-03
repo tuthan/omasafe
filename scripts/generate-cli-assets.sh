@@ -39,17 +39,20 @@ write_asset() {
 }
 
 write_asset docs/man/omasafe-cli.1 "$(cat <<EOF
-.TH OMASAFE-CLI 1 "2026-08-21" "OmaSafe $package_version" "User Commands"
+.TH OMASAFE-CLI 1 "2026-09-03" "OmaSafe $package_version" "User Commands"
 .SH NAME
-omasafe-cli \- local trust and drift review for Omarchy plugins
+omasafe-cli \- local trust, payload analysis, and drift review for Omarchy plugins
 .SH SYNOPSIS
 .B omasafe-cli
 .I COMMAND
 .RI [ OPTIONS ]
 .SH DESCRIPTION
 OmaSafe inventories installed Omarchy plugins, compares them with trusted
-baselines, and reports source drift. The CLI is the engine used by the optional
-Omarchy bar-widget plugin.
+baselines, analyzes shipped payloads and capabilities, and reports source drift
+and evidence-backed findings. The CLI also provides opt-in advisory or hardened
+lifecycle gates for reviewed updates and enables the optional Omarchy bar-widget
+plugin to consume versioned JSON reports. OmaSafe never declares a plugin safe
+or malicious.
 .SH COMMANDS
 .TP
 .B paths
@@ -195,7 +198,7 @@ _omasafe_cli() {
     fi
     case "\${COMP_WORDS[1]}" in
         scan|provenance|plugins|marketplace|rules|scan-plugin)
-            COMPREPLY=(\$(compgen -W "--format --notify --only-new --include-analysis --yes --expected-head --expected-tree --expected-digest --policy --action --reason --rule --path --commit --expires --latest --git --revision --fail-on" -- "\${cur}"))
+            COMPREPLY=(\$(compgen -W "--format --notify --only-new --include-analysis --yes --expected-head --expected-tree --expected-digest --note --policy --action --scope --to --reason --rule --path --commit --expires --latest --git --revision --fail-on" -- "\${cur}"))
             ;;
         paths|schedule)
             COMPREPLY=()
@@ -209,7 +212,7 @@ EOF
 write_asset docs/completions/_omasafe-cli "$(cat <<EOF
 #compdef omasafe-cli
 # zsh completion for omasafe-cli; generated from docs/cli-surface.txt
-_arguments '1:command:($top_level)' '*:option:(--format --notify --only-new --include-analysis --yes --expected-head --expected-tree --expected-digest --policy --action --reason --rule --path --commit --expires --latest --git --revision --fail-on)'
+_arguments '1:command:($top_level)' '*:option:(--format --notify --only-new --include-analysis --yes --expected-head --expected-tree --expected-digest --note --policy --action --scope --to --reason --rule --path --commit --expires --latest --git --revision --fail-on)'
 EOF
 )"
 
@@ -225,7 +228,10 @@ complete -c omasafe-cli -l policy -r -a "advisory hardened"
 complete -c omasafe-cli -l expected-head -r
 complete -c omasafe-cli -l expected-tree -r
 complete -c omasafe-cli -l expected-digest -r
+complete -c omasafe-cli -l note -r
 complete -c omasafe-cli -l action -r -a "acknowledge exclude rebaseline restore untrust revoke suppress reinstate"
+complete -c omasafe-cli -l scope -r
+complete -c omasafe-cli -l to -r
 complete -c omasafe-cli -l reason -r
 complete -c omasafe-cli -l rule -r
 complete -c omasafe-cli -l commit -r

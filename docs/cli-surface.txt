@@ -4,10 +4,10 @@ paths	print XDG configuration, state, and cache paths
 provenance	[--format text|json]
 scan	[--format text|json] [--notify] [--only-new] [--include-analysis]
 plugins inventory	[--format text|json]
-plugins trust PLUGIN_ID	[--yes] [--expected-head VALUE] [--expected-tree VALUE] [--expected-digest VALUE]
+plugins trust PLUGIN_ID	[--yes] [--expected-head VALUE] [--expected-tree VALUE] [--expected-digest VALUE] [--note TEXT]
 plugins status PLUGIN_ID	[--format text|json]
-plugins diff PLUGIN_ID	[--format text|json]
-plugins review PLUGIN_ID	--action acknowledge|exclude|rebaseline|restore|untrust|revoke|suppress|reinstate [--rule RULE_ID] [--path SCOPE] [--reason TEXT] [--yes]
+plugins diff PLUGIN_ID	[REF_A..REF_B] [--format text|json]
+plugins review PLUGIN_ID	--action acknowledge|exclude|rebaseline|restore|untrust|revoke|suppress|reinstate [--scope SCOPE] [--to INDEX|DIGEST] [--expected-head VALUE] [--expected-tree VALUE] [--expected-digest VALUE] [--rule RULE_ID] [--path SCOPE] [--reason TEXT] --yes
 plugins enable PLUGIN_ID	[--policy advisory|hardened] [--format text|json]
 plugins review-update PLUGIN_ID	[--expected-commit SHA] [--yes] [--policy advisory|hardened]
 plugins enforcement-status PLUGIN_ID	[--format text|json]

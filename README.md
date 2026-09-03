@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="media/logo.png" alt="OmaSafe" width="520">
+</p>
+
 # OmaSafe
 
 OmaSafe is a local trust and drift-review tool for [Omarchy](https://omarchy.org)
@@ -9,10 +13,10 @@ own machine:
 3. What changed since you trusted or last reviewed it?
 4. What is out of coverage and should not be read as clean?
 
-OmaSafe **reports** source identity, marketplace context, and drift against a
-baseline you establish. It never declares a plugin safe or malicious, never
-executes plugin code, and never emits a single security score. Quiet means "no
-new actionable change," not "proven secure."
+OmaSafe helps surface unusual patterns, risky capabilities, and source changes
+for review. It never labels a plugin safe or malicious, never executes plugin
+code, and never emits a single security score. Quiet means "no new actionable
+change," not "proven secure."
 
 Why this matters: Omarchy plugins are QML + JavaScript loaded **unsandboxed, with
 full user permissions, inside the shared shell process**, installed as mutable Git
@@ -45,15 +49,22 @@ CLI commands.
 
 ## Status
 
-**v0.1 is the current release** — installed inventory, marketplace correlation,
-source identity, trust baselines, diffs, and drift notifications, distributed as a
-signed CLI. Capability analysis and later work are on the
-[roadmap](docs/plans/README.md).
+**v0.2.1 is the current release** — the signed CLI now combines the v0.1 local
+trust layer with bounded payload analysis, capability and finding reports,
+reviewed updates, and opt-in enforcement controls. v0.3 and later work remain on
+the [roadmap](docs/plans/README.md).
 
 See [`docs/brainstorm.md`](docs/brainstorm.md) for the product thesis and
 [`docs/plans/`](docs/plans/) for the release plans.
 
 ## CLI usage
+
+The CLI is intentionally explicit about the difference between observation,
+analysis, and mutation. Analysis reports findings but does not automatically
+fail; pass `--fail-on <severity>` when using `plugins analyze` or `scan-plugin`
+as a CI gate. `scan` uses exit code 3 when actionable drift or coverage alerts
+remain, while analyzer commands use exit code 4 only when their explicit
+`--fail-on` threshold is met.
 
 ```sh
 # Where OmaSafe keeps config, state, and cache
@@ -77,21 +88,64 @@ omasafe-cli plugins trust PLUGIN_ID \
 omasafe-cli plugins status PLUGIN_ID --format json
 omasafe-cli plugins diff PLUGIN_ID
 
+# Analyze an installed plugin's complete shipped payload
+omasafe-cli plugins analyze PLUGIN_ID --format json
+
+# Analyze a local directory or an immutable remote Git revision
+omasafe-cli scan-plugin --path ./plugin --format json --fail-on high
+omasafe-cli scan-plugin --git https://github.com/OWNER/REPO.git \
+  --revision COMMIT --format json
+
+# Inspect the owned rule catalog and marketplace equivalence coverage
+omasafe-cli rules list --format text
+omasafe-cli rules coverage --format json
+omasafe-cli rules explain RULE_ID --format text
+
 # Record a review decision: acknowledge | rebaseline | restore | untrust | exclude
 omasafe-cli plugins review PLUGIN_ID --action acknowledge --reason "reviewed" --yes
+
+# Suppress or reinstate one finding, optionally within a payload path
+omasafe-cli plugins review PLUGIN_ID --action suppress \
+  --rule RULE_ID --reason "reviewed and accepted" --yes
+omasafe-cli plugins review PLUGIN_ID --action reinstate \
+  --rule RULE_ID --reason "review again" --yes
 
 # Remove the active trust baseline while keeping the historical record
 omasafe-cli plugins review PLUGIN_ID --action untrust --reason "no longer trusted" --yes
 
-# Post-change drift scan across all plugins (optionally desktop-notify only new alerts)
-omasafe-cli scan --format json --notify --only-new
+# Review an exact candidate before allowing the native updater to mutate a plugin
+omasafe-cli plugins review-update PLUGIN_ID --expected-commit COMMIT
+omasafe-cli plugins review-update PLUGIN_ID --expected-commit COMMIT \
+  --policy hardened --yes
+
+# Gate an already-installed inactive plugin, or inspect the last decision
+omasafe-cli plugins enable PLUGIN_ID --policy hardened --format json
+omasafe-cli plugins enforcement-status PLUGIN_ID --format json
+
+# Create/list exact-identity, expiring overrides for hardened policy
+omasafe-cli plugins override create PLUGIN_ID --rule RULE_ID \
+  --commit COMMIT --reason "operator-reviewed" --expires TIMESTAMP
+omasafe-cli plugins override list --format json
+
+# Post-change drift scan across all plugins (optionally include analysis and notify only new alerts)
+omasafe-cli scan --format json --include-analysis --notify --only-new
 
 # Deterministic self-inventory / provenance report
 omasafe-cli provenance --format json
 
-# Opt in to a daily systemd user timer that runs `scan --notify --only-new`
-omasafe-cli schedule install
+# Opt in to a daily report-only systemd user timer
+omasafe-cli schedule install --policy advisory
+omasafe-cli schedule install --policy hardened
+omasafe-cli schedule status --format json
 ```
+
+`advisory` is the compatibility default: it reports the enforcement contract
+without blocking the lifecycle operation. `hardened` enables fail-closed checks
+for coverage, stale identities, unsupported executable payloads, admitted rule
+families, and installed-tree postconditions. The current evidence-gated
+blocking-family set is empty; hardened mode still applies the
+precision-independent checks. Overrides are exact-identity, expiring, and
+auditable, and are never created unattended.
 
 Runtime state uses XDG paths only:
 
@@ -116,26 +170,26 @@ and removal lifecycles.
   ```sh
   # Download the pinned installer, review it, then run it locally
   curl --fail --proto '=https' --tlsv1.2 --location \
-    https://raw.githubusercontent.com/tuthan/omasafe/v0.1.2/scripts/install-cli.sh \
+    https://raw.githubusercontent.com/tuthan/omasafe/v0.2.1/scripts/install-cli.sh \
     --output install-cli.sh
   less install-cli.sh
   bash install-cli.sh --version latest
 
   # Or review and run it for an exact release
   curl --fail --proto '=https' --tlsv1.2 --location \
-    https://raw.githubusercontent.com/tuthan/omasafe/v0.1.2/scripts/install-cli.sh \
+    https://raw.githubusercontent.com/tuthan/omasafe/v0.2.1/scripts/install-cli.sh \
     --output install-cli.sh
   less install-cli.sh
-  bash install-cli.sh --version v0.1.2
+  bash install-cli.sh --version v0.2.1
   ```
 
   The URL is pinned to the release tag, so the installer you review is the exact
   one that produced that release's signed assets; reviewing it locally avoids
   piping a network response directly to the shell. `latest` selects the current
-  signed release, while `v0.1.2` selects an exact signed archive. When installing
+  signed release, while `v0.2.1` selects an exact signed archive. When installing
   an exact release, pin the URL to the same tag you pass to `--version`. From a
   repository checkout, run `./scripts/install-cli.sh --version latest` or
-  `./scripts/install-cli.sh --version v0.1.2`.
+  `./scripts/install-cli.sh --version v0.2.1`.
 
   Release signatures and detached verification instructions are in
   [`docs/release-signing.md`](docs/release-signing.md).
@@ -166,6 +220,7 @@ Workspace layout:
 ```text
 crates/
 ├── omasafe-cli/           # the binary and command surface
+├── omasafe-analyzer/      # bounded payload/capability analysis and rules
 ├── omasafe-core/          # shared error type, XDG path discovery
 ├── omasafe-marketplace/   # pinned catalog fetch, parse, and correlation
 ├── omasafe-plugin-trust/  # source identity and trust/decision history
@@ -206,9 +261,23 @@ against a fresh VM snapshot per release.
 
 ## Scope
 
-v0.1 delivers installed inventory, marketplace correlation, source identity, trust
-baselines, diffs, and drift notifications. Static capability analysis is
-deliberately deferred to v0.2 ([`docs/plans/v0.2.md`](docs/plans/v0.2.md)).
+v0.2.1 delivers installed inventory, marketplace correlation, source identity,
+trust baselines, diffs, bounded payload analysis, capability/findings reports,
+scoped suppressions, reviewed candidate updates, advisory/hardened lifecycle
+gates, exact expiring overrides, and report-only scheduled scans.
+
+Analysis is deliberately conservative: QML/JavaScript uses bounded
+intra-file dataflow when the parser feature is enabled; shell and Python use
+minimal high-signal lexical analysis; native binaries are inventoried and
+referenced binaries are reported; skipped, unsupported, truncated, or
+unreferenced payloads remain visible as coverage state. A clean report is not a
+malware verdict, and the current hardened blocking-family set is empty until
+complete precision evidence exists.
+
+The v0.2 and v0.2.1 implementation records are available in
+[`docs/plans/v0.2.md`](docs/plans/v0.2.md),
+[`docs/plans/v0.2.1-hardening-implementation.md`](docs/plans/v0.2.1-hardening-implementation.md),
+and [`docs/progress.md`](docs/progress.md).
 
 Explicit non-goals: antivirus, runtime sandboxing, EDR, a universal security
 score, a hosted reputation service, and automatic privileged remediation.

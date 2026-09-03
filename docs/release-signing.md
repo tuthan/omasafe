@@ -16,17 +16,17 @@ integrity check, not a signature.
 From the exact clean commit that is ready to release:
 
 ```sh
-git tag -s v0.1.2 -m 'OmaSafe v0.1.2'
-git tag -v v0.1.2
-git push origin v0.1.2
+git tag -s v0.2.1 -m 'OmaSafe v0.2.1'
+git tag -v v0.2.1
+git push origin v0.2.1
 ```
 
 The tag starts `.github/workflows/release.yml`. It publishes:
 
 ```text
-omasafe-cli-v0.1.2-x86_64-linux.tar.gz
-omasafe-cli-v0.1.2-x86_64-linux.tar.gz.sha256
-omasafe-cli-v0.1.2-x86_64-linux.tar.gz.sigstore.json
+omasafe-cli-v0.2.1-x86_64-linux.tar.gz
+omasafe-cli-v0.2.1-x86_64-linux.tar.gz.sha256
+omasafe-cli-v0.2.1-x86_64-linux.tar.gz.sigstore.json
 ```
 
 The `x86_64-linux` label is the human-facing platform name. The binary is
@@ -44,14 +44,14 @@ sudo pacman -S --needed cosign
 
 ```sh
 cosign verify-blob \
-  --bundle omasafe-cli-v0.1.2-x86_64-linux.tar.gz.sigstore.json \
+  --bundle omasafe-cli-v0.2.1-x86_64-linux.tar.gz.sigstore.json \
   --certificate-identity-regexp \
     '^https://github.com/tuthan/omasafe/.github/workflows/release.yml@refs/tags/v.*$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  omasafe-cli-v0.1.2-x86_64-linux.tar.gz
-test "$(sha256sum omasafe-cli-v0.1.2-x86_64-linux.tar.gz | awk '{print $1}')" = \
-  "$(awk 'NF { print $1; exit }' omasafe-cli-v0.1.2-x86_64-linux.tar.gz.sha256)"
-tar -xzf omasafe-cli-v0.1.2-x86_64-linux.tar.gz
+  omasafe-cli-v0.2.1-x86_64-linux.tar.gz
+test "$(sha256sum omasafe-cli-v0.2.1-x86_64-linux.tar.gz | awk '{print $1}')" = \
+  "$(awk 'NF { print $1; exit }' omasafe-cli-v0.2.1-x86_64-linux.tar.gz.sha256)"
+tar -xzf omasafe-cli-v0.2.1-x86_64-linux.tar.gz
 ```
 
 The repository also provides a user-level installer for x86_64 Linux. It
@@ -67,14 +67,14 @@ curl --fail --proto '=https' --tlsv1.2 --location \
 # Or install an exact release
 curl --fail --proto '=https' --tlsv1.2 --location \
   https://raw.githubusercontent.com/tuthan/omasafe/d4fb76d/scripts/install-cli.sh \
-  | bash -s -- --version v0.1.2
+  | bash -s -- --version v0.2.1
 ```
 
 The raw-script URL is pinned to the commit that introduced the installer;
-`--version latest` selects the current signed release, while `v0.1.2` selects an
+`--version latest` selects the current signed release, while `v0.2.1` selects an
 exact signed archive. From a repository checkout, run
 `./scripts/install-cli.sh --version latest` or
-`./scripts/install-cli.sh --version v0.1.2` instead. Use `--prefix DIR` to
+`./scripts/install-cli.sh --version v0.2.1` instead. Use `--prefix DIR` to
 choose another installation root. The installer does not require root
 privileges.
 
