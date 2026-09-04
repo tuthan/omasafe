@@ -5,7 +5,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use omasafe_analyzer::{
-    CoverageState, IngestError, Limits, PayloadKind, ingest_filesystem, ingest_pinned_tree,
+    CoverageState, IngestError, Limits, PayloadKind, discover_filesystem_manifest_roots,
+    ingest_filesystem, ingest_pinned_tree,
 };
 use omasafe_core::bounds::TimeBudget;
 
@@ -255,6 +256,27 @@ fn non_directory_targets_are_rejected_cleanly() {
         Err(IngestError::NotADirectory) => {}
         other => panic!("expected NotADirectory, got {other:?}"),
     }
+}
+
+#[test]
+fn manifest_discovery_skips_malformed_unrelated_manifests() {
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        &temp.path().join("plugin-a/manifest.json"),
+        br#"{"id":"io.example.a"}"#,
+        false,
+    );
+    write(
+        &temp.path().join("plugin-b/manifest.json"),
+        b"not-json",
+        false,
+    );
+
+    let roots = discover_filesystem_manifest_roots(temp.path()).unwrap();
+
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0].root, "plugin-a");
+    assert_eq!(roots[0].plugin_id, "io.example.a");
 }
 
 // ---------------------------------------------------------------------------

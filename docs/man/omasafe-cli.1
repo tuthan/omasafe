@@ -1,4 +1,4 @@
-.TH OMASAFE-CLI 1 "2026-09-03" "OmaSafe 0.2.1" "User Commands"
+.TH OMASAFE-CLI 1 "2026-09-04" "OmaSafe 0.2.2" "User Commands"
 .SH NAME
 omasafe-cli \- local trust, payload analysis, and drift review for Omarchy plugins
 .SH SYNOPSIS
@@ -97,11 +97,15 @@ Inventory every shipped payload file of an installed plugin with type, mode,
 size, digest, executable bit, and explicit analysis coverage state. Exit
 status is 0 even when findings exist; CI policy uses --fail-on.
 .TP
-.B scan-plugin (--path DIR | --git URL --revision COMMIT) [--format text|json]
-    [--fail-on SEVERITY]
-Run the same bounded payload inventory against a local directory or a pinned
-immutable Git revision read as raw objects (no checkout, filters, hooks, or
-submodules). URLs carrying credentials are rejected.
+.B scan-plugin (--path DIR | --git URL [--revision COMMIT] | --request TEXT
+    | --marketplace PLUGIN_ID) [--plugin-id PLUGIN_ID]
+    [--report-profile full|review] [--format text|json] [--fail-on SEVERITY]
+Run the same bounded payload inventory against a local directory, a Git
+revision, a public GitHub URL or copied Omarchy install command, or a verified
+marketplace listing. Remote candidates resolve one exact commit and read raw
+Git objects without checkout, filters, hooks, submodules, installation, or
+enablement. The review profile bounds serialized JSON and reports omissions.
+URLs carrying credentials are rejected.
 .TP
 .B marketplace refresh (--commit COMMIT | --latest)
 Fetch and verify a pinned marketplace snapshot.

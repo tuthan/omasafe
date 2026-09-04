@@ -49,10 +49,11 @@ CLI commands.
 
 ## Status
 
-**v0.2.1 is the current release** — the signed CLI now combines the v0.1 local
+**v0.2.2 is the current release** — the signed CLI now combines the v0.1 local
 trust layer with bounded payload analysis, capability and finding reports,
-reviewed updates, and opt-in enforcement controls. v0.3 and later work remain on
-the [roadmap](docs/plans/README.md).
+reviewed updates, opt-in enforcement controls, and scan-only review of exact
+GitHub/marketplace candidates. v0.3 and later work remain on the
+[roadmap](docs/plans/README.md).
 
 See [`docs/brainstorm.md`](docs/brainstorm.md) for the product thesis and
 [`docs/plans/`](docs/plans/) for the release plans.
@@ -95,6 +96,14 @@ omasafe-cli plugins analyze PLUGIN_ID --format json
 omasafe-cli scan-plugin --path ./plugin --format json --fail-on high
 omasafe-cli scan-plugin --git https://github.com/OWNER/REPO.git \
   --revision COMMIT --format json
+
+# Review a pasted public GitHub URL or marketplace install command without installing
+omasafe-cli scan-plugin --request \
+  'omarchy plugin add https://github.com/OWNER/REPO.git --enable' \
+  --report-profile review --format json
+
+# Review one exact listing from a previously verified marketplace snapshot
+omasafe-cli scan-plugin --marketplace PLUGIN_ID --report-profile review --format json
 
 # Inspect the owned rule catalog and marketplace equivalence coverage
 omasafe-cli rules list --format text
@@ -281,6 +290,11 @@ and [`docs/progress.md`](docs/progress.md).
 
 Explicit non-goals: antivirus, runtime sandboxing, EDR, a universal security
 score, a hosted reputation service, and automatic privileged remediation.
+
+The v0.2.2 candidate route resolves one exact Git commit, reads raw Git
+objects, and never installs, enables, trusts, or suppresses a candidate. The
+review report is bounded and records any omissions; it is analysis evidence,
+not an approval or a safety verdict.
 
 ## License
 

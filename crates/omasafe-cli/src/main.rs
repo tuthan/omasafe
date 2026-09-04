@@ -22,6 +22,10 @@ use omasafe_plugin_trust::{
     omarchy_plugin_enable, omarchy_plugin_update, query_shell, source_identity,
 };
 use omasafe_report::Report;
+use omasafe_report::acquisition::{
+    AcquisitionInputKind, AcquisitionSection, CacheFact, CacheResult,
+    InstallVerb as AcquisitionInstallVerb,
+};
 use omasafe_report::enforcement::{
     AuthorizationBasis, EnforcementAuditEvent, EnforcementEvaluation, EnforcementMode,
     EnforcementOutcome, EnforcementPolicy, OVERRIDE_SCHEMA_VERSION, OverrideBinding,
@@ -226,7 +230,7 @@ fn run(args: Vec<String>) -> Result<i32, Box<dyn std::error::Error>> {
         [command, rest @ ..] if command == "scan-plugin" => scan_plugin(rest)?,
         _ => {
             eprintln!(
-                "usage: omasafe-cli plugins ... | scan [--format text|json] [--notify] [--only-new] | marketplace refresh [--commit COMMIT|--latest] | rules list [--format text|json] | rules coverage [--format text|json] | rules explain RULE_ID [--format text|json] | plugins analyze PLUGIN_ID [--format text|json] [--fail-on SEVERITY] | plugins enable PLUGIN_ID [--policy advisory|hardened] [--format text|json] | plugins review-update PLUGIN_ID [--expected-commit SHA] [--yes] [--policy advisory|hardened] | plugins enforcement-status PLUGIN_ID [--format text|json] | plugins override create PLUGIN_ID --rule RULE_ID [--rule RULE_ID ...] --commit SHA --reason TEXT --expires TIMESTAMP | plugins override list [--format text|json] | scan-plugin (--path DIR|--git URL --revision COMMIT) [--format text|json] | schedule install [--policy advisory|hardened] | schedule status [--format text|json] | paths | provenance [--format text|json]"
+                "usage: omasafe-cli plugins ... | scan [--format text|json] [--notify] [--only-new] | marketplace refresh [--commit COMMIT|--latest] | rules list [--format text|json] | rules coverage [--format text|json] | rules explain RULE_ID [--format text|json] | plugins analyze PLUGIN_ID [--format text|json] [--fail-on SEVERITY] | plugins enable PLUGIN_ID [--policy advisory|hardened] [--format text|json] | plugins review-update PLUGIN_ID [--expected-commit SHA] [--yes] [--policy advisory|hardened] | plugins enforcement-status PLUGIN_ID [--format text|json] | plugins override create PLUGIN_ID --rule RULE_ID [--rule RULE_ID ...] --commit SHA --reason TEXT --expires TIMESTAMP | plugins override list [--format text|json] | scan-plugin (--path DIR|--git URL [--revision COMMIT]|--request TEXT|--marketplace PLUGIN_ID) [--plugin-id PLUGIN_ID] [--report-profile full|review] [--format text|json] [--fail-on SEVERITY] | schedule install [--policy advisory|hardened] | schedule status [--format text|json] | paths | provenance [--format text|json]"
             );
             std::process::exit(2);
         }
@@ -5059,10 +5063,15 @@ fn plugins_analyze(id: &str, args: &[String]) -> Result<i32, Box<dyn std::error:
     emit_analysis_report(
         target,
         ingest_result.map_err(Into::into),
-        format,
-        fail_on,
         ContentSource::Filesystem(PathBuf::from(&record.path)),
         Some(id),
+        None,
+        ReportOptions {
+            format,
+            fail_on,
+            report_profile: "full",
+            suppression_mode: SuppressionMode::Configured,
+        },
     )
 }
 
@@ -5070,9 +5079,13 @@ fn scan_plugin(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     interruption_checkpoint("before analysis started")?;
     let mut format = "text";
     let mut fail_on = None;
+    let mut report_profile = "full";
     let mut path_target = None;
     let mut git_url = None;
+    let mut request = None;
+    let mut marketplace = None;
     let mut revision = None;
+    let mut plugin_id = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -5085,6 +5098,10 @@ fn scan_plugin(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
                 fail_on = Some(value.to_owned());
                 index += 2;
             }
+            "--report-profile" => {
+                report_profile = next_value(args, index, "--report-profile")?;
+                index += 2;
+            }
             "--path" => {
                 path_target = Some(next_value(args, index, "--path")?.to_owned());
                 index += 2;
@@ -5093,8 +5110,20 @@ fn scan_plugin(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
                 git_url = Some(next_value(args, index, "--git")?.to_owned());
                 index += 2;
             }
+            "--request" => {
+                request = Some(next_value(args, index, "--request")?.to_owned());
+                index += 2;
+            }
+            "--marketplace" => {
+                marketplace = Some(next_value(args, index, "--marketplace")?.to_owned());
+                index += 2;
+            }
             "--revision" => {
                 revision = Some(next_value(args, index, "--revision")?.to_owned());
+                index += 2;
+            }
+            "--plugin-id" => {
+                plugin_id = Some(next_value(args, index, "--plugin-id")?.to_owned());
                 index += 2;
             }
             value => return Err(format!("unknown scan-plugin argument: {value}").into()),
@@ -5103,70 +5132,324 @@ fn scan_plugin(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     if !matches!(format, "text" | "json") {
         return Err("scan-plugin format must be text or json".into());
     }
+    if !matches!(report_profile, "full" | "review") {
+        return Err("scan-plugin report profile must be full or review".into());
+    }
     let fail_on = parse_fail_on(fail_on)?;
     apply_scan_memory_limit()?;
+    let selectors = [
+        path_target.is_some(),
+        git_url.is_some(),
+        request.is_some(),
+        marketplace.is_some(),
+    ]
+    .into_iter()
+    .filter(|selected| *selected)
+    .count();
+    if selectors != 1 {
+        return Err(
+            "scan-plugin requires exactly one of --path, --git, --request, or --marketplace".into(),
+        );
+    }
+    if marketplace.is_some() && (revision.is_some() || plugin_id.is_some()) {
+        return Err("--revision and --plugin-id are not valid with --marketplace".into());
+    }
+    if git_url.is_none() && revision.is_some() {
+        return Err("--revision requires --git".into());
+    }
 
-    match (path_target, git_url, revision) {
-        (Some(path), None, None) => {
-            let target = serde_json::json!({ "source": "local-directory", "path": path });
-            let result = omasafe_analyzer::ingest_filesystem(
-                Path::new(&path),
-                omasafe_analyzer::Limits::default(),
-                omasafe_core::bounds::TimeBudget::default(),
-            );
-            match result {
-                Ok(inventory) => emit_analysis_report(
-                    target,
-                    Ok(inventory),
+    if let Some(path) = path_target {
+        let selected_root = if let Some(id) = &plugin_id {
+            let manifests = omasafe_analyzer::discover_filesystem_manifest_roots(Path::new(&path))?;
+            let matches: Vec<_> = manifests
+                .into_iter()
+                .filter(|manifest| &manifest.plugin_id == id)
+                .collect();
+            match matches.as_slice() {
+                [manifest] => manifest.root.clone(),
+                [] => return Err(format!("no manifest matched plugin ID {id}").into()),
+                _ => return Err(format!("multiple manifests matched plugin ID {id}").into()),
+            }
+        } else {
+            String::new()
+        };
+        let scan_path = if selected_root.is_empty() {
+            PathBuf::from(&path)
+        } else {
+            Path::new(&path).join(&selected_root)
+        };
+        let mut target = serde_json::json!({
+            "source": "local-directory",
+            "path": path,
+            "scope": "plugin-root",
+            "root": selected_root,
+        });
+        if let Some(id) = &plugin_id {
+            target["id"] = serde_json::json!(id);
+        }
+        let result = omasafe_analyzer::ingest_filesystem(
+            &scan_path,
+            omasafe_analyzer::Limits::default(),
+            omasafe_core::bounds::TimeBudget::default(),
+        );
+        return match result {
+            Ok(inventory) => emit_analysis_report(
+                target,
+                Ok(inventory),
+                ContentSource::Filesystem(scan_path),
+                None,
+                None,
+                ReportOptions {
                     format,
                     fail_on,
-                    ContentSource::Filesystem(PathBuf::from(&path)),
-                    None,
-                ),
-                Err(omasafe_analyzer::IngestError::NotADirectory) => {
-                    Err("scan-plugin target is not a directory".into())
-                }
-                Err(error) => Err(Box::new(error)),
+                    report_profile,
+                    suppression_mode: SuppressionMode::CandidateUnsuppressed,
+                },
+            ),
+            Err(omasafe_analyzer::IngestError::NotADirectory) => {
+                Err("scan-plugin target is not a directory".into())
             }
-        }
-        (None, Some(url), Some(revision)) => {
-            let paths = XdgPaths::discover()?;
-            paths.ensure()?;
-            let cache_root = paths.cache.join("analysis");
-            match omasafe_analyzer::ensure_pinned_repository(&cache_root, &url, &revision) {
-                Ok(repository_dir) => {
-                    let target = serde_json::json!({
-                        "source": "pinned-revision", "url": url, "revision": revision
-                    });
-                    let result = omasafe_analyzer::ingest_pinned_tree(
-                        &repository_dir,
-                        &revision,
-                        omasafe_analyzer::Limits::default(),
-                        omasafe_core::bounds::TimeBudget::default(),
+            Err(error) => Err(Box::new(error)),
+        };
+    }
+
+    let paths = XdgPaths::discover()?;
+    let cache_root = paths.cache.join("analysis");
+    let (url, resolved_revision, mut acquisition, selected_plugin_id) = if let Some(request) =
+        request
+    {
+        let parsed = omasafe_core::source::parse_candidate_request(&request)
+            .map_err(|error| error.to_string())?;
+        let head =
+            omasafe_core::git::resolve_remote_head(&parsed.repository_url).map_err(|error| {
+                format!("scan-plugin --request could not resolve a remote default HEAD ({error})")
+            })?;
+        let mut acquisition = acquisition_for_git(
+            acquisition_input_kind(&parsed.input_kind),
+            acquisition_install_verb(&parsed.install_verb),
+            "default-branch-head",
+            parsed.repository_url.clone(),
+            head.revision.clone(),
+            true,
+            false,
+        );
+        acquisition.discarded_install_flags = parsed
+            .discarded_install_flags
+            .iter()
+            .map(|flag| match flag {
+                omasafe_core::source::InstallFlag::Enable => "enable",
+                omasafe_core::source::InstallFlag::Yes => "yes",
+            })
+            .map(str::to_owned)
+            .collect();
+        (parsed.repository_url, head.revision, acquisition, plugin_id)
+    } else if let Some(url) = git_url {
+        validate_scan_git_url(&url)?;
+        let (resolved_revision, requested_reference, resolved_via_network) = match revision {
+            Some(revision) => {
+                if !omasafe_marketplace::valid_commit(&revision) {
+                    return Err(
+                        "scan-plugin --revision must be 40 or 64 hexadecimal characters".into(),
                     );
-                    emit_analysis_report(
-                        target,
-                        result.map_err(Into::into),
-                        format,
-                        fail_on,
-                        ContentSource::GitRepository(repository_dir.clone()),
-                        None,
-                    )
                 }
-                Err(omasafe_analyzer::IngestError::InvalidRevision) => {
-                    Err("scan-plugin --revision must be 40 or 64 hexadecimal characters".into())
-                }
-                Err(error) => Err(error.into()),
+                (
+                    revision.to_ascii_lowercase(),
+                    "exact-commit".to_owned(),
+                    false,
+                )
             }
+            None => {
+                let head = omasafe_core::git::resolve_remote_head(&url).map_err(|error| {
+                            format!("scan-plugin --git requires --revision or a resolvable remote default HEAD ({error})")
+                        })?;
+                (head.revision, "default-branch-head".to_owned(), true)
+            }
+        };
+        let input_kind = AcquisitionInputKind::ExactGit;
+        let acquisition = acquisition_for_git(
+            input_kind,
+            AcquisitionInstallVerb::None,
+            requested_reference,
+            url.clone(),
+            resolved_revision.clone(),
+            resolved_via_network,
+            false,
+        );
+        (url, resolved_revision, acquisition, plugin_id)
+    } else {
+        let id = marketplace.expect("marketplace selector");
+        let snapshot = load_cached_catalog(&paths.cache)?
+            .ok_or_else(|| "marketplace candidate requires a cached catalog snapshot".to_owned())?;
+        let candidate = omasafe_marketplace::resolve_candidate(&snapshot, &id)?;
+        let acquisition = {
+            let mut value = acquisition_for_git(
+                AcquisitionInputKind::MarketplaceId,
+                AcquisitionInstallVerb::None,
+                "listing-validated-commit",
+                candidate.effective_repository_url.clone(),
+                candidate.listing_validated_commit.clone(),
+                false,
+                false,
+            );
+            value.listed_repository = Some(candidate.listed_repository.clone());
+            let mut claim = serde_json::to_value(candidate.claim)?;
+            if let Some(age) = timestamp_age_seconds(&snapshot.retrieved_at) {
+                claim["age_seconds"] = serde_json::json!(age);
+            }
+            value.marketplace_claim = Some(claim);
+            value
+        };
+        (
+            candidate.effective_repository_url,
+            candidate.listing_validated_commit,
+            acquisition,
+            Some(candidate.plugin_id),
+        )
+    };
+
+    std::fs::create_dir_all(&cache_root)?;
+    let ensured = omasafe_analyzer::ensure_pinned_repository_with_facts(
+        &cache_root,
+        &url,
+        &resolved_revision,
+    )
+    .map_err(|error| match error {
+        omasafe_analyzer::IngestError::InvalidRevision => {
+            "scan-plugin --revision must be 40 or 64 hexadecimal characters".to_owned()
         }
-        (None, Some(_), None) => Err("scan-plugin --git requires --revision".into()),
-        (None, None, Some(_)) => Err("scan-plugin --revision requires --git".into()),
-        (None, None, None) => {
-            Err("scan-plugin requires --path DIR or --git URL with --revision".into())
+        other => format!("candidate fetch failed: {other}"),
+    })?;
+    acquisition.cache = CacheFact {
+        used: true,
+        result: if ensured.cache_hit {
+            CacheResult::Hit
+        } else {
+            CacheResult::Miss
+        },
+    };
+    acquisition.network_used |= !ensured.cache_hit;
+
+    let repository_dir = ensured.path;
+    let manifest_root = if let Some(id) = &selected_plugin_id {
+        let manifests =
+            omasafe_analyzer::discover_manifest_roots(&repository_dir, &resolved_revision)?;
+        let matches: Vec<_> = manifests
+            .into_iter()
+            .filter(|manifest| &manifest.plugin_id == id)
+            .collect();
+        match matches.as_slice() {
+            [manifest] => Some(manifest.root.clone()),
+            [] => return Err(format!("no manifest matched plugin ID {id}").into()),
+            _ => return Err(format!("multiple manifests matched plugin ID {id}").into()),
         }
-        _ => Err(
-            "scan-plugin accepts either --path or the --git URL + --revision pair, not both".into(),
-        ),
+    } else {
+        None
+    };
+    let root = manifest_root.unwrap_or_default();
+    let target_source = match &acquisition.input_kind {
+        AcquisitionInputKind::MarketplaceId => "marketplace-listing",
+        AcquisitionInputKind::ExactGit
+            if acquisition.requested_reference == "default-branch-head" =>
+        {
+            "resolved-git-request"
+        }
+        AcquisitionInputKind::ExactGit => "pinned-revision",
+        AcquisitionInputKind::RawGithubUrl | AcquisitionInputKind::OmarchyInstallCommand => {
+            "resolved-git-request"
+        }
+    };
+    let mut target = serde_json::json!({
+        "source": target_source,
+        "url": url,
+        "revision": resolved_revision,
+        "scope": "plugin-root",
+        "root": root,
+    });
+    if let Some(id) = selected_plugin_id {
+        target["id"] = serde_json::json!(id);
+    }
+    let result = omasafe_analyzer::ingest_pinned_tree_at_root(
+        &repository_dir,
+        &resolved_revision,
+        target["root"].as_str().unwrap_or(""),
+        omasafe_analyzer::Limits::default(),
+        omasafe_core::bounds::TimeBudget::default(),
+    );
+    emit_analysis_report(
+        target,
+        result.map_err(Into::into),
+        ContentSource::GitRepository(repository_dir),
+        None,
+        Some(acquisition),
+        ReportOptions {
+            format,
+            fail_on,
+            report_profile,
+            suppression_mode: SuppressionMode::CandidateUnsuppressed,
+        },
+    )
+}
+
+fn acquisition_for_git(
+    input_kind: AcquisitionInputKind,
+    install_verb: AcquisitionInstallVerb,
+    requested_reference: impl Into<String>,
+    url: String,
+    revision: String,
+    network_used: bool,
+    cache_hit: bool,
+) -> AcquisitionSection {
+    AcquisitionSection::new(
+        input_kind,
+        install_verb,
+        requested_reference,
+        url,
+        revision,
+        network_used,
+        CacheFact {
+            used: true,
+            result: if cache_hit {
+                CacheResult::Hit
+            } else {
+                CacheResult::Miss
+            },
+        },
+    )
+}
+
+fn acquisition_input_kind(
+    value: &omasafe_core::source::CandidateInputKind,
+) -> AcquisitionInputKind {
+    match value {
+        omasafe_core::source::CandidateInputKind::RawGithubUrl => {
+            AcquisitionInputKind::RawGithubUrl
+        }
+        omasafe_core::source::CandidateInputKind::OmarchyInstallCommand => {
+            AcquisitionInputKind::OmarchyInstallCommand
+        }
+    }
+}
+
+fn validate_scan_git_url(url: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if !url.starts_with("https://")
+        || url.starts_with('-')
+        || url.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
+    {
+        return Err("scan-plugin --git URL must be a credential-free HTTPS URL".into());
+    }
+    let rest = &url["https://".len()..];
+    let authority = rest.split('/').next().unwrap_or_default();
+    if authority.is_empty() || authority.contains(['@', ':', '?', '#']) {
+        return Err("scan-plugin --git URL must be a credential-free HTTPS URL".into());
+    }
+    Ok(())
+}
+
+fn acquisition_install_verb(value: &omasafe_core::source::InstallVerb) -> AcquisitionInstallVerb {
+    match value {
+        omasafe_core::source::InstallVerb::None => AcquisitionInstallVerb::None,
+        omasafe_core::source::InstallVerb::Add => AcquisitionInstallVerb::Add,
+        omasafe_core::source::InstallVerb::Install => AcquisitionInstallVerb::Install,
     }
 }
 
@@ -5227,6 +5510,19 @@ fn parse_fail_on(value: Option<String>) -> Result<Option<omasafe_analyzer::Sever
 enum ContentSource {
     Filesystem(PathBuf),
     GitRepository(PathBuf),
+}
+
+#[derive(Clone, Copy)]
+enum SuppressionMode {
+    Configured,
+    CandidateUnsuppressed,
+}
+
+struct ReportOptions<'a> {
+    format: &'a str,
+    fail_on: Option<omasafe_analyzer::Severity>,
+    report_profile: &'a str,
+    suppression_mode: SuppressionMode,
 }
 
 /// Digest-bound content readers, boxed per source at the emit boundary.
@@ -5362,10 +5658,10 @@ fn verify_entry_bytes(entry: &omasafe_analyzer::PayloadEntry, bytes: Vec<u8>) ->
 fn emit_analysis_report(
     target: serde_json::Value,
     ingest_result: Result<omasafe_analyzer::PayloadInventory, Box<dyn std::error::Error>>,
-    format: &str,
-    fail_on: Option<omasafe_analyzer::Severity>,
     source: ContentSource,
     plugin_context: Option<&str>,
+    acquisition: Option<AcquisitionSection>,
+    options: ReportOptions<'_>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
     // Ingestion failures are command failures; only per-file degradation is
     // reported inside a successful inventory.
@@ -5398,53 +5694,68 @@ fn emit_analysis_report(
     // a suppression hides and de-enforces a finding but leaves every stored
     // artifact byte-identical. An unreadable suppressions file fails open
     // toward MORE visibility and is disclosed as a limitation.
-    let suppressions_path = XdgPaths::discover()
-        .ok()
-        .map(|paths| paths.config.join("suppressions.json"));
-    let (suppressions, suppressions_limitation) = match suppressions_path
-        .as_deref()
-        .map(omasafe_core::suppress::SuppressionState::load)
-    {
-        Some(Ok(state)) => (state, None),
-        Some(Err(error)) => (
-            omasafe_core::suppress::SuppressionState::default(),
-            Some(format!("suppressions-unreadable:{error}")),
-        ),
-        None => (omasafe_core::suppress::SuppressionState::default(), None),
-    };
     let mut applied_suppressions: Vec<serde_json::Value> = Vec::new();
     let mut suppression_reconfirmations: Vec<serde_json::Value> = Vec::new();
-    let findings: Vec<_> = rendered
-        .into_iter()
-        .filter(|finding| {
-            let stale = suppressions.requires_reconfirmation(
-                &finding.rule_id,
-                plugin_context,
-                &finding.relative_path,
-                &policy_identity_string,
-            );
-            if stale {
-                suppression_reconfirmations.push(serde_json::json!({
-                    "rule_id": finding.rule_id,
-                    "relative_path": finding.relative_path,
-                    "reason": "analyzer-policy-changed",
-                }));
+    let (findings, suppressions_limitation, active_records, suppression_policy, consulted) =
+        match options.suppression_mode {
+            SuppressionMode::CandidateUnsuppressed => {
+                (rendered, None, None, "candidate-unsuppressed", false)
             }
-            let hit = suppressions.matches_policy(
-                &finding.rule_id,
-                plugin_context,
-                &finding.relative_path,
-                &policy_identity_string,
-            );
-            if hit {
-                applied_suppressions.push(serde_json::json!({
-                    "rule_id": finding.rule_id,
-                    "relative_path": finding.relative_path,
-                }));
+            SuppressionMode::Configured => {
+                let suppressions_path = XdgPaths::discover()
+                    .ok()
+                    .map(|paths| paths.config.join("suppressions.json"));
+                let (suppressions, limitation) = match suppressions_path
+                    .as_deref()
+                    .map(omasafe_core::suppress::SuppressionState::load)
+                {
+                    Some(Ok(state)) => (state, None),
+                    Some(Err(error)) => (
+                        omasafe_core::suppress::SuppressionState::default(),
+                        Some(format!("suppressions-unreadable:{error}")),
+                    ),
+                    None => (omasafe_core::suppress::SuppressionState::default(), None),
+                };
+                let findings: Vec<_> = rendered
+                    .into_iter()
+                    .filter(|finding| {
+                        let stale = suppressions.requires_reconfirmation(
+                            &finding.rule_id,
+                            plugin_context,
+                            &finding.relative_path,
+                            &policy_identity_string,
+                        );
+                        if stale {
+                            suppression_reconfirmations.push(serde_json::json!({
+                                "rule_id": finding.rule_id,
+                                "relative_path": finding.relative_path,
+                                "reason": "analyzer-policy-changed",
+                            }));
+                        }
+                        let hit = suppressions.matches_policy(
+                            &finding.rule_id,
+                            plugin_context,
+                            &finding.relative_path,
+                            &policy_identity_string,
+                        );
+                        if hit {
+                            applied_suppressions.push(serde_json::json!({
+                                "rule_id": finding.rule_id,
+                                "relative_path": finding.relative_path,
+                            }));
+                        }
+                        !hit
+                    })
+                    .collect();
+                (
+                    findings,
+                    limitation,
+                    Some(suppressions.active().count()),
+                    "configured",
+                    true,
+                )
             }
-            !hit
-        })
-        .collect();
+        };
 
     let fingerprint =
         omasafe_analyzer::fingerprint_analysis(&artifacts.results, &artifacts.capabilities);
@@ -5500,7 +5811,7 @@ fn emit_analysis_report(
         "critical" => Some(omasafe_analyzer::Severity::Critical),
         _ => None,
     };
-    let threshold_breached = fail_on.is_some_and(|threshold| {
+    let threshold_breached = options.fail_on.is_some_and(|threshold| {
         findings.iter().any(|finding| {
             severity_of(&finding.severity).is_some_and(|severity| severity >= threshold)
         })
@@ -5515,14 +5826,16 @@ fn emit_analysis_report(
         "unreferenced": inventory.state_count(omasafe_analyzer::CoverageState::Unreferenced),
     });
 
-    if format == "json" {
-        let result = serde_json::json!({
+    if options.format == "json" {
+        let mut result = serde_json::json!({
             "target": target,
             "analysis": analysis,
             "suppressions": {
+                "policy": suppression_policy,
+                "consulted": consulted,
                 "applied": applied_suppressions,
                 "reconfirmation_required": suppression_reconfirmations,
-                "active_records": suppressions.active().count(),
+                "active_records": active_records,
             },
             "payload_inventory": {
                 "totals": {
@@ -5535,11 +5848,39 @@ fn emit_analysis_report(
                 "entries": inventory.entries,
             },
         });
+        if let Some(acquisition) = acquisition.as_ref() {
+            result["acquisition"] = serde_json::to_value(acquisition)?;
+        }
+        if options.report_profile == "review" {
+            apply_review_profile(&mut result)?;
+        }
         println!(
             "{}",
             serde_json::to_string_pretty(&Report::new(TOOL_VERSION, now(), result))?
         );
     } else {
+        if let Some(acquisition) = acquisition.as_ref() {
+            println!(
+                "Acquisition: {} at {} (scan-only; installation performed: false)",
+                safe_text(&acquisition.requested_reference),
+                safe_text(&acquisition.resolved_identity.value)
+            );
+            println!(
+                "Cache: {}  Network used: {}  Suppression policy: {}",
+                match &acquisition.cache.result {
+                    CacheResult::Hit => "hit",
+                    CacheResult::Miss => "miss",
+                    CacheResult::NotUsed => "not-used",
+                },
+                acquisition.network_used,
+                suppression_policy
+            );
+        }
+        if options.report_profile == "review" {
+            println!(
+                "Report profile: review (text view; JSON omission accounting applies to --format json)"
+            );
+        }
         println!(
             "Analysis of {} ({})",
             safe_text(
@@ -5658,6 +5999,171 @@ fn emit_analysis_report(
     // is the CI opt-in signal, distinct from scan's 3. Returned through the
     // normal path so stdout flushes like any other run.
     Ok(if threshold_breached { 4 } else { 0 })
+}
+
+const REVIEW_SERIALIZED_BYTE_LIMIT: usize = 1_572_864;
+const REVIEW_INITIAL_LIST_CAP: usize = 1024;
+
+/// Shapes a report for bounded UI/agent transport.  The full analysis,
+/// fingerprint, and threshold decision have already been computed before
+/// this function runs; this function only removes sorted-tail presentation
+/// entries and records exact omission arithmetic.
+fn apply_review_profile(result: &mut serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
+    let payload_total = result["payload_inventory"]["entries"]
+        .as_array()
+        .map_or(0, Vec::len);
+    result["payload_inventory"]["entries"] = serde_json::json!([]);
+    result["payload_inventory"]["entries_omitted"] = serde_json::json!(payload_total);
+    result["payload_inventory"]["profile"] = serde_json::json!("review");
+
+    let mut omissions = serde_json::Map::new();
+    omissions.insert(
+        "payload_entries".into(),
+        serde_json::json!({
+            "total": payload_total,
+            "emitted": 0,
+            "omitted": payload_total,
+        }),
+    );
+    for (name, key) in [
+        ("findings", "findings"),
+        ("capabilities", "capabilities"),
+        ("invocation_edges", "invocation_edges"),
+    ] {
+        let (total, emitted) = cap_analysis_array(result, key, REVIEW_INITIAL_LIST_CAP);
+        omissions.insert(
+            name.into(),
+            serde_json::json!({
+                "total": total,
+                "emitted": emitted,
+                "omitted": total.saturating_sub(emitted),
+            }),
+        );
+    }
+    result["report_profile"] = serde_json::json!({
+        "name": "review",
+        "serialized_byte_limit": REVIEW_SERIALIZED_BYTE_LIMIT,
+        "omissions": omissions,
+    });
+    note_review_omissions(result);
+
+    loop {
+        if serialized_report_size(result)? <= REVIEW_SERIALIZED_BYTE_LIMIT {
+            return Ok(());
+        }
+        let mut trimmed = false;
+        // Deterministic tail trimming order. The arrays are already sorted by
+        // the analyzer, so retaining their prefixes is stable across runs.
+        for key in ["capabilities", "invocation_edges", "findings"] {
+            if trim_analysis_tail(result, key) {
+                update_omission_after_trim(result, key);
+                note_review_omissions(result);
+                trimmed = true;
+                break;
+            }
+        }
+        if !trimmed {
+            return Err(format!(
+                "review report exceeds the {REVIEW_SERIALIZED_BYTE_LIMIT}-byte serialized limit"
+            )
+            .into());
+        }
+    }
+}
+
+fn cap_analysis_array(result: &mut serde_json::Value, key: &str, cap: usize) -> (usize, usize) {
+    let Some(array) = result["analysis"][key].as_array_mut() else {
+        return (0, 0);
+    };
+    let total = array.len();
+    array.truncate(cap);
+    (total, array.len())
+}
+
+fn trim_analysis_tail(result: &mut serde_json::Value, key: &str) -> bool {
+    let Some(array) = result["analysis"][key].as_array_mut() else {
+        return false;
+    };
+    if array.is_empty() {
+        return false;
+    }
+    if array.len() == 1 {
+        array.pop();
+    } else {
+        array.truncate(array.len() / 2);
+    }
+    true
+}
+
+fn update_omission_after_trim(result: &mut serde_json::Value, key: &str) {
+    let emitted = result["analysis"][key].as_array().map_or(0, Vec::len) as u64;
+    let Some(omission) = result["report_profile"]["omissions"][key].as_object_mut() else {
+        return;
+    };
+    let total = omission
+        .get("total")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    omission.insert("emitted".into(), serde_json::json!(emitted));
+    omission.insert(
+        "omitted".into(),
+        serde_json::json!(total.saturating_sub(emitted)),
+    );
+}
+
+fn note_review_omissions(result: &mut serde_json::Value) {
+    let Some(omissions) = result["report_profile"]["omissions"].as_object() else {
+        return;
+    };
+    let notes: Vec<(String, u64)> = omissions
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.clone(),
+                value
+                    .get("omitted")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+            )
+        })
+        .collect();
+    for (name, omitted) in notes {
+        rewrite_review_limitation(
+            &mut result["analysis"]["coverage_limitations"],
+            &name,
+            omitted,
+        );
+        rewrite_review_limitation(
+            &mut result["payload_inventory"]["limitations"],
+            &name,
+            omitted,
+        );
+    }
+}
+
+fn rewrite_review_limitation(values: &mut serde_json::Value, name: &str, omitted: u64) {
+    let Some(limitations) = values.as_array_mut() else {
+        return;
+    };
+    let prefix = format!("review-profile-{name}-omitted:");
+    limitations.retain(|value| {
+        !value
+            .as_str()
+            .is_some_and(|limitation| limitation.starts_with(&prefix))
+    });
+    if omitted > 0 {
+        limitations.push(serde_json::json!(format!("{prefix}{omitted}")));
+    }
+}
+
+fn serialized_report_size(result: &serde_json::Value) -> Result<usize, serde_json::Error> {
+    serde_json::to_vec_pretty(&serde_json::json!({
+        "schema": omasafe_report::SCHEMA_VERSION,
+        "tool_version": TOOL_VERSION,
+        "generated_at": now(),
+        "result": result,
+    }))
+    .map(|bytes| bytes.len())
 }
 
 fn print_paths() -> Result<(), Box<dyn std::error::Error>> {
@@ -5806,6 +6312,80 @@ fn now_nanos() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod report_profile_tests {
+    use super::*;
+
+    #[test]
+    fn review_profile_trims_context_before_findings_and_rewrites_notes() {
+        let findings: Vec<serde_json::Value> = (0..1024)
+            .map(|index| {
+                serde_json::json!({
+                    "relative_path": format!("finding-{index}.qml"),
+                    "evidence": "f".repeat(1000),
+                })
+            })
+            .collect();
+        let capabilities: Vec<serde_json::Value> = (0..1024)
+            .map(|index| {
+                serde_json::json!({
+                    "relative_path": format!("capability-{index}.qml"),
+                    "detail": "c".repeat(300),
+                })
+            })
+            .collect();
+        let invocation_edges: Vec<serde_json::Value> = (0..1024)
+            .map(|index| {
+                serde_json::json!({
+                    "from_path": format!("from-{index}.qml"),
+                    "target_path": format!("to-{index}.qml"),
+                })
+            })
+            .collect();
+        let mut result = serde_json::json!({
+            "analysis": {
+                "findings": findings,
+                "capabilities": capabilities,
+                "invocation_edges": invocation_edges,
+                "coverage_limitations": [],
+            },
+            "payload_inventory": {
+                "entries": [],
+                "limitations": [],
+            },
+        });
+
+        apply_review_profile(&mut result).unwrap();
+
+        assert_eq!(
+            result["analysis"]["findings"].as_array().unwrap().len(),
+            1024
+        );
+        assert_eq!(
+            result["report_profile"]["omissions"]["findings"]["omitted"],
+            0
+        );
+        let limitations = result["analysis"]["coverage_limitations"]
+            .as_array()
+            .unwrap();
+        let capability_notes: Vec<_> = limitations
+            .iter()
+            .filter(|value| {
+                value
+                    .as_str()
+                    .is_some_and(|note| note.starts_with("review-profile-capabilities-omitted:"))
+            })
+            .collect();
+        assert_eq!(capability_notes.len(), 1);
+        assert!(!limitations.iter().any(|value| {
+            value
+                .as_str()
+                .is_some_and(|note| note == "review-profile-capabilities-omitted:976")
+        }));
+        assert!(serialized_report_size(&result).unwrap() <= REVIEW_SERIALIZED_BYTE_LIMIT);
+    }
 }
 
 #[cfg(test)]

@@ -14,7 +14,7 @@ plugins enforcement-status PLUGIN_ID	[--format text|json]
 plugins override create PLUGIN_ID	--rule RULE_ID [--rule RULE_ID ...] --commit SHA --reason TEXT --expires TIMESTAMP
 plugins override list	[--format text|json]
 plugins analyze PLUGIN_ID	[--format text|json] [--fail-on info|low|medium|high|critical]
-scan-plugin	(--path DIR | --git URL --revision COMMIT) [--format text|json] [--fail-on info|low|medium|high|critical]
+scan-plugin	(--path DIR | --git URL [--revision COMMIT] | --request TEXT | --marketplace PLUGIN_ID) [--plugin-id PLUGIN_ID] [--report-profile full|review] [--format text|json] [--fail-on info|low|medium|high|critical]
 rules list	[--format text|json]
 rules coverage	[--format text|json]
 rules explain RULE_ID	[--format text|json]

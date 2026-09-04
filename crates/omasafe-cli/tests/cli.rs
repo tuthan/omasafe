@@ -1177,15 +1177,13 @@ fn scan_plugin_argument_shapes_are_strict() {
         .args(["scan-plugin"])
         .assert()
         .failure()
-        .stderr(predicates::str::contains(
-            "requires --path DIR or --git URL",
-        ));
+        .stderr(predicates::str::contains("requires exactly one of"));
     fixture
         .command()
         .args(["scan-plugin", "--path", ".", "--revision", "a"])
         .assert()
         .failure()
-        .stderr(predicates::str::contains("not both"));
+        .stderr(predicates::str::contains("--revision requires --git"));
     fixture
         .command()
         .args(["scan-plugin", "--git", "https://example.test/r.git"])
@@ -4796,4 +4794,291 @@ fn review_update_sweeps_orphaned_checkouts_from_dead_pids() {
     // the missing trusted baseline afterwards.
     update.review_update(&[]);
     assert!(!dead_dir.exists(), "orphaned checkout was not swept");
+}
+
+#[test]
+fn candidate_scan_is_unsuppressed_and_review_profile_is_bounded() {
+    let fixture = Fixture::new();
+    let target = tempfile::TempDir::new().unwrap();
+    fs::write(
+        target.path().join("Main.qml"),
+        "Process { command: [\"sh\", \"-c\", \"x\"] }\n",
+    )
+    .unwrap();
+    fs::create_dir_all(fixture.config.path().join("omasafe")).unwrap();
+    fs::write(
+        fixture.config.path().join("omasafe/suppressions.json"),
+        serde_json::json!({
+            "schema_version": 1,
+            "suppressions": [{
+                "rule_id": "oma.qml.process-execution",
+                "reason": "test",
+                "created_at": "now",
+                "active": true
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let full_output = fixture
+        .command()
+        .args([
+            "scan-plugin",
+            "--path",
+            target.path().to_str().unwrap(),
+            "--report-profile",
+            "full",
+            "--format",
+            "json",
+            "--fail-on",
+            "medium",
+        ])
+        .assert()
+        .code(4)
+        .get_output()
+        .stdout
+        .clone();
+    let full_report: Value = serde_json::from_slice(&full_output).unwrap();
+
+    let output = fixture
+        .command()
+        .args([
+            "scan-plugin",
+            "--path",
+            target.path().to_str().unwrap(),
+            "--report-profile",
+            "review",
+            "--format",
+            "json",
+            "--fail-on",
+            "medium",
+        ])
+        .assert()
+        .code(4)
+        .get_output()
+        .stdout
+        .clone();
+    assert!(output.len() < 1_572_864);
+    let report: Value = serde_json::from_slice(&output).unwrap();
+    let result = &report["result"];
+    assert_eq!(
+        full_report["result"]["analysis"]["analysis_fingerprint"],
+        result["analysis"]["analysis_fingerprint"]
+    );
+    assert!(
+        !full_report["result"]["payload_inventory"]["entries"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(result["suppressions"]["policy"], "candidate-unsuppressed");
+    assert_eq!(result["suppressions"]["consulted"], false);
+    assert_eq!(result["suppressions"]["active_records"], Value::Null);
+    assert_eq!(
+        result["suppressions"]["applied"].as_array().unwrap().len(),
+        0
+    );
+    assert!(
+        !result["analysis"]["findings"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(result["payload_inventory"]["profile"], "review");
+    assert_eq!(
+        result["payload_inventory"]["entries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        result["report_profile"]["omissions"]["payload_entries"]["omitted"],
+        result["payload_inventory"]["totals"]["entries"]
+    );
+    fixture
+        .command()
+        .args([
+            "scan-plugin",
+            "--path",
+            target.path().to_str().unwrap(),
+            "--report-profile",
+            "review",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Report profile: review"));
+}
+
+#[test]
+#[cfg(unix)]
+fn marketplace_candidate_scan_uses_verified_listing_and_exact_cached_commit() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new();
+    symlink("/usr/bin/git", fixture.bin.path().join("git")).unwrap();
+    let source = tempfile::TempDir::new().unwrap();
+    let candidate_work = source.path().join("candidate");
+    let catalog_work = source.path().join("catalog");
+    fs::create_dir_all(&candidate_work).unwrap();
+    fs::create_dir_all(catalog_work.join("site")).unwrap();
+    fs::write(
+        candidate_work.join("manifest.json"),
+        br#"{"schemaVersion":1,"id":"io.example.marketplace"}"#,
+    )
+    .unwrap();
+    fs::write(
+        candidate_work.join("Main.qml"),
+        "Process { command: [\"sh\", \"-c\", \"x\"] }\n",
+    )
+    .unwrap();
+
+    let git = |args: &[&str], directory: &Path| {
+        let output = std::process::Command::new("/usr/bin/git")
+            .args(args)
+            .current_dir(directory)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "omasafe")
+            .env("GIT_AUTHOR_EMAIL", "omasafe@example.invalid")
+            .env("GIT_COMMITTER_NAME", "omasafe")
+            .env("GIT_COMMITTER_EMAIL", "omasafe@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "--quiet"], &candidate_work);
+    git(&["add", "."], &candidate_work);
+    git(&["commit", "--quiet", "-m", "candidate"], &candidate_work);
+    let candidate_revision = String::from_utf8(
+        std::process::Command::new("/usr/bin/git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&candidate_work)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+
+    let listed_repository = "https://Example.test/Owner/Candidate";
+    let catalog_bytes = serde_json::to_vec(&serde_json::json!([{
+        "id": "io.example.marketplace",
+        "repo": listed_repository,
+        "verificationStatus": "verified",
+        "listingValidatedCommit": candidate_revision.clone(),
+        "repositoryLayout": "root-plugin"
+    }]))
+    .unwrap();
+    fs::write(catalog_work.join("site/catalog.json"), &catalog_bytes).unwrap();
+    git(&["init", "--quiet"], &catalog_work);
+    git(&["add", "."], &catalog_work);
+    git(&["commit", "--quiet", "-m", "catalog"], &catalog_work);
+    let catalog_revision = String::from_utf8(
+        std::process::Command::new("/usr/bin/git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&catalog_work)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+
+    let cache = fixture.cache.path().join("omasafe");
+    let analysis_cache = cache.join("analysis");
+    fs::create_dir_all(&analysis_cache).unwrap();
+    let clone = |source: &Path, destination: &Path| {
+        let output = std::process::Command::new("/usr/bin/git")
+            .args(["clone", "--quiet", "--bare"])
+            .arg(source)
+            .arg(destination)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git clone: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    clone(&catalog_work, &cache.join("catalog.git"));
+    fs::write(cache.join("catalog.json"), &catalog_bytes).unwrap();
+    fs::write(
+        cache.join("catalog.meta.json"),
+        serde_json::json!({
+            "repository_commit": catalog_revision,
+            "repository_url": "https://github.com/omacom/omarchy-plugin-marketplace",
+            "retrieved_at": "2026-09-04T00:00:00Z",
+            "file_digest": format!("{:x}", Sha256::digest(&catalog_bytes))
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let effective_url = "https://example.test/Owner/Candidate.git";
+    let digest = Sha256::digest(effective_url.as_bytes());
+    let slug: String = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    clone(&candidate_work, &analysis_cache.join(format!("{slug}.git")));
+
+    let output = fixture
+        .command()
+        .args([
+            "scan-plugin",
+            "--marketplace",
+            "io.example.marketplace",
+            "--report-profile",
+            "review",
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).unwrap();
+    let result = &report["result"];
+    assert_eq!(result["target"]["source"], "marketplace-listing");
+    assert_eq!(result["target"]["id"], "io.example.marketplace");
+    assert_eq!(result["target"]["revision"], candidate_revision);
+    assert_eq!(result["acquisition"]["input_kind"], "marketplace-id");
+    assert_eq!(result["acquisition"]["cache"]["result"], "hit");
+    assert_eq!(result["acquisition"]["network_used"], false);
+    assert_eq!(
+        result["acquisition"]["marketplace_claim"]["listed_repository"],
+        listed_repository
+    );
+    assert_eq!(
+        result["acquisition"]["marketplace_claim"]["effective_repository_url"],
+        effective_url
+    );
+}
+
+#[test]
+fn rejected_candidate_request_does_not_create_analysis_cache() {
+    let fixture = Fixture::new();
+    fixture
+        .command()
+        .args([
+            "scan-plugin",
+            "--request",
+            "sudo omarchy plugin add https://github.com/example/plugin",
+            "--format",
+            "json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "paste only the GitHub repository URL",
+        ));
+    assert!(!fixture.cache.path().join("omasafe/analysis").exists());
 }

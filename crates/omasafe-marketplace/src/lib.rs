@@ -1,10 +1,15 @@
 pub mod manifest;
 
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+use omasafe_core::bounds::{
+    GIT_PROCESS_BUDGET, MAX_METADATA_BYTES, MAX_PROCESS_OUTPUT_BYTES_PER_STREAM, run_bounded_capped,
+};
 
 pub const MAX_CATALOG_BYTES: usize = 32 * 1024 * 1024;
 pub const OFFICIAL_REPOSITORY: &str = "https://github.com/omacom/omarchy-plugin-marketplace";
@@ -30,6 +35,20 @@ pub enum Error {
     Rollback,
     #[error("catalog JSON has no recognized entry list")]
     InvalidShape,
+    #[error("marketplace cache is not cryptographically reverified")]
+    UnverifiedCache,
+    #[error("no marketplace entry matched plugin ID {0}")]
+    MissingCandidate(String),
+    #[error("multiple marketplace entries matched plugin ID {0}")]
+    AmbiguousCandidate(String),
+    #[error("marketplace entry {0} has no usable repository")]
+    MissingRepository(String),
+    #[error("unsupported-marketplace-repository: {0}")]
+    UnsupportedRepository(String),
+    #[error("marketplace entry {0} has no valid listingValidatedCommit")]
+    MissingListingCommit(String),
+    #[error("marketplace entry {0} declares an unsupported repository layout")]
+    UnsupportedLayout(String),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -85,6 +104,33 @@ pub struct RegistryClaim {
     pub upstream_moved: Option<bool>,
     pub installed_matches_listing: Option<bool>,
     pub repository_layout: Option<String>,
+}
+
+/// Exact, catalog-controlled identity used by the marketplace candidate
+/// scanner.
+#[derive(Debug, Clone, Serialize)]
+pub struct Candidate {
+    pub plugin_id: String,
+    pub listed_repository: String,
+    pub effective_repository_url: String,
+    pub listing_validated_commit: String,
+    pub repository_layout: String,
+    pub claim: CandidateClaim,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CandidateClaim {
+    pub registry_repository: String,
+    pub registry_commit: String,
+    pub catalog_file_digest: String,
+    pub retrieved_at: String,
+    pub generation_time: Option<String>,
+    pub listed_repository: String,
+    pub effective_repository_url: String,
+    pub verification_status: Option<String>,
+    pub listing_validated_commit: String,
+    pub upstream_observed_commit: Option<String>,
+    pub repository_layout: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,69 +220,163 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), Error> {
 
 pub fn resolve_latest_commit(repository_url: &str) -> Result<String, Error> {
     validate_https_repository(repository_url)?;
-    let output = git_command()
-        .args([
-            "ls-remote",
-            "--exit-code",
-            "--symref",
-            repository_url,
-            "HEAD",
-        ])
-        .output()
-        .map_err(|error| Error::Git(error.to_string()))?;
-    if !output.status.success() {
-        return Err(git_error(
-            &output.stderr,
-            "catalog remote did not advertise a default branch",
-        ));
-    }
-    parse_remote_head(&output.stdout)
+    omasafe_core::git::resolve_remote_head(repository_url)
+        .map(|head| head.revision)
+        .map_err(|error| Error::Git(error.to_string()))
 }
 
-fn parse_remote_head(output: &[u8]) -> Result<String, Error> {
-    let text = std::str::from_utf8(output)
-        .map_err(|_| Error::Git("catalog remote returned non-UTF-8 output".into()))?;
-    let mut lines = text.lines().filter(|line| !line.trim().is_empty());
-    let symref_line = lines
-        .next()
-        .ok_or_else(|| Error::Git("catalog remote omitted its default branch".into()))?;
-    let mut symref_fields = symref_line.split_ascii_whitespace();
-    let marker = symref_fields.next();
-    let branch_ref = symref_fields.next();
-    let head = symref_fields.next();
-    if marker != Some("ref:")
-        || head != Some("HEAD")
-        || symref_fields.next().is_some()
-        || !branch_ref.is_some_and(|value| {
-            value.starts_with("refs/heads/") && value.len() > "refs/heads/".len()
-        })
-    {
-        return Err(Error::Git(
-            "catalog remote omitted a valid default branch".into(),
-        ));
+/// Resolves one listing only from a verified cached snapshot. Catalog text is
+/// retained separately from the effective fetch URL so a GitHub SSH
+/// conversion remains visible provenance rather than a silent rewrite.
+pub fn resolve_candidate(snapshot: &CatalogSnapshot, plugin_id: &str) -> Result<Candidate, Error> {
+    if !snapshot.verified {
+        return Err(Error::UnverifiedCache);
     }
+    let matches: Vec<&CatalogEntry> = snapshot
+        .entries
+        .iter()
+        .filter(|entry| entry.id.as_deref() == Some(plugin_id))
+        .collect();
+    let entry = match matches.as_slice() {
+        [] => return Err(Error::MissingCandidate(plugin_id.to_owned())),
+        [entry] => *entry,
+        _ => return Err(Error::AmbiguousCandidate(plugin_id.to_owned())),
+    };
+    let listed_repository = entry
+        .repo
+        .clone()
+        .ok_or_else(|| Error::MissingRepository(plugin_id.to_owned()))?;
+    let effective_repository_url = effective_repository_url(&listed_repository)?;
+    let listing_validated_commit = entry
+        .listing_validated_commit
+        .clone()
+        .filter(|commit| valid_commit(commit))
+        .ok_or_else(|| Error::MissingListingCommit(plugin_id.to_owned()))?;
+    let repository_layout = entry
+        .repository_layout
+        .clone()
+        .ok_or_else(|| Error::UnsupportedLayout(plugin_id.to_owned()))?;
+    if !matches!(
+        repository_layout.as_str(),
+        "root-plugin" | "monorepo" | "suite"
+    ) {
+        return Err(Error::UnsupportedLayout(plugin_id.to_owned()));
+    }
+    Ok(Candidate {
+        plugin_id: plugin_id.to_owned(),
+        listed_repository: listed_repository.clone(),
+        effective_repository_url: effective_repository_url.clone(),
+        listing_validated_commit: listing_validated_commit.clone(),
+        repository_layout: repository_layout.clone(),
+        claim: CandidateClaim {
+            registry_repository: snapshot.repository.clone(),
+            registry_commit: snapshot.repository_commit.clone(),
+            catalog_file_digest: snapshot.file_digest.clone(),
+            retrieved_at: snapshot.retrieved_at.clone(),
+            generation_time: snapshot.generation_time.clone(),
+            listed_repository,
+            effective_repository_url,
+            verification_status: entry.verification_status.clone(),
+            listing_validated_commit,
+            upstream_observed_commit: entry.upstream_observed_commit.clone(),
+            repository_layout,
+        },
+    })
+}
 
-    let commit_line = lines
-        .next()
-        .ok_or_else(|| Error::Git("catalog remote omitted the default branch commit".into()))?;
-    let mut commit_fields = commit_line.split_ascii_whitespace();
-    let commit = commit_fields
-        .next()
-        .ok_or_else(|| Error::Git("catalog remote response omitted the commit".into()))?;
-    let reference = commit_fields
-        .next()
-        .ok_or_else(|| Error::Git("catalog remote response omitted the ref".into()))?;
-    if commit_fields.next().is_some() || reference != "HEAD" || !valid_commit(commit) {
-        return Err(Error::Git(
-            "catalog remote response was not an exact HEAD commit mapping".into(),
+fn effective_repository_url(value: &str) -> Result<String, Error> {
+    if let Some(rest) = value.strip_prefix("https://") {
+        let authority_end = rest
+            .find('/')
+            .ok_or_else(|| Error::UnsupportedRepository("HTTPS repository has no path".into()))?;
+        let authority = &rest[..authority_end];
+        if authority.is_empty()
+            || authority.contains(['@', ':', '?', '#'])
+            || value.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
+        {
+            return Err(Error::UnsupportedRepository(
+                "HTTPS repository contains credentials, a port, or control characters".into(),
+            ));
+        }
+        let path = &rest[authority_end + 1..];
+        if path.contains(['?', '#']) || path.ends_with("//") {
+            return Err(Error::UnsupportedRepository(
+                "HTTPS repository must not contain a query, fragment, or repeated trailing slash"
+                    .into(),
+            ));
+        }
+        let path = path.strip_suffix('/').unwrap_or(path);
+        let segments: Vec<&str> = path.split('/').collect();
+        if segments.len() != 2
+            || !segments
+                .iter()
+                .all(|segment| repository_segment_is_safe(segment))
+        {
+            return Err(Error::UnsupportedRepository(
+                "HTTPS repository must identify exactly OWNER/REPOSITORY".into(),
+            ));
+        }
+        let repository = segments[1].strip_suffix(".git").unwrap_or(segments[1]);
+        if !repository_segment_is_safe(repository) || repository.ends_with(".git") {
+            return Err(Error::UnsupportedRepository(
+                "HTTPS repository must identify exactly OWNER/REPOSITORY".into(),
+            ));
+        }
+        return Ok(format!(
+            "https://{}/{}/{}.git",
+            authority.to_ascii_lowercase(),
+            segments[0],
+            repository
         ));
     }
-    if lines.next().is_some() {
-        return Err(Error::Git(
-            "catalog remote HEAD resolution returned multiple revisions".into(),
+    let (owner_repo, supported) = if let Some(value) = value.strip_prefix("git@github.com:") {
+        (value, true)
+    } else if let Some(value) = value.strip_prefix("ssh://git@github.com/") {
+        (value, true)
+    } else {
+        (value, false)
+    };
+    if supported {
+        if owner_repo.ends_with("//") {
+            return Err(Error::UnsupportedRepository(
+                "GitHub SSH repository must not contain a repeated trailing slash".into(),
+            ));
+        }
+        let path = owner_repo.strip_suffix('/').unwrap_or(owner_repo);
+        let segments: Vec<&str> = path.split('/').collect();
+        if segments.len() != 2
+            || !segments
+                .iter()
+                .all(|segment| repository_segment_is_safe(segment))
+        {
+            return Err(Error::UnsupportedRepository(
+                "GitHub SSH repository must identify exactly OWNER/REPOSITORY".into(),
+            ));
+        }
+        let repository = segments[1].strip_suffix(".git").unwrap_or(segments[1]);
+        if !repository_segment_is_safe(repository) || repository.ends_with(".git") {
+            return Err(Error::UnsupportedRepository(
+                "GitHub SSH repository must identify exactly OWNER/REPOSITORY".into(),
+            ));
+        }
+        return Ok(format!(
+            "https://github.com/{}/{}.git",
+            segments[0], repository
         ));
     }
-    Ok(commit.to_ascii_lowercase())
+    Err(Error::UnsupportedRepository(
+        "only credential-free HTTPS or public GitHub SSH/scp repositories are supported".into(),
+    ))
+}
+
+fn repository_segment_is_safe(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment != "."
+        && segment != ".."
+        && !segment.contains(['?', '#', '@', '\\'])
+        && segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
 }
 
 fn validate_https_repository(repository_url: &str) -> Result<(), Error> {
@@ -244,15 +384,6 @@ fn validate_https_repository(repository_url: &str) -> Result<(), Error> {
         return Err(Error::Git("catalog repository must be an HTTPS URL".into()));
     }
     Ok(())
-}
-
-fn git_error(stderr: &[u8], fallback: &str) -> Error {
-    let message = String::from_utf8_lossy(stderr).trim().to_owned();
-    Error::Git(if message.is_empty() {
-        fallback.into()
-    } else {
-        message
-    })
 }
 
 pub fn fetch_pinned_catalog(
@@ -267,17 +398,31 @@ pub fn fetch_pinned_catalog(
     validate_https_repository(repository_url)?;
     fs::create_dir_all(cache_dir)?;
     let repository_dir = cache_dir.join("catalog.git");
-    if !repository_dir.exists() {
-        run_git(
-            cache_dir,
-            &[
-                "init",
-                "--bare",
-                repository_dir
-                    .to_str()
-                    .ok_or_else(|| Error::Git("catalog cache path is not UTF-8".into()))?,
-            ],
-        )?;
+    match fs::symlink_metadata(&repository_dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(Error::Git(
+                "catalog cache repository path is a symlink".into(),
+            ));
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(Error::Git(
+                "catalog cache repository path is not a directory".into(),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            run_git(
+                cache_dir,
+                &[
+                    "init",
+                    "--bare",
+                    repository_dir
+                        .to_str()
+                        .ok_or_else(|| Error::Git("catalog cache path is not UTF-8".into()))?,
+                ],
+            )?;
+        }
+        Err(error) => return Err(error.into()),
     }
     match run_git_output(&repository_dir, &["remote", "get-url", "origin"]) {
         Ok(remote) if String::from_utf8_lossy(&remote).trim() == repository_url => {}
@@ -459,16 +604,20 @@ fn run_git(directory: &Path, args: &[&str]) -> Result<(), Error> {
 }
 
 fn run_git_output(directory: &Path, args: &[&str]) -> Result<Vec<u8>, Error> {
-    let output = git_command()
-        .args(args)
-        .current_dir(directory)
-        .output()
-        .map_err(|error| Error::Git(error.to_string()))?;
-    if output.status.success() {
+    let mut command = git_command();
+    command.args(args).current_dir(directory);
+    let output = run_bounded_capped(
+        &mut command,
+        GIT_PROCESS_BUDGET,
+        MAX_PROCESS_OUTPUT_BYTES_PER_STREAM,
+    )
+    .map_err(|error| Error::Git(error.to_string()))?
+    .ok_or_else(|| Error::Git("catalog Git operation exceeded its time budget".into()))?;
+    if output.status.success() && !output.truncated {
         Ok(output.stdout)
     } else {
         Err(Error::Git(
-            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            "catalog Git operation failed or exceeded its output bound".into(),
         ))
     }
 }
@@ -487,11 +636,35 @@ struct CacheMetadata {
 pub fn load_cached_catalog(cache_dir: &Path) -> Result<Option<CatalogSnapshot>, Error> {
     let metadata_path = cache_dir.join("catalog.meta.json");
     let catalog_path = cache_dir.join("catalog.json");
-    if !metadata_path.exists() || !catalog_path.exists() {
-        return Ok(None);
+    let metadata_stat = match fs::symlink_metadata(&metadata_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata_stat.file_type().is_symlink() || !metadata_stat.is_file() {
+        return Err(Error::Io(std::io::Error::other(
+            "catalog metadata is not a regular file",
+        )));
     }
-    let metadata: CacheMetadata = serde_json::from_slice(&fs::read(&metadata_path)?)?;
-    let size = fs::metadata(&catalog_path)?.len();
+    if metadata_stat.len() > MAX_METADATA_BYTES as u64 {
+        return Err(Error::Oversized);
+    }
+    let metadata_file = fs::File::open(&metadata_path)?;
+    let mut metadata_bytes = Vec::with_capacity(metadata_stat.len() as usize + 1);
+    metadata_file
+        .take(MAX_METADATA_BYTES as u64 + 1)
+        .read_to_end(&mut metadata_bytes)?;
+    if metadata_bytes.len() > MAX_METADATA_BYTES {
+        return Err(Error::Oversized);
+    }
+    let metadata: CacheMetadata = serde_json::from_slice(&metadata_bytes)?;
+    let catalog_metadata = fs::symlink_metadata(&catalog_path)?;
+    if catalog_metadata.file_type().is_symlink() || !catalog_metadata.is_file() {
+        return Err(Error::Io(std::io::Error::other(
+            "catalog cache file is not a regular file",
+        )));
+    }
+    let size = catalog_metadata.len();
     if size > MAX_CATALOG_BYTES as u64 {
         return Err(Error::Oversized);
     }
@@ -510,12 +683,14 @@ pub fn load_cached_catalog(cache_dir: &Path) -> Result<Option<CatalogSnapshot>, 
         .file_digest
         .as_deref()
         .is_some_and(|digest| digest == snapshot.file_digest);
+    let repository_cache = cache_dir.join("catalog.git");
     let repo_matches = metadata.repository_url.as_deref() == Some(OFFICIAL_REPOSITORY)
-        && cache_dir.join("catalog.git").is_dir();
+        && fs::symlink_metadata(&repository_cache)
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink());
     let commit_matches = valid_commit(&snapshot.repository_commit)
         && repo_matches
         && run_git_output(
-            &cache_dir.join("catalog.git"),
+            &repository_cache,
             &[
                 "show",
                 &format!("{}:site/catalog.json", snapshot.repository_commit),
@@ -527,19 +702,23 @@ pub fn load_cached_catalog(cache_dir: &Path) -> Result<Option<CatalogSnapshot>, 
 }
 
 fn is_ancestor(directory: &Path, previous: &str, current: &str) -> Result<bool, Error> {
-    let output = git_command()
+    let mut command = git_command();
+    command
         .args(["merge-base", "--is-ancestor", previous, current])
-        .current_dir(directory)
-        .output()
-        .map_err(|error| Error::Git(error.to_string()))?;
+        .current_dir(directory);
+    let output = run_bounded_capped(
+        &mut command,
+        GIT_PROCESS_BUDGET,
+        MAX_PROCESS_OUTPUT_BYTES_PER_STREAM,
+    )
+    .map_err(|error| Error::Git(error.to_string()))?
+    .ok_or_else(|| Error::Git("catalog Git operation exceeded its time budget".into()))?;
     if output.status.success() {
         Ok(true)
     } else if output.status.code() == Some(1) {
         Ok(false)
     } else {
-        Err(Error::Git(
-            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        ))
+        Err(Error::Git("catalog ancestry check failed".into()))
     }
 }
 
@@ -571,35 +750,6 @@ mod tests {
             normalize_repository("git@github.com:Example/Widget.git"),
             "github.com/example/widget"
         );
-    }
-
-    #[test]
-    fn parses_only_an_exact_remote_head_commit_mapping() {
-        let commit = "ABCDEF0123456789ABCDEF0123456789ABCDEF01";
-        assert_eq!(
-            parse_remote_head(format!("ref: refs/heads/master HEAD\n{commit}\tHEAD\n").as_bytes(),)
-                .unwrap(),
-            commit.to_ascii_lowercase()
-        );
-        assert!(parse_remote_head(b"abc\tHEAD\n").is_err());
-        assert!(
-            parse_remote_head(format!("ref: refs/tags/v1 HEAD\n{commit}\tHEAD\n").as_bytes())
-                .is_err()
-        );
-        assert!(
-            parse_remote_head(
-                format!("ref: refs/heads/main HEAD\n{commit}\tHEAD\n{commit}\tHEAD\n").as_bytes(),
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn supplies_a_message_when_git_returns_no_stderr() {
-        assert!(matches!(
-            git_error(b"", "default branch lookup failed"),
-            Error::Git(message) if message == "default branch lookup failed"
-        ));
     }
 
     #[test]
@@ -657,6 +807,88 @@ mod tests {
             ),
             Err(Error::InvalidShape)
         ));
+    }
+
+    #[test]
+    fn candidate_resolution_requires_verified_snapshot_and_preserves_ssh_case() {
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let mut snapshot = parse_catalog(
+            format!(
+                r#"[{{"id":"io.example.widget","repo":"git@github.com:MixedCase/Plugin.git","listingValidatedCommit":"{commit}","repositoryLayout":"monorepo"}}]"#
+            )
+            .as_bytes(),
+            "https://github.com/omacom/omarchy-plugin-marketplace".into(),
+            commit.into(),
+            "2026-09-04T00:00:00Z".into(),
+        )
+        .unwrap();
+        assert!(matches!(
+            resolve_candidate(&snapshot, "io.example.widget"),
+            Err(Error::UnverifiedCache)
+        ));
+        snapshot.verified = true;
+        let candidate = resolve_candidate(&snapshot, "io.example.widget").unwrap();
+        assert_eq!(
+            candidate.listed_repository,
+            "git@github.com:MixedCase/Plugin.git"
+        );
+        assert_eq!(
+            candidate.effective_repository_url,
+            "https://github.com/MixedCase/Plugin.git"
+        );
+    }
+
+    #[test]
+    fn candidate_resolution_rejects_private_repository_forms() {
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        for repo in [
+            "git@gitlab.com:owner/plugin.git",
+            "ssh://git@github.com:22/owner/plugin.git",
+            "https://github.com/owner/plugin?ref=main",
+        ] {
+            let mut snapshot = parse_catalog(
+                format!(
+                    r#"[{{"id":"io.example.widget","repo":"{repo}","listingValidatedCommit":"{commit}","repositoryLayout":"root-plugin"}}]"#
+                )
+                .as_bytes(),
+                "registry".into(),
+                commit.into(),
+                "now".into(),
+            )
+            .unwrap();
+            snapshot.verified = true;
+            assert!(matches!(
+                resolve_candidate(&snapshot, "io.example.widget"),
+                Err(Error::UnsupportedRepository(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn candidate_resolution_canonicalizes_https_repository_forms() {
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        for repo in [
+            "https://GitHub.com/MixedCase/Plugin",
+            "https://github.com/MixedCase/Plugin/",
+            "https://github.com/MixedCase/Plugin.git",
+        ] {
+            let mut snapshot = parse_catalog(
+                format!(
+                    r#"[{{"id":"io.example.widget","repo":"{repo}","listingValidatedCommit":"{commit}","repositoryLayout":"root-plugin"}}]"#
+                )
+                .as_bytes(),
+                "registry".into(),
+                commit.into(),
+                "now".into(),
+            )
+            .unwrap();
+            snapshot.verified = true;
+            let candidate = resolve_candidate(&snapshot, "io.example.widget").unwrap();
+            assert_eq!(
+                candidate.effective_repository_url,
+                "https://github.com/MixedCase/Plugin.git"
+            );
+        }
     }
 
     #[test]

@@ -1,6 +1,7 @@
 # OmaSafe Implementation Plans
 
-Status: reviewed base sequence, 2026-08-20 · v0.2.1 implementation complete, 2026-09-02
+Status: reviewed base sequence, 2026-08-20 · v0.2.1 implementation complete, 2026-09-02 ·
+v0.2.2 candidate-source scan revised draft, 2026-09-04
 
 This directory turns the product brainstorm into independently shippable releases. Each
 version must deliver a useful vertical slice; unfinished future architecture must not
@@ -14,6 +15,7 @@ leak into the current release. These plans are the source of truth for scope and
 | [v0.1](v0.1.md) | Inventory installed plugins, correlate registry commits, pin trust, and disclose drift | — |
 | [v0.2](v0.2.md) | Analyze shipped payloads/capabilities and review candidate updates before activation | v0.1 identity/diff/state contracts |
 | [v0.2.1](v0.2.1-hardening-implementation.md) | Close scan-rule and lifecycle gaps, add opt-in hardened policy, and surface enforcement/coverage state in the plugin | v0.2 analyzer/rule/policy and plugin UI contracts |
+| [v0.2.2](v0.2.2-candidate-source-scan.md) | Scan uninstalled GitHub and verified marketplace candidates from a pasted URL/install command without installing or executing them | v0.2.1 bounded analyzer/report/consumer contracts |
 | [v0.3](v0.3.md) | Review PKGBUILDs and AUR updates without executing build files | v0.1 identity/diff; v0.2 analyzer/report contracts |
 | [v0.4](v0.4.md) | Detect machine-posture regressions and vulnerable/outdated packages | v0.1 state/notification; v0.2 report contract |
 | [v0.5](v0.5.md) | Perform a narrow set of explicit remediations and export reports | v0.4 checks; audited polkit boundary |

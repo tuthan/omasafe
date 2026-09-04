@@ -16,6 +16,11 @@ top_level=$(awk -F '\t' '!/^#/ && NF {print $1}' "$surface" | awk '{print $1}' |
 [[ -n "$top_level" ]] || { printf 'CLI surface is empty\n' >&2; exit 1; }
 package_version=$(awk -F '"' '/^version =/ {print $2; exit}' "$root_dir/Cargo.toml")
 [[ -n "$package_version" ]] || { printf 'workspace version is missing\n' >&2; exit 1; }
+if [[ -n ${SOURCE_DATE_EPOCH:-} ]]; then
+  generated_date=$(date -u -d "@${SOURCE_DATE_EPOCH}" +%Y-%m-%d)
+else
+  generated_date=$(date -u +%Y-%m-%d)
+fi
 
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
@@ -39,7 +44,7 @@ write_asset() {
 }
 
 write_asset docs/man/omasafe-cli.1 "$(cat <<EOF
-.TH OMASAFE-CLI 1 "2026-09-03" "OmaSafe $package_version" "User Commands"
+.TH OMASAFE-CLI 1 "$generated_date" "OmaSafe $package_version" "User Commands"
 .SH NAME
 omasafe-cli \- local trust, payload analysis, and drift review for Omarchy plugins
 .SH SYNOPSIS
@@ -138,11 +143,15 @@ Inventory every shipped payload file of an installed plugin with type, mode,
 size, digest, executable bit, and explicit analysis coverage state. Exit
 status is 0 even when findings exist; CI policy uses --fail-on.
 .TP
-.B scan-plugin (--path DIR | --git URL --revision COMMIT) [--format text|json]
-    [--fail-on SEVERITY]
-Run the same bounded payload inventory against a local directory or a pinned
-immutable Git revision read as raw objects (no checkout, filters, hooks, or
-submodules). URLs carrying credentials are rejected.
+.B scan-plugin (--path DIR | --git URL [--revision COMMIT] | --request TEXT
+    | --marketplace PLUGIN_ID) [--plugin-id PLUGIN_ID]
+    [--report-profile full|review] [--format text|json] [--fail-on SEVERITY]
+Run the same bounded payload inventory against a local directory, a Git
+revision, a public GitHub URL or copied Omarchy install command, or a verified
+marketplace listing. Remote candidates resolve one exact commit and read raw
+Git objects without checkout, filters, hooks, submodules, installation, or
+enablement. The review profile bounds serialized JSON and reports omissions.
+URLs carrying credentials are rejected.
 .TP
 .B marketplace refresh (--commit COMMIT | --latest)
 Fetch and verify a pinned marketplace snapshot.
@@ -198,7 +207,7 @@ _omasafe_cli() {
     fi
     case "\${COMP_WORDS[1]}" in
         scan|provenance|plugins|marketplace|rules|scan-plugin)
-            COMPREPLY=(\$(compgen -W "--format --notify --only-new --include-analysis --yes --expected-head --expected-tree --expected-digest --note --policy --action --scope --to --reason --rule --path --commit --expires --latest --git --revision --fail-on" -- "\${cur}"))
+            COMPREPLY=(\$(compgen -W "--format --notify --only-new --include-analysis --yes --expected-head --expected-tree --expected-digest --note --policy --action --scope --to --reason --rule --path --commit --expires --latest --git --revision --request --marketplace --plugin-id --report-profile --fail-on" -- "\${cur}"))
             ;;
         paths|schedule)
             COMPREPLY=()
@@ -212,7 +221,7 @@ EOF
 write_asset docs/completions/_omasafe-cli "$(cat <<EOF
 #compdef omasafe-cli
 # zsh completion for omasafe-cli; generated from docs/cli-surface.txt
-_arguments '1:command:($top_level)' '*:option:(--format --notify --only-new --include-analysis --yes --expected-head --expected-tree --expected-digest --note --policy --action --scope --to --reason --rule --path --commit --expires --latest --git --revision --fail-on)'
+_arguments '1:command:($top_level)' '*:option:(--format --notify --only-new --include-analysis --yes --expected-head --expected-tree --expected-digest --note --policy --action --scope --to --reason --rule --path --commit --expires --latest --git --revision --request --marketplace --plugin-id --report-profile --fail-on)'
 EOF
 )"
 
@@ -239,6 +248,10 @@ complete -c omasafe-cli -l expires -r
 complete -c omasafe-cli -l path -r
 complete -c omasafe-cli -l git -r
 complete -c omasafe-cli -l revision -r
+complete -c omasafe-cli -l request -r
+complete -c omasafe-cli -l marketplace -r
+complete -c omasafe-cli -l plugin-id -r
+complete -c omasafe-cli -l report-profile -r -a "full review"
 complete -c omasafe-cli -l fail-on -r -a "info low medium high critical"
 EOF
 )"

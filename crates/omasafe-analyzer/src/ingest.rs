@@ -19,7 +19,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
 use omasafe_core::bounds::{
@@ -450,11 +450,29 @@ fn file_mode(metadata: &fs::Metadata) -> u32 {
 /// cache layout, or reports. The cache-quota check runs both before and after
 /// the fetch, under an exclusive advisory lock so concurrent scans cannot each
 /// pass the same pre-check and then all fetch.
+#[derive(Debug)]
+pub struct PinnedRepository {
+    pub path: PathBuf,
+    pub cache_hit: bool,
+}
+
 pub fn ensure_pinned_repository(
     cache_root: &Path,
     url: &str,
     revision: &str,
 ) -> Result<PathBuf, IngestError> {
+    Ok(ensure_pinned_repository_with_facts(cache_root, url, revision)?.path)
+}
+
+/// As [`ensure_pinned_repository`], with the cache fact needed by the
+/// acquisition report.  A hit is only reported when the exact commit object
+/// was already present before this call; a mutable URL is never used as an
+/// identity substitute.
+pub fn ensure_pinned_repository_with_facts(
+    cache_root: &Path,
+    url: &str,
+    revision: &str,
+) -> Result<PinnedRepository, IngestError> {
     if !url.starts_with("https://") || url.starts_with('-') {
         return Err(IngestError::InvalidUrl);
     }
@@ -476,7 +494,22 @@ pub fn ensure_pinned_repository(
     let _lock = CacheLock::acquire(cache_root)?;
     enforce_cache_quota(cache_root)?;
 
-    if !repository_dir.exists() {
+    let existed = match fs::symlink_metadata(&repository_dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(IngestError::Git(
+                "analysis cache repository path is a symlink".to_owned(),
+            ));
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(IngestError::Git(
+                "analysis cache repository path is not a directory".to_owned(),
+            ));
+        }
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(IngestError::Io(error)),
+    };
+    if !existed {
         let display = repository_dir.to_string_lossy().into_owned();
         // Match the object format to the pinned revision so SHA-256 remotes
         // can be fetched at all.
@@ -490,13 +523,60 @@ pub fn ensure_pinned_repository(
             &["init", "--bare", "--object-format", object_format, &display],
         )?;
     }
+    let expected_object_format = if revision.len() == 64 {
+        "sha256"
+    } else {
+        "sha1"
+    };
+    let actual_object_format = run_git(&repository_dir, &["rev-parse", "--show-object-format"])?;
+    if actual_object_format.trim() != expected_object_format {
+        return Err(IngestError::Git(format!(
+            "analysis cache object format mismatch: expected {expected_object_format}"
+        )));
+    }
+    let commit_exists = run_git(
+        &repository_dir,
+        &["cat-file", "-e", &format!("{revision}^{{commit}}")],
+    )
+    .is_ok();
+    // A commit object alone is not enough to call this a cache hit: a
+    // partially deleted tree/blob set would otherwise skip the repair fetch.
+    // If the exact revision is present but unreachable, rebuild this one
+    // URL-scoped cache entry so the normal pinned fetch can restore it.
+    let cache_hit = commit_exists
+        && run_git(
+            &repository_dir,
+            &[
+                "fsck",
+                "--connectivity-only",
+                "--no-reflogs",
+                "--no-progress",
+                revision,
+            ],
+        )
+        .is_ok();
+    if commit_exists && !cache_hit {
+        fs::remove_dir_all(&repository_dir)?;
+        let display = repository_dir.to_string_lossy().into_owned();
+        let object_format = if revision.len() == 64 {
+            "sha256"
+        } else {
+            "sha1"
+        };
+        run_git(
+            cache_root,
+            &["init", "--bare", "--object-format", object_format, &display],
+        )?;
+    }
     if run_git(&repository_dir, &["remote", "get-url", "origin"]).is_err() {
         run_git(&repository_dir, &["remote", "add", "origin", url])?;
     }
-    run_git(
-        &repository_dir,
-        &["fetch", "--no-tags", "--quiet", "origin", revision],
-    )?;
+    if !cache_hit {
+        run_git(
+            &repository_dir,
+            &["fetch", "--no-tags", "--quiet", "origin", revision],
+        )?;
+    }
     // The fetch itself is the unbounded write. On violation, remove the
     // offending repository we just wrote so the quota genuinely bounds disk
     // use (transient overshoot is bounded by one repository), then fail
@@ -505,7 +585,10 @@ pub fn ensure_pinned_repository(
         let _ = fs::remove_dir_all(&repository_dir);
         return Err(IngestError::CacheQuotaExceeded(MAX_CACHE_BYTES));
     }
-    Ok(repository_dir)
+    Ok(PinnedRepository {
+        path: repository_dir,
+        cache_hit,
+    })
 }
 
 /// Advisory whole-cache lock serializing fetch/quota decisions.
@@ -604,8 +687,26 @@ pub fn ingest_pinned_tree(
     limits: Limits,
     budget: TimeBudget,
 ) -> Result<PayloadInventory, IngestError> {
+    ingest_pinned_tree_at_root(repository_dir, revision, "", limits, budget)
+}
+
+/// Ingests one logical plugin root from an immutable Git tree.  The raw Git
+/// repository may contain a monorepo/suite around this root; files outside it
+/// are never exposed to the analyzer.
+pub fn ingest_pinned_tree_at_root(
+    repository_dir: &Path,
+    revision: &str,
+    root: &str,
+    limits: Limits,
+    budget: TimeBudget,
+) -> Result<PayloadInventory, IngestError> {
     if !omasafe_marketplace_valid_revision(revision) {
         return Err(IngestError::InvalidRevision);
+    }
+    if root.starts_with('/') || root.split('/').any(|part| part == "..") {
+        return Err(IngestError::Git(
+            "selected plugin root is not a safe relative path".to_owned(),
+        ));
     }
     let mut walker = Walker::new(limits, budget);
     if walker.out_of_budget() {
@@ -661,6 +762,18 @@ pub fn ingest_pinned_tree(
                 }
             }
         };
+        let relative = if root.is_empty() {
+            relative
+        } else if relative == root {
+            continue;
+        } else if let Some(child) = relative.strip_prefix(&format!("{root}/")) {
+            child.to_owned()
+        } else {
+            continue;
+        };
+        if relative.is_empty() {
+            continue;
+        }
         if relative.split('/').count() > walker.limits.max_tree_depth + 1 {
             walker.note("tree_depth_limit_exceeded");
             continue;
@@ -791,6 +904,187 @@ pub fn ingest_pinned_tree(
 
 const SYMLINK_TARGET_CAP_BYTES: usize = 4096;
 const LS_TREE_OUTPUT_CAP_BYTES: usize = MAX_PROCESS_OUTPUT_BYTES_PER_STREAM;
+const MANIFEST_BYTES_CAP: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ManifestRoot {
+    pub manifest_path: String,
+    pub root: String,
+    pub plugin_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestIdentity {
+    id: Option<String>,
+}
+
+/// Discovers bounded manifest identities directly from the exact raw Git
+/// tree. No checkout or project code is involved. Malformed manifest
+/// candidates are skipped; the CLI still fails closed when the requested
+/// plugin ID cannot be resolved to exactly one valid manifest.
+pub fn discover_manifest_roots(
+    repository_dir: &Path,
+    revision: &str,
+) -> Result<Vec<ManifestRoot>, IngestError> {
+    if !omasafe_marketplace_valid_revision(revision) {
+        return Err(IngestError::InvalidRevision);
+    }
+    let budget = TimeBudget::default();
+    let mut command = git::command();
+    command.current_dir(repository_dir);
+    command.arg("-c").arg("core.quotePath=false");
+    command.args(["ls-tree", "-r", "-l", "-z", revision]);
+    let captured = run_bounded_capped(
+        &mut command,
+        budget.remaining().min(GIT_PROCESS_BUDGET),
+        LS_TREE_OUTPUT_CAP_BYTES,
+    )
+    .map_err(IngestError::Io)?
+    .ok_or(IngestError::BudgetExhausted)?;
+    if !captured.status.success() || captured.truncated {
+        return Err(IngestError::Git(
+            "manifest discovery Git output was incomplete".to_owned(),
+        ));
+    }
+    let mut roots = Vec::new();
+    for record in split_nul_records(&captured.stdout) {
+        if budget.expired() {
+            return Err(IngestError::BudgetExhausted);
+        }
+        let Some((meta_bytes, path_bytes)) = SplitOnceBytes::split_once(record, b'\t') else {
+            return Err(IngestError::Git(
+                "manifest discovery encountered a malformed tree record".to_owned(),
+            ));
+        };
+        let Ok(meta) = std::str::from_utf8(meta_bytes) else {
+            return Err(IngestError::Git(
+                "manifest discovery encountered non-UTF-8 tree metadata".to_owned(),
+            ));
+        };
+        let fields: Vec<&str> = meta.split_ascii_whitespace().collect();
+        if fields.len() != 4 || fields[1] != "blob" {
+            continue;
+        }
+        let Some(path) = std::str::from_utf8(path_bytes).ok() else {
+            return Err(IngestError::Git(
+                "manifest discovery encountered a non-UTF-8 manifest path".to_owned(),
+            ));
+        };
+        let path = match normalize_git_path(path) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+        if path != "manifest.json" && !path.ends_with("/manifest.json") {
+            continue;
+        }
+        let Ok(size) = fields[3].parse::<usize>() else {
+            continue;
+        };
+        if size > MANIFEST_BYTES_CAP {
+            continue;
+        }
+        let mut blob_command = git::command();
+        blob_command.current_dir(repository_dir);
+        blob_command.args(["cat-file", "blob", fields[2]]);
+        let blob = run_bounded_capped(
+            &mut blob_command,
+            budget.remaining().min(GIT_PROCESS_BUDGET),
+            size + 1,
+        )
+        .map_err(IngestError::Io)?
+        .ok_or(IngestError::BudgetExhausted)?;
+        if !blob.status.success() || blob.truncated || blob.stdout.len() != size {
+            continue;
+        }
+        let Ok(identity) = serde_json::from_slice::<ManifestIdentity>(&blob.stdout) else {
+            continue;
+        };
+        let Some(plugin_id) = identity.id.filter(|id| !id.is_empty()) else {
+            continue;
+        };
+        let root = path.strip_suffix("/manifest.json").unwrap_or("").to_owned();
+        roots.push(ManifestRoot {
+            manifest_path: path,
+            root,
+            plugin_id,
+        });
+    }
+    roots.sort_by(|a, b| a.manifest_path.cmp(&b.manifest_path));
+    Ok(roots)
+}
+
+/// The filesystem equivalent used by scan-plugin --path --plugin-id. It
+/// reuses the bounded inventory walk and re-reads only bounded manifest bytes.
+pub fn discover_filesystem_manifest_roots(
+    target_root: &Path,
+) -> Result<Vec<ManifestRoot>, IngestError> {
+    let inventory = ingest_filesystem(target_root, Limits::default(), TimeBudget::default())?;
+    let mut roots = Vec::new();
+    for entry in inventory.entries.iter().filter(|entry| {
+        entry.relative_path == "manifest.json" || entry.relative_path.ends_with("/manifest.json")
+    }) {
+        if entry.sampled_digest || entry.size as usize > MANIFEST_BYTES_CAP {
+            continue;
+        }
+        let path = target_root.join(&entry.relative_path);
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let file = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                let Ok(file) = fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                    .open(path)
+                else {
+                    continue;
+                };
+                file
+            }
+            #[cfg(not(unix))]
+            {
+                let Ok(file) = fs::File::open(path) else {
+                    continue;
+                };
+                file
+            }
+        };
+        let mut bytes = Vec::new();
+        if file
+            .take(MANIFEST_BYTES_CAP as u64 + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+        {
+            continue;
+        }
+        if bytes.len() as u64 != entry.size {
+            continue;
+        }
+        let Ok(identity) = serde_json::from_slice::<ManifestIdentity>(&bytes) else {
+            continue;
+        };
+        let Some(plugin_id) = identity.id.filter(|id| !id.is_empty()) else {
+            continue;
+        };
+        let root = entry
+            .relative_path
+            .strip_suffix("/manifest.json")
+            .unwrap_or("")
+            .to_owned();
+        roots.push(ManifestRoot {
+            manifest_path: entry.relative_path.clone(),
+            root,
+            plugin_id,
+        });
+    }
+    roots.sort_by(|a, b| a.manifest_path.cmp(&b.manifest_path));
+    Ok(roots)
+}
 
 fn split_nul_records(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
     bytes
@@ -843,12 +1137,7 @@ fn run_git_capped(dir: &Path, args: &[&str], cap: usize) -> Result<(Vec<u8>, boo
         .map_err(IngestError::Io)?
         .ok_or(IngestError::BudgetExhausted)?;
     if !captured.status.success() {
-        let message = String::from_utf8_lossy(&captured.stderr).trim().to_owned();
-        return Err(IngestError::Git(if message.is_empty() {
-            "git exited unsuccessfully".to_owned()
-        } else {
-            message
-        }));
+        return Err(IngestError::Git("git exited unsuccessfully".to_owned()));
     }
     Ok((captured.stdout, captured.truncated))
 }
@@ -877,12 +1166,7 @@ fn run_git_capped_within(
     // A capped read closes the pipe once full, so git may die by SIGPIPE;
     // that is the expected consequence of our own cap, not a failure.
     if !captured.status.success() && !captured.truncated {
-        let message = String::from_utf8_lossy(&captured.stderr).trim().to_owned();
-        return Err(IngestError::Git(if message.is_empty() {
-            "git exited unsuccessfully".to_owned()
-        } else {
-            message
-        }));
+        return Err(IngestError::Git("git exited unsuccessfully".to_owned()));
     }
     Ok((captured.stdout, captured.truncated))
 }

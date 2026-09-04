@@ -20,4 +20,8 @@ complete -c omasafe-cli -l expires -r
 complete -c omasafe-cli -l path -r
 complete -c omasafe-cli -l git -r
 complete -c omasafe-cli -l revision -r
+complete -c omasafe-cli -l request -r
+complete -c omasafe-cli -l marketplace -r
+complete -c omasafe-cli -l plugin-id -r
+complete -c omasafe-cli -l report-profile -r -a "full review"
 complete -c omasafe-cli -l fail-on -r -a "info low medium high critical"

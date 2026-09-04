@@ -22,8 +22,10 @@ pub use detect::{AnalysisArtifacts, analyze_inventory, parser_metadata};
 pub use equivalence::EquivalenceMap;
 pub use fingerprint::{Confidence, NormalizedResult, fingerprint_analysis, fingerprint_results};
 pub use ingest::{
-    IngestError, Limits, TargetSource, ensure_pinned_repository, ingest_filesystem,
-    ingest_pinned_tree,
+    IngestError, Limits, ManifestRoot, PinnedRepository, TargetSource,
+    discover_filesystem_manifest_roots, discover_manifest_roots, ensure_pinned_repository,
+    ensure_pinned_repository_with_facts, ingest_filesystem, ingest_pinned_tree,
+    ingest_pinned_tree_at_root,
 };
 pub use omasafe_core::bounds::TimeBudget;
 pub use payload::{CoverageState, PayloadEntry, PayloadInventory, PayloadKind};

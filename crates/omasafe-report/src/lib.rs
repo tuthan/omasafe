@@ -1,5 +1,6 @@
 use serde::Serialize;
 
+pub mod acquisition;
 pub mod analysis;
 pub mod enforcement;
 

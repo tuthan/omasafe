@@ -2731,9 +2731,41 @@ open, so an override that expires is re-read from the CLI rather than judged in
 QML. Blocked decisions also expose a read-only recovery command for the
 persisted CLI status; full lifecycle recovery actions remain CLI-owned.
 
-The workspace and CLI package floor are now 0.2.1. The contracts remain
+The workspace and CLI package floor are now 0.2.2. The contracts remain
 read-only and fail-safe; the sibling consumer can adopt them without taking
 ownership of policy, expiry, or lifecycle mutation decisions.
+
+## v0.2.2 CLI — Candidate Source Scan (2026-09-04)
+
+Status: **complete for the CLI slices C0–C2**
+
+Implemented:
+
+- Bounded public GitHub URL and copied Omarchy add/install request parsing,
+  with explicit discarded enable/yes provenance and no shell execution.
+- Shared bounded remote-HEAD resolution, immutable commit acquisition, cache
+  hit/miss disclosure, object-format checks, raw Git tree reads, and optional
+  bounded manifest-root selection for monorepos.
+- The request, default-HEAD Git, plugin-id, marketplace, and review-profile
+  scan routes.
+- Versioned acquisition provenance, explicit scan-only/no-install state,
+  verified marketplace listing resolution, SSH-to-public-HTTPS conversion
+  provenance, and candidate-unsuppressed suppression policy.
+- Review-profile JSON omission accounting and serialized UTF-8 size preflight;
+  full and review reports retain the same analysis fingerprint and threshold
+  semantics.
+- Review hardening for stale omission notes, context-first trimming, tabbed
+  request grammar, sanitized remote errors, cache reachability repair,
+  malformed sibling manifests, and canonical marketplace URLs; recorded in
+  [`adr/0004-candidate-acquisition.md`](adr/0004-candidate-acquisition.md).
+- v0.2.2 CLI surface, man page, shell completions, README examples, and
+  workspace package version.
+
+Verification: cargo fmt --all -- --check; cargo test --workspace;
+scripts/generate-cli-assets.sh --check.
+
+The sibling UI and agent-skill slices remain separate follow-on work; this
+milestone covers the CLI implementation and its report contract.
 
 ## Plan Step 8 — Typed Shell IR Foundation (2026-08-31)
 
