@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::time::Duration;
 
@@ -10,6 +10,7 @@ use crate::SourceIdentity;
 use omasafe_report::enforcement::{EnforcementAuditEvent, EnforcementDecision, OverrideBinding};
 
 pub const HISTORY_SCHEMA_VERSION: u64 = 1;
+pub const MAX_VALIDATION_STATE_BYTES: usize = 512 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -191,6 +192,25 @@ impl OverrideHistory {
         Ok(history)
     }
 
+    pub fn load_bounded(path: &Path) -> Result<Self, Error> {
+        let bytes = read_bounded_bytes(path, MAX_VALIDATION_STATE_BYTES)?.unwrap_or_else(|| {
+            serde_json::to_vec(&Self::default()).expect("default override history serializes")
+        });
+        let history: Self =
+            serde_json::from_slice(&bytes).map_err(|source| Error::EnforcementJson {
+                path: path.display().to_string(),
+                source,
+            })?;
+        if history.schema_version != OVERRIDE_HISTORY_SCHEMA_VERSION {
+            return Err(Error::Schema {
+                kind: "override history",
+                version: history.schema_version,
+                expected: OVERRIDE_HISTORY_SCHEMA_VERSION,
+            });
+        }
+        Ok(history)
+    }
+
     pub fn record(&mut self, binding: OverrideBinding) {
         self.schema_version = OVERRIDE_HISTORY_SCHEMA_VERSION;
         self.overrides.push(binding);
@@ -231,6 +251,25 @@ impl EnforcementHistory {
         }
         let history: Self =
             serde_json::from_slice(&fs::read(path)?).map_err(|source| Error::EnforcementJson {
+                path: path.display().to_string(),
+                source,
+            })?;
+        if history.schema_version != ENFORCEMENT_HISTORY_SCHEMA_VERSION {
+            return Err(Error::Schema {
+                kind: "enforcement history",
+                version: history.schema_version,
+                expected: ENFORCEMENT_HISTORY_SCHEMA_VERSION,
+            });
+        }
+        Ok(history)
+    }
+
+    pub fn load_bounded(path: &Path) -> Result<Self, Error> {
+        let bytes = read_bounded_bytes(path, MAX_VALIDATION_STATE_BYTES)?.unwrap_or_else(|| {
+            serde_json::to_vec(&Self::default()).expect("default enforcement history serializes")
+        });
+        let history: Self =
+            serde_json::from_slice(&bytes).map_err(|source| Error::EnforcementJson {
                 path: path.display().to_string(),
                 source,
             })?;
@@ -347,6 +386,24 @@ impl TrustHistory {
         Ok(history)
     }
 
+    pub fn load_bounded(path: &Path) -> Result<Self, Error> {
+        let bytes = read_bounded_bytes(path, MAX_VALIDATION_STATE_BYTES)?.unwrap_or_else(|| {
+            serde_json::to_vec(&Self::default()).expect("default trust history serializes")
+        });
+        let history: Self = serde_json::from_slice(&bytes).map_err(|source| Error::Json {
+            path: path.display().to_string(),
+            source,
+        })?;
+        if history.schema_version != HISTORY_SCHEMA_VERSION {
+            return Err(Error::Schema {
+                kind: "trust history",
+                version: history.schema_version,
+                expected: HISTORY_SCHEMA_VERSION,
+            });
+        }
+        Ok(history)
+    }
+
     pub fn accept(&mut self, record: TrustRecord) {
         self.schema_version = HISTORY_SCHEMA_VERSION;
         self.revoked_plugins.retain(|id| id != &record.plugin_id);
@@ -415,6 +472,25 @@ impl ScanState {
         Ok(state)
     }
 
+    pub fn load_bounded(path: &Path) -> Result<Self, Error> {
+        let bytes = read_bounded_bytes(path, MAX_VALIDATION_STATE_BYTES)?.unwrap_or_else(|| {
+            serde_json::to_vec(&Self::default()).expect("default scan state serializes")
+        });
+        let state: Self =
+            serde_json::from_slice(&bytes).map_err(|source| Error::ScanStateJson {
+                path: path.display().to_string(),
+                source,
+            })?;
+        if state.schema_version != HISTORY_SCHEMA_VERSION {
+            return Err(Error::Schema {
+                kind: "scan state",
+                version: state.schema_version,
+                expected: HISTORY_SCHEMA_VERSION,
+            });
+        }
+        Ok(state)
+    }
+
     pub fn is_new(&self, key: &str) -> bool {
         !self.alerts.contains_key(key)
     }
@@ -441,12 +517,59 @@ impl ScanState {
     }
 }
 
+fn read_bounded_bytes(path: &Path, cap: usize) -> Result<Option<Vec<u8>>, Error> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > cap as u64 {
+        return Err(
+            std::io::Error::other("state input exceeds its bounded regular-file contract").into(),
+        );
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = options.open(path)?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize + 1);
+    Read::by_ref(&mut file)
+        .take(cap as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > cap {
+        return Err(
+            std::io::Error::other("state input exceeds its bounded regular-file contract").into(),
+        );
+    }
+    Ok(Some(bytes))
+}
+
 pub struct StateLock {
     _file: fs::File,
 }
 
 pub fn lock(path: &Path) -> Result<StateLock, Error> {
+    lock_with_mode(path, false)
+}
+
+/// Acquires the state lock for a bounded, read-only observation. Shared locks
+/// let validation coexist with another reader while writers retain the
+/// existing exclusive mode.
+pub fn lock_shared(path: &Path) -> Result<StateLock, Error> {
+    lock_with_mode(path, true)
+}
+
+fn lock_with_mode(path: &Path, shared: bool) -> Result<StateLock, Error> {
     let lock_path = path.with_extension("lock");
+    if let Ok(metadata) = fs::symlink_metadata(&lock_path)
+        && (metadata.file_type().is_symlink() || !metadata.is_file())
+    {
+        return Err(std::io::Error::other("state lock is not a regular file").into());
+    }
     let mut options = fs::OpenOptions::new();
     options.read(true).write(true).truncate(false).create(true);
     #[cfg(unix)]
@@ -462,7 +585,8 @@ pub fn lock(path: &Path) -> Result<StateLock, Error> {
         fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))?;
         let mut acquired = false;
         for _ in 0..20 {
-            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            let mode = if shared { libc::LOCK_SH } else { libc::LOCK_EX };
+            let result = unsafe { libc::flock(file.as_raw_fd(), mode | libc::LOCK_NB) };
             if result == 0 {
                 acquired = true;
                 break;

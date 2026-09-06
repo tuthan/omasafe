@@ -20,6 +20,7 @@ pub const ENFORCEMENT_POLICY_SCHEMA_VERSION: &str = "omasafe.enforcement-policy.
 pub const ENFORCEMENT_POLICY_VERSION: u32 = 1;
 pub const OVERRIDE_SCHEMA_VERSION: &str = "omasafe.override.v1";
 pub const ENFORCEMENT_AUDIT_SCHEMA_VERSION: &str = "omasafe.enforcement-audit.v1";
+pub const ENFORCEMENT_SUMMARY_SCHEMA_VERSION: &str = "omasafe.enforcement-summary.v1";
 
 /// H7's precision threshold for promoting a rule family into hardened
 /// blocking. The threshold is intentionally strict: one false positive or an
@@ -402,6 +403,26 @@ pub struct EnforcementDecision {
     pub audit_event_id: String,
     pub evaluated_at: String,
     pub native_install_not_interposed: bool,
+}
+
+/// Compact typed summary shared by installed scans and inventory. It carries
+/// only the fields rendered by the bar widget; full decisions remain in state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnforcementSummaryDecision {
+    pub plugin_id: String,
+    pub evaluation_state: EvaluationState,
+    pub outcome: EnforcementOutcome,
+    pub authorization_basis: Option<AuthorizationBasis>,
+    pub evaluated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnforcementSummary {
+    pub schema: String,
+    pub available: bool,
+    pub decisions: Vec<EnforcementSummaryDecision>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// A durable record of an enforcement attempt. The CLI writes this at the

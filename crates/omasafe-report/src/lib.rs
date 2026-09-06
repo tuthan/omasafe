@@ -3,6 +3,7 @@ use serde::Serialize;
 pub mod acquisition;
 pub mod analysis;
 pub mod enforcement;
+pub mod scan;
 
 pub const SCHEMA_VERSION: &str = "omasafe.report.v1";
 

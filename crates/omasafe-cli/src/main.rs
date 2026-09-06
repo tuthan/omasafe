@@ -1,12 +1,16 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{IsTerminal, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+use omasafe_core::scan_snapshot::{
+    self, CachedEnforcementDecision, CachedEnforcementSummary, CachedScanAlert, ContextFingerprint,
+    Fingerprint, ScanProfile, ScanSnapshot, SnapshotRead,
+};
 use omasafe_core::{TOOL_VERSION, paths::XdgPaths};
 use omasafe_marketplace::{
     Correlation, MAX_CATALOG_BYTES, OFFICIAL_REPOSITORY, correlate, fetch_pinned_catalog,
@@ -16,7 +20,7 @@ use omasafe_plugin_trust::{
     DiffResult, SourceIdentity,
     baseline::{
         EnforcementHistory, OverrideHistory, ReviewDecision, ScanState, TrustHistory, TrustRecord,
-        UpdateFlowRecord, lock as lock_state,
+        UpdateFlowRecord, lock as lock_state, lock_shared as lock_state_shared,
     },
     collect, collect_one, git_diff, omarchy_bar_use_default, omarchy_plugin_disable,
     omarchy_plugin_enable, omarchy_plugin_update, query_shell, source_identity,
@@ -27,9 +31,11 @@ use omasafe_report::acquisition::{
     InstallVerb as AcquisitionInstallVerb,
 };
 use omasafe_report::enforcement::{
-    AuthorizationBasis, EnforcementAuditEvent, EnforcementEvaluation, EnforcementMode,
-    EnforcementOutcome, EnforcementPolicy, OVERRIDE_SCHEMA_VERSION, OverrideBinding,
+    AuthorizationBasis, ENFORCEMENT_SUMMARY_SCHEMA_VERSION, EnforcementAuditEvent,
+    EnforcementEvaluation, EnforcementMode, EnforcementOutcome, EnforcementPolicy,
+    EnforcementSummary, EnforcementSummaryDecision, OVERRIDE_SCHEMA_VERSION, OverrideBinding,
 };
+use omasafe_report::scan::{CachePersistence, ScanAlert, ScanResult};
 use sha2::{Digest, Sha256};
 
 fn main() {
@@ -52,10 +58,12 @@ fn main() {
 /// OmaSafe's flows.
 const INTERRUPTED_EXIT_CODE: i32 = 130;
 const SCHEDULE_SCHEMA_VERSION: &str = "omasafe.schedule.v1";
-const ENFORCEMENT_SUMMARY_SCHEMA_VERSION: &str = "omasafe.enforcement-summary.v1";
 const DEFAULT_SCAN_MEMORY_LIMIT_MB: u64 = 768;
 const SCHEDULE_PROCESS_BUDGET: Duration = Duration::from_secs(5);
 const SCHEDULE_PROCESS_OUTPUT_CAP: usize = 64 * 1024;
+const ANALYSIS_CACHE_SCHEMA_VERSION: &str = "omasafe.analysis-cache.v1";
+const ANALYSIS_CACHE_MAX_BYTES: usize = 2 * 1024 * 1024;
+const ANALYSIS_CACHE_MAX_READ_BYTES: usize = ANALYSIS_CACHE_MAX_BYTES + 1;
 
 fn interrupted(context: &str) -> Box<dyn std::error::Error> {
     format!("interrupted: {context}").into()
@@ -200,8 +208,18 @@ fn run(args: Vec<String>) -> Result<i32, Box<dyn std::error::Error>> {
                 0
             }
         }
+        [command, subcommand, rest @ ..] if command == "scan-cache" && subcommand == "show" => {
+            scan_cache_show(rest)?;
+            0
+        }
         [command, subcommand, rest @ ..] if command == "schedule" && subcommand == "install" => {
             schedule_install(rest)?;
+            0
+        }
+        [command, subcommand, rest @ ..]
+            if command == "schedule" && (subcommand == "uninstall" || subcommand == "disable") =>
+        {
+            schedule_uninstall(rest)?;
             0
         }
         [command, subcommand, rest @ ..] if command == "schedule" && subcommand == "status" => {
@@ -230,7 +248,7 @@ fn run(args: Vec<String>) -> Result<i32, Box<dyn std::error::Error>> {
         [command, rest @ ..] if command == "scan-plugin" => scan_plugin(rest)?,
         _ => {
             eprintln!(
-                "usage: omasafe-cli plugins ... | scan [--format text|json] [--notify] [--only-new] | marketplace refresh [--commit COMMIT|--latest] | rules list [--format text|json] | rules coverage [--format text|json] | rules explain RULE_ID [--format text|json] | plugins analyze PLUGIN_ID [--format text|json] [--fail-on SEVERITY] | plugins enable PLUGIN_ID [--policy advisory|hardened] [--format text|json] | plugins review-update PLUGIN_ID [--expected-commit SHA] [--yes] [--policy advisory|hardened] | plugins enforcement-status PLUGIN_ID [--format text|json] | plugins override create PLUGIN_ID --rule RULE_ID [--rule RULE_ID ...] --commit SHA --reason TEXT --expires TIMESTAMP | plugins override list [--format text|json] | scan-plugin (--path DIR|--git URL [--revision COMMIT]|--request TEXT|--marketplace PLUGIN_ID) [--plugin-id PLUGIN_ID] [--report-profile full|review] [--format text|json] [--fail-on SEVERITY] | schedule install [--policy advisory|hardened] | schedule status [--format text|json] | paths | provenance [--format text|json]"
+                "usage: omasafe-cli plugins ... | scan [--format text|json] [--notify] [--only-new] [--include-analysis] | scan-cache show [--profile installed-basic|installed-analysis] [--validate] [--format text|json] | marketplace refresh [--commit COMMIT|--latest] | rules list [--format text|json] | rules coverage [--format text|json] | rules explain RULE_ID [--format text|json] | plugins analyze PLUGIN_ID [--format text|json] [--refresh|--cached] [--fail-on SEVERITY] | plugins enable PLUGIN_ID [--policy advisory|hardened] [--format text|json] | plugins review-update PLUGIN_ID [--expected-commit SHA] [--yes] [--policy advisory|hardened] | plugins enforcement-status PLUGIN_ID [--format text|json] | plugins override create PLUGIN_ID --rule RULE_ID [--rule RULE_ID ...] --commit SHA --reason TEXT --expires TIMESTAMP | plugins override list [--format text|json] | scan-plugin (--path DIR|--git URL [--revision COMMIT]|--request TEXT|--marketplace PLUGIN_ID) [--plugin-id PLUGIN_ID] [--report-profile full|review] [--format text|json] [--fail-on SEVERITY] | schedule install [--policy advisory|hardened] | schedule uninstall | schedule status [--format text|json] | paths | provenance [--format text|json]"
             );
             std::process::exit(2);
         }
@@ -2601,27 +2619,6 @@ fn bounded_git(dir: Option<&Path>, args: &[&str]) -> Result<String, String> {
     }
 }
 
-#[derive(Clone, serde::Serialize)]
-struct ScanAlert {
-    plugin_id: String,
-    kind: String,
-    /// The confidence/impact level of the signal, not a claim that a plugin is safe.
-    /// v0.1 emits review-needed warnings; later analysis can emit critical findings.
-    severity: String,
-    message: String,
-    post_change: bool,
-}
-
-#[derive(serde::Serialize)]
-struct ScanResult {
-    alerts: Vec<ScanAlert>,
-    quiet: bool,
-    outstanding: usize,
-    new: usize,
-    highest_severity: String,
-    post_change_detection: bool,
-}
-
 fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
     let mut format = "text";
     let mut notify = false;
@@ -2655,8 +2652,27 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
     if include_analysis {
         apply_scan_memory_limit()?;
     }
+    let profile = if include_analysis {
+        ScanProfile::InstalledAnalysis
+    } else {
+        ScanProfile::InstalledBasic
+    };
     let paths = XdgPaths::discover()?;
-    paths.ensure()?;
+    paths.ensure_scan_roots()?;
+    let mut cache_warning = paths.ensure_cache().err().map(|error| {
+        format!("cache paths unavailable; scan continued without a snapshot: {error}")
+    });
+    let generation = if cache_warning.is_none() {
+        match scan_snapshot::reserve_generation(&paths, profile) {
+            Ok(generation) => Some(generation),
+            Err(error) => {
+                cache_warning = Some(format!("generation reservation unavailable: {error}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
     let plugin_root = plugin_root()?;
     let (shell_json, shell_error) = query_shell();
     let mut inventory = collect(&plugin_root, shell_json.as_deref());
@@ -2681,16 +2697,18 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
     };
     let state_path = paths.state.join("scan-state.json");
     let _state_lock = lock_state(&state_path)?;
+    let mut state_recovered = false;
     let mut state = match ScanState::load(&state_path) {
         Ok(state) => state,
         Err(error) => {
             let corrupt = state_path.with_extension(format!("corrupt-{}", now_nanos()));
             let _ = std::fs::rename(&state_path, corrupt);
             eprintln!("omasafe: scan state was corrupt and has been reset: {error}");
+            state_recovered = true;
             ScanState::default()
         }
     };
-    let mut alerts = Vec::new();
+    let mut all_alerts = Vec::new();
     let mut new_alerts = Vec::new();
     let mut live_keys = BTreeSet::new();
     let mut highest_severity = "none".to_owned();
@@ -2698,9 +2716,11 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
         let key = "coverage:trust-history".to_owned();
         live_keys.insert(key.clone());
         let alert = ScanAlert {
+            key: key.clone(),
             plugin_id: "trust-history".into(),
             kind: "lost-coverage".into(),
             severity: "warning".into(),
+            reason_code: "trust-history".into(),
             message: "trust history was corrupt and quarantined; baselines require recovery".into(),
             post_change: false,
         };
@@ -2713,9 +2733,7 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
             notify_user(&alert);
             state.record(key, now());
         }
-        if !only_new || is_new {
-            alerts.push(alert);
-        }
+        all_alerts.push(alert);
     }
     for plugin in &inventory.plugins {
         // Backups are retained in inventory for audit visibility but are not
@@ -2730,9 +2748,11 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
             let key = format!("coverage:{}", plugin.id);
             live_keys.insert(key.clone());
             let alert = ScanAlert {
+                key: key.clone(),
                 plugin_id: plugin.id.clone(),
                 kind: "lost-coverage".into(),
                 severity: "warning".into(),
+                reason_code: "plugin-unscannable".into(),
                 message: "plugin can no longer be scanned".into(),
                 post_change: false,
             };
@@ -2747,18 +2767,18 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
                     state.record(key, now());
                 }
             }
-            if !only_new || is_new {
-                alerts.push(alert);
-            }
+            all_alerts.push(alert);
             continue;
         }
         if !plugin.limitations.is_empty() && !is_excluded(&history, &plugin.id, "lost-coverage") {
             let key = format!("partial:{}", plugin.id);
             live_keys.insert(key.clone());
             let alert = ScanAlert {
+                key: key.clone(),
                 plugin_id: plugin.id.clone(),
                 kind: "lost-coverage".into(),
                 severity: "warning".into(),
+                reason_code: "partial-coverage".into(),
                 message: format!(
                     "plugin coverage is partial: {}",
                     plugin.limitations.join(", ")
@@ -2774,9 +2794,7 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
                 notify_user(&alert);
                 state.record(key, now());
             }
-            if !only_new || is_new {
-                alerts.push(alert);
-            }
+            all_alerts.push(alert);
         }
         let trusted = history.latest(&plugin.id).map(|record| &record.accepted);
         let current = SourceIdentity {
@@ -2796,9 +2814,11 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
             let key = drift_key(&plugin.id, trusted, &current);
             live_keys.insert(key.clone());
             let alert = ScanAlert {
+                key: key.clone(),
                 plugin_id: plugin.id.clone(),
                 kind: "source-drift".into(),
                 severity: "warning".into(),
+                reason_code: "source-drift".into(),
                 message: if is_acknowledged(&history, &plugin.id, "source-drift") {
                     "installed source differs from the trusted baseline; previously acknowledged, review remains available"
                 } else {
@@ -2815,9 +2835,7 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
                 notify_user(&alert);
                 state.record(key, now());
             }
-            if !only_new || is_new {
-                alerts.push(alert);
-            }
+            all_alerts.push(alert);
         }
     }
     for trusted in history
@@ -2836,9 +2854,11 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
                 continue;
             }
             let alert = ScanAlert {
+                key: key.clone(),
                 plugin_id: trusted.plugin_id.clone(),
                 kind: "missing-plugin".into(),
                 severity: "warning".into(),
+                reason_code: "missing-plugin".into(),
                 message: "trusted plugin is missing or unavailable".into(),
                 post_change: true,
             };
@@ -2851,9 +2871,7 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
                 notify_user(&alert);
                 state.record(key, now());
             }
-            if !only_new || is_new {
-                alerts.push(alert);
-            }
+            all_alerts.push(alert);
         }
     }
     if inventory
@@ -2866,9 +2884,11 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
         live_keys.insert(key.clone());
         let is_new = state.is_new(&key);
         let alert = ScanAlert {
+            key: key.clone(),
             plugin_id: "inventory".into(),
             kind: "lost-coverage".into(),
             severity: "warning".into(),
+            reason_code: "inventory".into(),
             message: "inventory coverage is limited; review the scan report".into(),
             post_change: false,
         };
@@ -2880,9 +2900,7 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
             notify_user(&alert);
             state.record(key, now());
         }
-        if !only_new || is_new {
-            alerts.push(alert);
-        }
+        all_alerts.push(alert);
     }
     for (key, plugin_id, kind, message) in [(
         "bar:replacement",
@@ -2894,9 +2912,11 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
             let key = key.to_owned();
             live_keys.insert(key.clone());
             let alert = ScanAlert {
+                key: key.clone(),
                 plugin_id: plugin_id.to_owned(),
                 kind: kind.to_owned(),
                 severity: "warning".into(),
+                reason_code: "bar-replacement".into(),
                 message: message.to_owned(),
                 post_change: false,
             };
@@ -2909,15 +2929,14 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
                 notify_user(&alert);
                 state.record(key, now());
             }
-            if !only_new || is_new {
-                alerts.push(alert);
-            }
+            all_alerts.push(alert);
         }
     }
     if inventory.bar_conflict {
         let key = "bar:conflict".to_owned();
         live_keys.insert(key.clone());
         let alert = ScanAlert {
+            key: key.clone(),
             plugin_id: inventory
                 .active_full_bars
                 .first()
@@ -2925,6 +2944,7 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
                 .unwrap_or_else(|| "bar".into()),
             kind: "provenance-conflict".into(),
             severity: "warning".into(),
+            reason_code: "provenance-conflict".into(),
             message: format!(
                 "multiple active full-bar plugins are present: {}",
                 inventory.active_full_bars.join(", ")
@@ -2940,20 +2960,25 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
             notify_user(&alert);
             state.record(key, now());
         }
-        if !only_new || is_new {
-            alerts.push(alert);
-        }
+        all_alerts.push(alert);
     }
-    if let Some(snapshot) = load_cached_catalog(&paths.cache)? {
+    let marketplace_snapshot = if cache_warning.is_some() {
+        None
+    } else {
+        load_cached_catalog(&paths.cache)?
+    };
+    if let Some(snapshot) = marketplace_snapshot.as_ref() {
         let stale = timestamp_age_seconds(&snapshot.retrieved_at)
             .is_some_and(|age| age > 30 * 24 * 60 * 60);
         if !snapshot.verified || stale {
             let key = "coverage:marketplace-cache".to_owned();
             live_keys.insert(key.clone());
             let alert = ScanAlert {
+                key: key.clone(),
                 plugin_id: "marketplace".into(),
                 kind: "lost-coverage".into(),
                 severity: "warning".into(),
+                reason_code: "marketplace".into(),
                 message: if !snapshot.verified {
                     "cached marketplace snapshot could not be re-verified".into()
                 } else {
@@ -2970,24 +2995,24 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
                 notify_user(&alert);
                 state.record(key, now());
             }
-            if !only_new || is_new {
-                alerts.push(alert);
-            }
+            all_alerts.push(alert);
         }
         for plugin in &inventory.plugins {
             let correlation = correlate(
                 &plugin.id,
                 plugin.repository.as_deref(),
                 plugin.head.as_deref(),
-                &snapshot,
+                snapshot,
             );
             if correlation.status == "conflict" {
                 let key = format!("provenance:{}", plugin.id);
                 live_keys.insert(key.clone());
                 let alert = ScanAlert {
+                    key: key.clone(),
                     plugin_id: plugin.id.clone(),
                     kind: "provenance-conflict".into(),
                     severity: "warning".into(),
+                    reason_code: "provenance-conflict".into(),
                     message: "installed repository conflicts with the marketplace claim".into(),
                     post_change: false,
                 };
@@ -3000,9 +3025,7 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
                     notify_user(&alert);
                     state.record(key, now());
                 }
-                if !only_new || is_new {
-                    alerts.push(alert);
-                }
+                all_alerts.push(alert);
             }
         }
     }
@@ -3038,7 +3061,7 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
                     notify,
                     only_new,
                     &mut live_keys,
-                    &mut alerts,
+                    &mut all_alerts,
                     &mut new_alerts,
                     &mut state,
                     &mut highest_severity,
@@ -3068,7 +3091,7 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
                         notify,
                         only_new,
                         &mut live_keys,
-                        &mut alerts,
+                        &mut all_alerts,
                         &mut new_alerts,
                         &mut state,
                         &mut highest_severity,
@@ -3155,7 +3178,7 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
                         notify,
                         only_new,
                         &mut live_keys,
-                        &mut alerts,
+                        &mut all_alerts,
                         &mut new_alerts,
                         &mut state,
                         &mut highest_severity,
@@ -3190,7 +3213,7 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
                         notify,
                         only_new,
                         &mut live_keys,
-                        &mut alerts,
+                        &mut all_alerts,
                         &mut new_alerts,
                         &mut state,
                         &mut highest_severity,
@@ -3211,7 +3234,7 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
                         notify,
                         only_new,
                         &mut live_keys,
-                        &mut alerts,
+                        &mut all_alerts,
                         &mut new_alerts,
                         &mut state,
                         &mut highest_severity,
@@ -3234,7 +3257,7 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
                             notify,
                             only_new,
                             &mut live_keys,
-                            &mut alerts,
+                            &mut all_alerts,
                             &mut new_alerts,
                             &mut state,
                             &mut highest_severity,
@@ -3254,7 +3277,7 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
                     notify,
                     only_new,
                     &mut live_keys,
-                    &mut alerts,
+                    &mut all_alerts,
                     &mut new_alerts,
                     &mut state,
                     &mut highest_severity,
@@ -3294,13 +3317,58 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
     if notify || analysis_events_dirty {
         state.write_atomic_locked(&state_path)?;
     }
+    let enforcement_summary = enforcement_inventory_summary(&inventory.plugins);
+    let override_context = OverrideHistory::load(&paths.state.join("enforcement-overrides.json"))
+        .ok()
+        .and_then(|history| serde_json::to_value(history).ok())
+        .unwrap_or_else(|| serde_json::json!({"invalid": true}));
+    let canonical_alerts = normalize_alerts(all_alerts);
+    let rendered_alerts = if only_new {
+        normalize_alerts(new_alerts.clone())
+    } else {
+        canonical_alerts.clone()
+    };
+    let generated_at = now();
+    if let Some(generation) = generation
+        && !history_recovered
+        && !state_recovered
+    {
+        let persistence = build_and_persist_snapshot(SnapshotBuild {
+            paths: &paths,
+            profile,
+            generation,
+            generated_at: &generated_at,
+            inventory: &inventory,
+            history: &history,
+            marketplace: marketplace_snapshot.as_ref(),
+            enforcement_summary: &enforcement_summary,
+            override_value: &override_context,
+            alerts: &canonical_alerts,
+            new_count: new_alerts.len(),
+        });
+        if let Err(reason) = persistence {
+            cache_warning = Some(reason);
+        }
+    } else if generation.is_some() {
+        cache_warning = Some("scan context state was recovered; previous snapshot retained".into());
+    }
     let result = ScanResult {
-        quiet: live_keys.is_empty(),
+        quiet: live_keys.is_empty() && !enforcement_summary_has_blocks(&enforcement_summary),
         outstanding: live_keys.len(),
         new: new_alerts.len(),
         highest_severity: highest_severity.clone(),
         post_change_detection: true,
-        alerts,
+        alerts: rendered_alerts,
+        enforcement_summary,
+        cache_persistence: Some(CachePersistence {
+            state: if cache_warning.is_some() {
+                "unavailable"
+            } else {
+                "persisted"
+            }
+            .into(),
+            reason: cache_warning,
+        }),
     };
     let has_findings = if only_new {
         result.new > 0
@@ -3310,7 +3378,7 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
     if format == "json" {
         println!(
             "{}",
-            serde_json::to_string_pretty(&Report::new(TOOL_VERSION, now(), result))?
+            serde_json::to_string_pretty(&Report::new(TOOL_VERSION, generated_at, result))?
         );
     } else if result.quiet || (only_new && result.alerts.is_empty()) {
         println!("No new actionable changes detected.");
@@ -3320,6 +3388,549 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
         }
     }
     Ok(has_findings)
+}
+
+fn scan_cache_show(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut profile = ScanProfile::InstalledAnalysis;
+    let mut validate = false;
+    let mut format = "text";
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--profile" => {
+                profile = next_value(args, index, "scan cache profile")?.parse()?;
+                index += 2;
+            }
+            "--validate" => {
+                validate = true;
+                index += 1;
+            }
+            "--format" => {
+                format = next_value(args, index, "scan cache format")?;
+                index += 2;
+            }
+            value => return Err(format!("unknown scan-cache argument: {value}").into()),
+        }
+    }
+    if !matches!(format, "text" | "json") {
+        return Err(format!("unsupported format: {format}").into());
+    }
+    let paths = XdgPaths::discover()?;
+    paths.ensure()?;
+    let read = scan_snapshot::read_snapshot(&paths, profile)
+        .unwrap_or_else(|error| SnapshotRead::Corrupt(format!("cache could not be read: {error}")));
+    let (state, stale, stale_reasons, snapshot, limitation) = match read {
+        SnapshotRead::Missing => ("missing", false, Vec::new(), None, None),
+        SnapshotRead::Incompatible(reason) => (
+            "incompatible",
+            true,
+            vec!["incompatible".into()],
+            None,
+            Some(reason),
+        ),
+        SnapshotRead::Corrupt(reason) => {
+            ("corrupt", true, vec!["corrupt".into()], None, Some(reason))
+        }
+        SnapshotRead::Loaded(snapshot) if !validate => (
+            "cached-unvalidated",
+            true,
+            vec!["unvalidated".into()],
+            Some(*snapshot),
+            None,
+        ),
+        SnapshotRead::Loaded(snapshot) => {
+            let validated = validate_cached_snapshot(&paths, profile, &snapshot);
+            let (state, reasons, limitation) = match validated {
+                Ok(reasons) if reasons.is_empty() => ("cached-valid", reasons, None),
+                Ok(reasons) => ("cached-stale", reasons, None),
+                Err((reason, limitation)) => ("cached-unvalidated", vec![reason], Some(limitation)),
+            };
+            (state, true, reasons, Some(*snapshot), limitation)
+        }
+    };
+    let value = serde_json::json!({
+        "schema": scan_snapshot::CACHE_RESULT_SCHEMA,
+        "state": state,
+        "stale": stale,
+        "stale_reasons": stale_reasons,
+        "scan_profile": profile,
+        "generation": snapshot.as_ref().map(|value| value.generation),
+        "generated_at": snapshot.as_ref().map(|value| value.generated_at.clone()),
+        "valid_until": snapshot.as_ref().and_then(|value| value.valid_until.clone()),
+        "alerts": snapshot.as_ref().map_or_else(Vec::new, |value| value.alerts.clone()),
+        "outstanding": snapshot.as_ref().map_or(0, |value| value.alerts.len()),
+        "new": 0,
+        "highest_severity": snapshot.as_ref().map_or("none".into(), |value| value.alerts.iter().max_by_key(|alert| alert_severity_rank(&alert.severity)).map_or("none".into(), |alert| alert.severity.clone())),
+        "quiet": snapshot.as_ref().is_none_or(|value| value.alerts.is_empty() && value.enforcement_summary.decisions.iter().all(|decision| decision.outcome != "block")),
+        "enforcement_summary": snapshot.as_ref().map(|value| value.enforcement_summary.clone()),
+        "snapshot": snapshot,
+        "limitation": limitation,
+    });
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&Report::new(TOOL_VERSION, now(), value))?
+        );
+    } else {
+        match state {
+            "missing" => println!("No cached result (profile: {})", profile.as_str()),
+            "incompatible" => println!("Cached result requires a compatible CLI"),
+            "corrupt" => println!("Cached result unreadable"),
+            "cached-valid" => println!(
+                "Cached · validated · scanned {}",
+                snapshot
+                    .as_ref()
+                    .map_or("unknown", |value| value.generated_at.as_str())
+            ),
+            "cached-stale" => println!(
+                "Cached · stale · scanned {}",
+                snapshot
+                    .as_ref()
+                    .map_or("unknown", |value| value.generated_at.as_str())
+            ),
+            _ => println!(
+                "Cached · scanned {}",
+                snapshot
+                    .as_ref()
+                    .map_or("unknown", |value| value.generated_at.as_str())
+            ),
+        }
+        if let Some(limitation) = value["limitation"].as_str() {
+            println!("Limitation: {}", safe_text(limitation));
+        }
+    }
+    Ok(())
+}
+
+fn validate_cached_snapshot(
+    paths: &XdgPaths,
+    profile: ScanProfile,
+    snapshot: &ScanSnapshot,
+) -> Result<Vec<String>, (String, String)> {
+    let plugin_root =
+        plugin_root().map_err(|error| ("state-input-invalid".into(), error.to_string()))?;
+    let before = validation_witness(paths, &plugin_root);
+    let content_before = plugin_content_witness(&plugin_root);
+    let (shell_json, shell_error) = query_shell();
+    let mut inventory = collect(&plugin_root, shell_json.as_deref());
+    if let Some(error) = shell_error {
+        inventory.coverage.limitations.push(error);
+    }
+
+    let history_path = paths.state.join("trust-history.json");
+    let history = {
+        let _lock = lock_state_shared(&history_path)
+            .map_err(|error| validation_lock_error(error.to_string()))?;
+        TrustHistory::load_bounded(&history_path)
+            .map_err(|error| validation_state_error(error.to_string()))?
+    };
+    let enforcement_path = paths.state.join("enforcement-history.json");
+    let enforcement_history = {
+        let _lock = lock_state_shared(&enforcement_path)
+            .map_err(|error| validation_lock_error(error.to_string()))?;
+        EnforcementHistory::load_bounded(&enforcement_path)
+            .map_err(|error| validation_state_error(error.to_string()))?
+    };
+    let override_path = paths.state.join("enforcement-overrides.json");
+    let override_value = {
+        let _lock = lock_state_shared(&override_path)
+            .map_err(|error| validation_lock_error(error.to_string()))?;
+        let overrides = OverrideHistory::load_bounded(&override_path)
+            .map_err(|error| validation_state_error(error.to_string()))?;
+        serde_json::to_value(overrides)
+            .map_err(|error| validation_state_error(error.to_string()))?
+    };
+    let marketplace = load_cached_catalog(&paths.cache)
+        .map_err(|error| validation_state_error(error.to_string()))?;
+    let enforcement_summary =
+        enforcement_summary_from_history(&inventory.plugins, &enforcement_history);
+    let (inventory_fingerprint, context_fingerprint, _) = scan_context_fingerprints(
+        &inventory,
+        &history,
+        marketplace.as_ref(),
+        &enforcement_summary,
+        &override_value,
+        profile,
+    );
+    let after = validation_witness(paths, &plugin_root);
+    let content_after = plugin_content_witness(&plugin_root);
+    if before != after || content_before != content_after {
+        return Err((
+            "context-changed-during-validation".into(),
+            "the installed, nested plugin, or state context changed while it was being observed"
+                .into(),
+        ));
+    }
+    let mut reasons = Vec::new();
+    if snapshot.inventory_fingerprint.digest != inventory_fingerprint.digest {
+        reasons.push("inventory-changed".into());
+    }
+    for (component, reason) in [
+        ("trust", "trust-changed"),
+        ("marketplace", "marketplace-changed"),
+        ("analysis_policy", "analysis-policy-changed"),
+        ("enforcement", "enforcement-changed"),
+        ("runtime", "runtime-changed"),
+    ] {
+        if snapshot.scan_context_fingerprint.components.get(component)
+            != context_fingerprint.components.get(component)
+        {
+            reasons.push(reason.into());
+        }
+    }
+    if snapshot
+        .valid_until
+        .as_deref()
+        .is_some_and(is_timestamp_expired)
+    {
+        reasons.push("expired".into());
+    }
+    if earliest_override_expiry(&override_value)
+        .as_deref()
+        .is_some_and(is_timestamp_expired)
+    {
+        reasons.push("expired".into());
+    }
+    reasons.sort();
+    reasons.dedup();
+    Ok(reasons)
+}
+
+fn validation_lock_error(error: String) -> (String, String) {
+    if error.contains("busy") {
+        (
+            "state-lock-busy".into(),
+            "state is busy; validation was deferred".into(),
+        )
+    } else {
+        (
+            "state-input-invalid".into(),
+            "state could not be read for validation".into(),
+        )
+    }
+}
+
+fn validation_state_error(error: String) -> (String, String) {
+    (
+        "state-input-invalid".into(),
+        bounded_cache_text(&format!("state input is unavailable: {error}")),
+    )
+}
+
+fn validation_witness(paths: &XdgPaths, plugin_root: &Path) -> String {
+    let mut witness = Vec::new();
+    for path in [
+        plugin_root.to_path_buf(),
+        paths.state.join("trust-history.json"),
+        paths.state.join("enforcement-history.json"),
+        paths.state.join("enforcement-overrides.json"),
+        paths.cache.join("catalog.json"),
+        paths.cache.join("catalog.meta.json"),
+    ] {
+        let value = fs::symlink_metadata(&path).ok().map(|metadata| {
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |duration| duration.as_nanos());
+            format!(
+                "{}:{}:{}",
+                metadata.len(),
+                modified,
+                metadata.file_type().is_dir()
+            )
+        });
+        witness.push((path.display().to_string(), value));
+    }
+    serde_json::to_string(&witness).unwrap_or_default()
+}
+
+/// The top-level plugin directory mtime does not change when a file is edited
+/// in place. Keep the cheap metadata witness above for state races, but pair it
+/// with the same bounded content inventory used by scan snapshots so a nested
+/// plugin mutation between the two validation observations cannot be reported
+/// as `cached-valid`.
+fn plugin_content_witness(plugin_root: &Path) -> String {
+    let inventory = collect(plugin_root, None);
+    let value = inventory_fingerprint_value(&inventory);
+    scan_snapshot::canonical_digest("validation-plugin-content", "v1", &value)
+}
+
+fn is_timestamp_expired(timestamp: &str) -> bool {
+    parse_timestamp_seconds(timestamp).is_some_and(|value| value <= unix_now())
+}
+
+fn normalize_alerts(mut alerts: Vec<ScanAlert>) -> Vec<ScanAlert> {
+    alerts.sort_by(|left, right| {
+        alert_severity_rank(&right.severity)
+            .cmp(&alert_severity_rank(&left.severity))
+            .then_with(|| left.plugin_id.cmp(&right.plugin_id))
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    let mut keys = BTreeSet::new();
+    alerts.retain(|alert| keys.insert(alert.key.clone()));
+    alerts
+}
+
+fn cached_alert(alert: &ScanAlert) -> CachedScanAlert {
+    let reason_code = if scan_snapshot::known_reason_code_for_cli(&alert.reason_code) {
+        alert.reason_code.clone()
+    } else {
+        stable_reason_code(&alert.kind)
+    };
+    CachedScanAlert {
+        key: alert.key.clone(),
+        plugin_id: bounded_cache_text(&alert.plugin_id),
+        kind: bounded_cache_text(&alert.kind),
+        severity: bounded_cache_text(&alert.severity),
+        reason_code: reason_code.clone(),
+        message: stable_cache_message(&reason_code),
+        post_change: alert.post_change,
+    }
+}
+
+fn stable_cache_message(reason_code: &str) -> String {
+    match reason_code {
+        "source-drift" => "installed source differs from the trusted baseline; review is required",
+        "missing-plugin" => "trusted plugin is missing or unavailable",
+        "bar-replacement" => "a non-built-in full-bar plugin replaces the OmaSafe bar widget",
+        "provenance-conflict" => "installed repository conflicts with the marketplace claim",
+        "analysis" => "analysis reported a changed capability or finding; review is required",
+        "trust-history" => "trust history coverage is unavailable; baselines require recovery",
+        "plugin-unscannable" => "plugin can no longer be scanned",
+        "inventory" => "inventory coverage is limited; review the scan report",
+        _ => "plugin scan coverage is partial; review the scan report",
+    }
+    .into()
+}
+
+fn bounded_cache_text(value: &str) -> String {
+    value
+        .chars()
+        .take(scan_snapshot::MAX_CACHED_STRING_BYTES / 4)
+        .collect()
+}
+
+fn enforcement_summary_for_cache(summary: &EnforcementSummary) -> CachedEnforcementSummary {
+    CachedEnforcementSummary {
+        schema: summary.schema.clone(),
+        available: summary.available,
+        decisions: summary
+            .decisions
+            .iter()
+            .map(|decision| CachedEnforcementDecision {
+                plugin_id: bounded_cache_text(&decision.plugin_id),
+                evaluation_state: match decision.evaluation_state {
+                    omasafe_report::enforcement::EvaluationState::Evaluated => "evaluated".into(),
+                    omasafe_report::enforcement::EvaluationState::NotEvaluated => {
+                        "not-evaluated".into()
+                    }
+                },
+                outcome: decision.outcome.as_str().into(),
+                authorization_basis: decision.authorization_basis.map(|basis| match basis {
+                    AuthorizationBasis::Policy => "policy".into(),
+                    AuthorizationBasis::Override => "override".into(),
+                }),
+                evaluated_at: decision.evaluated_at.clone(),
+            })
+            .collect(),
+        error: summary
+            .error
+            .as_ref()
+            .map(|_| "enforcement history is unavailable".into()),
+    }
+}
+
+struct SnapshotBuild<'a> {
+    paths: &'a XdgPaths,
+    profile: ScanProfile,
+    generation: u64,
+    generated_at: &'a str,
+    inventory: &'a omasafe_plugin_trust::Inventory,
+    history: &'a TrustHistory,
+    marketplace: Option<&'a omasafe_marketplace::CatalogSnapshot>,
+    enforcement_summary: &'a EnforcementSummary,
+    override_value: &'a serde_json::Value,
+    alerts: &'a [ScanAlert],
+    new_count: usize,
+}
+
+fn build_and_persist_snapshot(input: SnapshotBuild<'_>) -> Result<(), String> {
+    let (inventory_fingerprint, context_fingerprint, valid_until) = scan_context_fingerprints(
+        input.inventory,
+        input.history,
+        input.marketplace,
+        input.enforcement_summary,
+        input.override_value,
+        input.profile,
+    );
+    let snapshot = ScanSnapshot {
+        schema: scan_snapshot::SNAPSHOT_SCHEMA.into(),
+        report_schema: scan_snapshot::REPORT_SCHEMA.into(),
+        producer_cli_version: TOOL_VERSION.into(),
+        generation: input.generation,
+        generated_at: input.generated_at.into(),
+        valid_until,
+        scan_profile: input.profile,
+        inventory_fingerprint,
+        scan_context_fingerprint: context_fingerprint,
+        alerts: input.alerts.iter().map(cached_alert).collect(),
+        new_at_generation: input.new_count,
+        enforcement_summary: enforcement_summary_for_cache(input.enforcement_summary),
+    };
+    let bytes = serde_json::to_vec(&snapshot)
+        .map_err(|error| format!("snapshot serialization failed: {error}"))?;
+    if bytes.len() > scan_snapshot::MAX_SNAPSHOT_BYTES {
+        return Err("snapshot exceeds the bounded cache size".into());
+    }
+    scan_snapshot::replace_snapshot(input.paths, input.profile, input.generation, &bytes)
+        .map(|_| ())
+        .map_err(|error| format!("snapshot persistence failed: {error}"))
+}
+
+fn scan_context_fingerprints(
+    inventory: &omasafe_plugin_trust::Inventory,
+    history: &TrustHistory,
+    marketplace: Option<&omasafe_marketplace::CatalogSnapshot>,
+    enforcement_summary: &EnforcementSummary,
+    override_value: &serde_json::Value,
+    profile: ScanProfile,
+) -> (Fingerprint, ContextFingerprint, Option<String>) {
+    let inventory_value = inventory_fingerprint_value(inventory);
+    let inventory_digest = scan_snapshot::canonical_digest("inventory", "v1", &inventory_value);
+    let inventory_fingerprint = Fingerprint {
+        schema: scan_snapshot::INVENTORY_FINGERPRINT_SCHEMA.into(),
+        digest: inventory_digest.clone(),
+    };
+    let trust_value = serde_json::to_value(history).unwrap_or_else(|_| serde_json::json!({}));
+    let marketplace_value = marketplace.map_or_else(
+        || serde_json::json!({"present": false}),
+        |snapshot| {
+            serde_json::json!({
+                "present": true,
+                "repository": snapshot.repository,
+                "repository_commit": snapshot.repository_commit,
+                "file_digest": snapshot.file_digest,
+                "retrieved_at": snapshot.retrieved_at,
+                "generation_time": snapshot.generation_time,
+                "verified": snapshot.verified,
+            })
+        },
+    );
+    let analysis_value = if profile == ScanProfile::InstalledAnalysis {
+        serde_json::to_value(omasafe_analyzer::policy_identity())
+            .unwrap_or_else(|_| serde_json::json!({"unavailable": true}))
+    } else {
+        serde_json::json!({"not_applicable": true})
+    };
+    let enforcement_value = serde_json::json!({
+        "summary": enforcement_summary,
+        "overrides": override_value,
+        "advisory_policy": EnforcementPolicy::new(EnforcementMode::Advisory).identity(),
+        "hardened_policy": EnforcementPolicy::new(EnforcementMode::Hardened).identity(),
+    });
+    let runtime_value = serde_json::json!({
+        "omarchy": "4.0.0-1",
+        "quickshell": "0.3.0",
+    });
+    let mut components = BTreeMap::new();
+    for (name, value) in [
+        ("inventory", inventory_value),
+        ("trust", trust_value),
+        ("marketplace", marketplace_value),
+        ("analysis_policy", analysis_value),
+        ("enforcement", enforcement_value),
+        ("runtime", runtime_value),
+    ] {
+        components.insert(
+            name.into(),
+            scan_snapshot::canonical_digest("scan-context", name, &value),
+        );
+    }
+    let component_value =
+        serde_json::to_value(&components).unwrap_or_else(|_| serde_json::json!({}));
+    let context_digest = scan_snapshot::canonical_digest("scan-context", "v1", &component_value);
+    let marketplace_valid_until = marketplace
+        .and_then(|snapshot| timestamp_plus_days(&snapshot.retrieved_at, 30))
+        .filter(|timestamp| timestamp.as_str() > "1970-01-01T00:00:00Z");
+    let valid_until = [
+        marketplace_valid_until,
+        earliest_override_expiry(override_value),
+    ]
+    .into_iter()
+    .flatten()
+    .min_by_key(|timestamp| parse_timestamp_seconds(timestamp).unwrap_or(i64::MAX));
+    (
+        inventory_fingerprint,
+        ContextFingerprint {
+            schema: scan_snapshot::CONTEXT_FINGERPRINT_SCHEMA.into(),
+            digest: context_digest,
+            components,
+        },
+        valid_until,
+    )
+}
+
+fn earliest_override_expiry(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("overrides")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|binding| {
+            let timestamp = binding.get("expires_at")?.as_str()?;
+            Some((parse_timestamp_seconds(timestamp)?, timestamp.to_owned()))
+        })
+        .min_by_key(|(seconds, _)| *seconds)
+        .map(|(_, timestamp)| timestamp)
+}
+
+fn inventory_fingerprint_value(inventory: &omasafe_plugin_trust::Inventory) -> serde_json::Value {
+    let plugins = inventory
+        .plugins
+        .iter()
+        .map(|plugin| {
+            let mut kinds = plugin.kinds.clone();
+            kinds.sort();
+            let mut limitations = plugin.limitations.clone();
+            limitations.sort();
+            serde_json::json!({
+                "id": plugin.id,
+                "classification": plugin.classification,
+                "enabled": plugin.enabled,
+                "active": plugin.active,
+                "first_party": plugin.first_party,
+                "kinds": kinds,
+                "repository": plugin.repository,
+                "head": plugin.head,
+                "tree": plugin.tree,
+                "dirty": plugin.dirty,
+                "content_digest": plugin.content_digest,
+                "content_file_count": plugin.content_file_count,
+                "classification_reason": plugin.classification_reason,
+                "limitations": limitations,
+                "file_digests": plugin.file_digests,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut active_full_bars = inventory.active_full_bars.clone();
+    active_full_bars.sort();
+    let mut limitations = inventory.coverage.limitations.clone();
+    limitations.sort();
+    serde_json::json!({
+        "plugins": plugins,
+        "active_full_bar": inventory.active_full_bar,
+        "active_full_bars": active_full_bars,
+        "bar_conflict": inventory.bar_conflict,
+        "non_builtin_bar_replaces_bar": inventory.non_builtin_bar_replaces_bar,
+        "coverage_limitations": limitations,
+    })
+}
+
+fn timestamp_plus_days(timestamp: &str, days: i64) -> Option<String> {
+    let seconds = parse_timestamp_seconds(timestamp)? + days * 86_400;
+    Some(format_timestamp(seconds))
 }
 
 /// Single ladder over both severity vocabularies OmaSafe emits: legacy alert
@@ -3356,7 +3967,7 @@ fn emit_scan_alert(
     message: String,
     post_change: bool,
     notify: bool,
-    only_new: bool,
+    _only_new: bool,
     live_keys: &mut BTreeSet<String>,
     alerts: &mut Vec<ScanAlert>,
     new_alerts: &mut Vec<ScanAlert>,
@@ -3365,9 +3976,11 @@ fn emit_scan_alert(
 ) {
     live_keys.insert(key.clone());
     let alert = ScanAlert {
+        key: key.clone(),
         plugin_id,
         kind: kind.to_owned(),
         severity: severity.to_owned(),
+        reason_code: stable_reason_code(kind),
         message,
         post_change,
     };
@@ -3380,9 +3993,24 @@ fn emit_scan_alert(
         notify_user(&alert);
         state.record(key, now());
     }
-    if !only_new || is_new {
-        alerts.push(alert);
+    alerts.push(alert);
+}
+
+fn stable_reason_code(kind: &str) -> String {
+    match kind {
+        "source-drift" => "source-drift",
+        "missing-plugin" => "missing-plugin",
+        "bar-replacement" => "bar-replacement",
+        "provenance-conflict" => "provenance-conflict",
+        "new-capability"
+        | "finding-regression"
+        | "analyzer-policy-update"
+        | "analyzer-improvement"
+        | "fingerprint-instability" => "analysis",
+        "lost-coverage" => "partial-coverage",
+        _ => "unknown",
     }
+    .to_owned()
 }
 
 fn notify_user(alert: &ScanAlert) {
@@ -3508,6 +4136,60 @@ fn schedule_install(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Disable and remove only the exact schedule units previously installed by
+/// OmaSafe. A matching metadata identity is the ownership proof; modified or
+/// foreign units are left intact and require manual review.
+fn schedule_uninstall(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(value) = args.first() {
+        return Err(format!("unknown schedule uninstall argument: {value}").into());
+    }
+    let paths = XdgPaths::discover()?;
+    let unit_dir = schedule_unit_dir()?;
+    let service_path = unit_dir.join("omasafe-scan.service");
+    let timer_path = unit_dir.join("omasafe-scan.timer");
+    let service_bytes = std::fs::read(&service_path).ok();
+    let timer_bytes = std::fs::read(&timer_path).ok();
+    if service_bytes.is_none() && timer_bytes.is_none() {
+        println!("Scheduled scan is not installed.");
+        return Ok(());
+    }
+    if service_bytes.is_none() || timer_bytes.is_none() {
+        return Err(
+            "refusing to remove an incomplete scheduled scan; inspect the user systemd units"
+                .into(),
+        );
+    }
+    let (metadata, metadata_error) = read_schedule_metadata(&paths.state.join("schedule.json"));
+    let metadata = metadata.ok_or_else(|| {
+        metadata_error.unwrap_or_else(|| "schedule ownership metadata is missing".to_owned())
+    })?;
+    let identity = schedule_unit_identity(
+        service_bytes
+            .as_deref()
+            .expect("service bytes checked above"),
+        timer_bytes.as_deref().expect("timer bytes checked above"),
+    );
+    if metadata.service_unit != "omasafe-scan.service"
+        || metadata.timer_unit != "omasafe-scan.timer"
+        || metadata.unit_identity != identity
+    {
+        return Err(
+            "refusing to remove scheduled units whose OmaSafe ownership identity does not match"
+                .into(),
+        );
+    }
+
+    run_bounded_systemctl(&["--user", "disable", "--now", "omasafe-scan.timer"])
+        .map_err(|error| format!("systemd user timer disable failed: {error}"))?;
+    run_bounded_systemctl(&["--user", "daemon-reload"])
+        .map_err(|error| format!("systemd user daemon-reload failed: {error}"))?;
+    remove_schedule_file(&service_path)?;
+    remove_schedule_file(&timer_path)?;
+    remove_schedule_file(&paths.state.join("schedule.json"))?;
+    println!("Disabled and removed the OmaSafe scheduled scan.");
+    Ok(())
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ScheduleMetadata {
     schema: String,
@@ -3524,10 +4206,13 @@ struct ScheduleExecution {
     available: bool,
     timer_active_state: Option<String>,
     timer_sub_state: Option<String>,
+    timer_next_run: Option<String>,
+    timer_last_trigger: Option<String>,
     service_active_state: Option<String>,
     service_sub_state: Option<String>,
     service_exit_code: Option<i32>,
     service_finished_at: Option<String>,
+    service_result: String,
     error: Option<String>,
 }
 
@@ -3574,6 +4259,29 @@ fn write_schedule_metadata(
     Ok(())
 }
 
+fn read_schedule_metadata(path: &Path) -> (Option<ScheduleMetadata>, Option<String>) {
+    match std::fs::read_to_string(path) {
+        Ok(text) => match serde_json::from_str::<ScheduleMetadata>(&text) {
+            Ok(metadata) if metadata.schema == SCHEDULE_SCHEMA_VERSION => (Some(metadata), None),
+            Ok(_) => (
+                None,
+                Some("schedule metadata schema is unsupported".to_owned()),
+            ),
+            Err(_) => (None, Some("schedule metadata is malformed".to_owned())),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
+        Err(_) => (None, Some("schedule metadata is unreadable".to_owned())),
+    }
+}
+
+fn remove_schedule_file(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Runs one systemd query/mutation under the same process-group and bounded
 /// output runner used by Git. A timeout, spawn failure, truncated stream, or
 /// non-success exit is unavailable/failure; no caller may treat partial
@@ -3606,32 +4314,27 @@ fn run_bounded_systemctl(
     }
 }
 
-fn read_systemd_properties(unit: &str) -> Result<BTreeSet<(String, String)>, String> {
-    let output = run_bounded_systemctl(&[
-        "--user",
-        "show",
-        unit,
-        "--no-pager",
-        "--property=ActiveState,SubState,ExecMainStatus,ExecMainExitTimestamp",
-    ])
-    .map_err(|error| format!("systemd user status is unavailable: {error}"))?;
+fn read_systemd_properties(
+    unit: &str,
+    required_properties: &[&str],
+) -> Result<BTreeSet<(String, String)>, String> {
+    let property_arg = format!("--property={}", required_properties.join(","));
+    let output =
+        run_bounded_systemctl(&["--user", "show", unit, "--no-pager", property_arg.as_str()])
+            .map_err(|error| format!("systemd user status for {unit} is unavailable: {error}"))?;
     let mut properties = BTreeSet::new();
     for line in String::from_utf8_lossy(&output.stdout).lines().take(32) {
         if let Some((key, value)) = line.split_once('=') {
             properties.insert((key.to_owned(), value.chars().take(256).collect()));
         }
     }
-    const REQUIRED_PROPERTIES: [&str; 4] = [
-        "ActiveState",
-        "SubState",
-        "ExecMainStatus",
-        "ExecMainExitTimestamp",
-    ];
-    if !REQUIRED_PROPERTIES
+    if !required_properties
         .iter()
         .all(|key| properties.iter().any(|(name, _)| name == key))
     {
-        return Err("systemd user status is unavailable: incomplete systemctl output".to_owned());
+        return Err(format!(
+            "systemd user status for {unit} is unavailable: incomplete systemctl output"
+        ));
     }
     Ok(properties)
 }
@@ -3645,8 +4348,20 @@ fn systemd_property(properties: &BTreeSet<(String, String)>, key: &str) -> Optio
 }
 
 fn schedule_execution() -> ScheduleExecution {
-    let timer = read_systemd_properties("omasafe-scan.timer");
-    let service = read_systemd_properties("omasafe-scan.service");
+    const TIMER_PROPERTIES: [&str; 4] = [
+        "ActiveState",
+        "SubState",
+        "NextElapseUSecRealtime",
+        "LastTriggerUSec",
+    ];
+    const SERVICE_PROPERTIES: [&str; 4] = [
+        "ActiveState",
+        "SubState",
+        "ExecMainStatus",
+        "ExecMainExitTimestamp",
+    ];
+    let timer = read_systemd_properties("omasafe-scan.timer", &TIMER_PROPERTIES);
+    let service = read_systemd_properties("omasafe-scan.service", &SERVICE_PROPERTIES);
     let error = timer.as_ref().err().or(service.as_ref().err()).cloned();
     let timer_properties = timer.ok();
     let service_properties = service.ok();
@@ -3655,6 +4370,17 @@ fn schedule_execution() -> ScheduleExecution {
         .as_ref()
         .and_then(|properties| systemd_property(properties, "ExecMainStatus"))
         .and_then(|value| value.parse::<i32>().ok());
+    let service_finished_at = service_properties
+        .as_ref()
+        .and_then(|properties| systemd_property(properties, "ExecMainExitTimestamp"));
+    let service_result = match (service_finished_at.is_some(), service_exit_code) {
+        (false, _) => "not-run",
+        (true, Some(0)) => "success",
+        (true, Some(3)) => "findings",
+        (true, Some(_)) => "failed",
+        (true, None) => "unknown",
+    }
+    .to_owned();
     ScheduleExecution {
         available,
         timer_active_state: timer_properties
@@ -3663,6 +4389,12 @@ fn schedule_execution() -> ScheduleExecution {
         timer_sub_state: timer_properties
             .as_ref()
             .and_then(|properties| systemd_property(properties, "SubState")),
+        timer_next_run: timer_properties
+            .as_ref()
+            .and_then(|properties| systemd_property(properties, "NextElapseUSecRealtime")),
+        timer_last_trigger: timer_properties
+            .as_ref()
+            .and_then(|properties| systemd_property(properties, "LastTriggerUSec")),
         service_active_state: service_properties
             .as_ref()
             .and_then(|properties| systemd_property(properties, "ActiveState")),
@@ -3670,9 +4402,8 @@ fn schedule_execution() -> ScheduleExecution {
             .as_ref()
             .and_then(|properties| systemd_property(properties, "SubState")),
         service_exit_code,
-        service_finished_at: service_properties
-            .as_ref()
-            .and_then(|properties| systemd_property(properties, "ExecMainExitTimestamp")),
+        service_finished_at,
+        service_result,
         error,
     }
 }
@@ -3691,18 +4422,7 @@ fn schedule_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         _ => None,
     };
     let metadata_path = paths.state.join("schedule.json");
-    let (metadata, metadata_error) = match std::fs::read_to_string(&metadata_path) {
-        Ok(text) => match serde_json::from_str::<ScheduleMetadata>(&text) {
-            Ok(metadata) if metadata.schema == SCHEDULE_SCHEMA_VERSION => (Some(metadata), None),
-            Ok(_) => (
-                None,
-                Some("schedule metadata schema is unsupported".to_owned()),
-            ),
-            Err(_) => (None, Some("schedule metadata is malformed".to_owned())),
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
-        Err(_) => (None, Some("schedule metadata is unreadable".to_owned())),
-    };
+    let (metadata, metadata_error) = read_schedule_metadata(&metadata_path);
     let metadata_consistent = metadata.as_ref().is_some_and(|metadata| {
         installed
             && unit_identity.as_deref() == Some(metadata.unit_identity.as_str())
@@ -3761,14 +4481,22 @@ fn schedule_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 println!("Last execution: unavailable ({error})");
             } else {
                 println!(
-                    "Last execution: {} (exit {})",
+                    "Last execution: {} ({}; exit {})",
                     execution
                         .service_finished_at
                         .as_deref()
                         .unwrap_or("not recorded"),
+                    execution.service_result,
                     execution
                         .service_exit_code
                         .map_or_else(|| "unknown".to_owned(), |code| code.to_string())
+                );
+                println!(
+                    "Next scheduled run: {}",
+                    execution
+                        .timer_next_run
+                        .as_deref()
+                        .unwrap_or("not recorded")
                 );
             }
         }
@@ -4430,47 +5158,59 @@ fn diff(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 fn enforcement_inventory_summary(
     plugins: &[omasafe_plugin_trust::PluginRecord],
-) -> serde_json::Value {
+) -> EnforcementSummary {
     let path = match XdgPaths::discover() {
         Ok(paths) => paths.state.join("enforcement-history.json"),
         Err(_) => {
-            return serde_json::json!({
-                "schema": ENFORCEMENT_SUMMARY_SCHEMA_VERSION,
-                "available": false,
-                "decisions": [],
-                "error": "enforcement history is unavailable"
-            });
+            return unavailable_enforcement_summary();
         }
     };
     let history = match EnforcementHistory::load(&path) {
         Ok(history) => history,
         Err(_) => {
-            return serde_json::json!({
-                "schema": ENFORCEMENT_SUMMARY_SCHEMA_VERSION,
-                "available": false,
-                "decisions": [],
-                "error": "enforcement history is unavailable"
-            });
+            return unavailable_enforcement_summary();
         }
     };
+    enforcement_summary_from_history(plugins, &history)
+}
+
+fn enforcement_summary_has_blocks(summary: &EnforcementSummary) -> bool {
+    summary
+        .decisions
+        .iter()
+        .any(|decision| decision.outcome == EnforcementOutcome::Block)
+}
+
+fn enforcement_summary_from_history(
+    plugins: &[omasafe_plugin_trust::PluginRecord],
+    history: &EnforcementHistory,
+) -> EnforcementSummary {
     let decisions = plugins
         .iter()
         .filter_map(|plugin| history.latest(&plugin.id))
-        .map(|decision| {
-            serde_json::json!({
-                "plugin_id": decision.plugin_id,
-                "evaluation_state": decision.evaluation_state,
-                "outcome": decision.outcome,
-                "authorization_basis": decision.authorization_basis,
-                "evaluated_at": decision.evaluated_at
-            })
+        .map(|decision| EnforcementSummaryDecision {
+            plugin_id: decision.plugin_id.clone(),
+            evaluation_state: decision.evaluation_state,
+            outcome: decision.outcome,
+            authorization_basis: decision.authorization_basis,
+            evaluated_at: decision.evaluated_at.clone(),
         })
         .collect::<Vec<_>>();
-    serde_json::json!({
-        "schema": ENFORCEMENT_SUMMARY_SCHEMA_VERSION,
-        "available": true,
-        "decisions": decisions
-    })
+    EnforcementSummary {
+        schema: ENFORCEMENT_SUMMARY_SCHEMA_VERSION.to_owned(),
+        available: true,
+        decisions,
+        error: None,
+    }
+}
+
+fn unavailable_enforcement_summary() -> EnforcementSummary {
+    EnforcementSummary {
+        schema: ENFORCEMENT_SUMMARY_SCHEMA_VERSION.to_owned(),
+        available: false,
+        decisions: Vec::new(),
+        error: Some("enforcement history is unavailable".into()),
+    }
 }
 
 fn parse_diff_args(args: &[String]) -> Result<(&str, Option<String>), Box<dyn std::error::Error>> {
@@ -4711,17 +5451,17 @@ fn inventory(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 "marketplace_stale".into(),
                 serde_json::Value::Bool(marketplace_stale),
             );
-            value
-                .as_object_mut()
-                .unwrap()
-                .insert("enforcement_summary".into(), enforcement_summary.clone());
+            value.as_object_mut().unwrap().insert(
+                "enforcement_summary".into(),
+                serde_json::to_value(&enforcement_summary)?,
+            );
             value
         } else {
             let mut value = serde_json::to_value(&result)?;
-            value
-                .as_object_mut()
-                .unwrap()
-                .insert("enforcement_summary".into(), enforcement_summary.clone());
+            value.as_object_mut().unwrap().insert(
+                "enforcement_summary".into(),
+                serde_json::to_value(&enforcement_summary)?,
+            );
             value
         };
         let report = Report::new(TOOL_VERSION, now(), output);
@@ -5018,6 +5758,8 @@ fn rules_explain(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
 fn plugins_analyze(id: &str, args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     let mut format = "text";
     let mut fail_on = None;
+    let mut refresh = false;
+    let mut cached_only = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -5030,15 +5772,31 @@ fn plugins_analyze(id: &str, args: &[String]) -> Result<i32, Box<dyn std::error:
                 fail_on = Some(value.to_owned());
                 index += 2;
             }
+            "--refresh" => {
+                refresh = true;
+                index += 1;
+            }
+            "--cached" => {
+                cached_only = true;
+                index += 1;
+            }
             value => return Err(format!("unknown analyze argument: {value}").into()),
         }
+    }
+    if refresh && cached_only {
+        return Err("--refresh and --cached cannot be used together".into());
     }
     if !matches!(format, "text" | "json") {
         return Err("analyze format must be text or json".into());
     }
+    if cached_only && format != "json" {
+        return Err("--cached requires --format json".into());
+    }
     interruption_checkpoint("before analysis started")?;
     let fail_on = parse_fail_on(fail_on)?;
     apply_scan_memory_limit()?;
+    let paths = XdgPaths::discover()?;
+    let cache_ready = paths.ensure_cache().is_ok();
     let plugin_root = plugin_root()?;
     let (shell_json, _shell_error) = query_shell();
     let inventory = collect_one(&plugin_root, id, shell_json.as_deref());
@@ -5054,6 +5812,32 @@ fn plugins_analyze(id: &str, args: &[String]) -> Result<i32, Box<dyn std::error:
         "path": record.path,
         "classification": record.classification,
     });
+    let source_identity = record
+        .content_digest
+        .as_deref()
+        .or(record.head.as_deref())
+        .or(record.tree.as_deref())
+        .unwrap_or("")
+        .to_owned();
+    let policy_identity =
+        serde_json::to_string(&serde_json::to_value(omasafe_analyzer::policy_identity())?)?;
+    let suppression_identity = suppression_cache_identity(&paths);
+    if !refresh
+        && cache_ready
+        && !source_identity.is_empty()
+        && let Some(cached) = read_analysis_cache(
+            &paths,
+            id,
+            &source_identity,
+            &policy_identity,
+            &suppression_identity,
+        )
+    {
+        return emit_cached_analysis_report(cached, target, format, fail_on);
+    }
+    if cached_only {
+        return Ok(1);
+    }
     let ingest_result = omasafe_analyzer::ingest_filesystem(
         Path::new(&record.path),
         omasafe_analyzer::Limits::default(),
@@ -5071,6 +5855,14 @@ fn plugins_analyze(id: &str, args: &[String]) -> Result<i32, Box<dyn std::error:
             fail_on,
             report_profile: "full",
             suppression_mode: SuppressionMode::Configured,
+            analysis_cache: (cache_ready && !source_identity.is_empty()).then_some(
+                AnalysisCacheWrite {
+                    paths: &paths,
+                    plugin_id: id,
+                    source_identity: &source_identity,
+                    suppression_identity: &suppression_identity,
+                },
+            ),
         },
     )
 }
@@ -5204,6 +5996,7 @@ fn scan_plugin(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
                     fail_on,
                     report_profile,
                     suppression_mode: SuppressionMode::CandidateUnsuppressed,
+                    analysis_cache: None,
                 },
             ),
             Err(omasafe_analyzer::IngestError::NotADirectory) => {
@@ -5386,6 +6179,7 @@ fn scan_plugin(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             fail_on,
             report_profile,
             suppression_mode: SuppressionMode::CandidateUnsuppressed,
+            analysis_cache: None,
         },
     )
 }
@@ -5523,6 +6317,200 @@ struct ReportOptions<'a> {
     fail_on: Option<omasafe_analyzer::Severity>,
     report_profile: &'a str,
     suppression_mode: SuppressionMode,
+    analysis_cache: Option<AnalysisCacheWrite<'a>>,
+}
+
+struct AnalysisCacheWrite<'a> {
+    paths: &'a XdgPaths,
+    plugin_id: &'a str,
+    source_identity: &'a str,
+    suppression_identity: &'a str,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct AnalysisCacheEntry {
+    schema: String,
+    plugin_id: String,
+    source_identity: String,
+    policy_identity: String,
+    suppression_identity: String,
+    result: serde_json::Value,
+}
+
+fn analysis_cache_path(paths: &XdgPaths, plugin_id: &str) -> PathBuf {
+    let digest = Sha256::digest(plugin_id.as_bytes());
+    paths
+        .cache
+        .join("analysis-snapshots")
+        .join(format!("{digest:x}.json"))
+}
+
+fn ensure_private_analysis_cache_dir(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(format!("{} is not a private cache directory", path.display()).into());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(path)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!("{} is not a private cache directory", path.display()).into());
+    }
+    #[cfg(unix)]
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+fn read_bounded_analysis_cache(path: &Path) -> Option<Vec<u8>> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > ANALYSIS_CACHE_MAX_READ_BYTES as u64
+    {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(ANALYSIS_CACHE_MAX_READ_BYTES as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() <= ANALYSIS_CACHE_MAX_BYTES).then_some(bytes)
+}
+
+fn suppression_cache_identity(paths: &XdgPaths) -> String {
+    let path = paths.config.join("suppressions.json");
+    match std::fs::read(&path) {
+        Ok(bytes) if bytes.len() <= ANALYSIS_CACHE_MAX_BYTES => {
+            format!("sha256:{:x}", Sha256::digest(bytes))
+        }
+        Ok(_) => "oversized".to_owned(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "missing".to_owned(),
+        Err(_) => "unreadable".to_owned(),
+    }
+}
+
+fn read_analysis_cache(
+    paths: &XdgPaths,
+    plugin_id: &str,
+    source_identity: &str,
+    policy_identity: &str,
+    suppression_identity: &str,
+) -> Option<serde_json::Value> {
+    let bytes = read_bounded_analysis_cache(&analysis_cache_path(paths, plugin_id))?;
+    let entry: AnalysisCacheEntry = serde_json::from_slice(&bytes).ok()?;
+    if entry.schema != ANALYSIS_CACHE_SCHEMA_VERSION
+        || entry.plugin_id != plugin_id
+        || entry.source_identity != source_identity
+        || entry.policy_identity != policy_identity
+        || entry.suppression_identity != suppression_identity
+    {
+        return None;
+    }
+    let result = entry.result;
+    (result["analysis"]["schema"] == "omasafe.analysis.v1").then_some(result)
+}
+
+fn persist_analysis_cache(
+    cache: &AnalysisCacheWrite<'_>,
+    result: &serde_json::Value,
+    policy_identity: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let entry = AnalysisCacheEntry {
+        schema: ANALYSIS_CACHE_SCHEMA_VERSION.to_owned(),
+        plugin_id: cache.plugin_id.to_owned(),
+        source_identity: cache.source_identity.to_owned(),
+        policy_identity: policy_identity.to_owned(),
+        suppression_identity: cache.suppression_identity.to_owned(),
+        result: result.clone(),
+    };
+    let bytes = serde_json::to_vec(&entry)?;
+    if bytes.len() > ANALYSIS_CACHE_MAX_BYTES {
+        return Ok(());
+    }
+    let directory = cache.paths.cache.join("analysis-snapshots");
+    ensure_private_analysis_cache_dir(&directory)?;
+    let path = analysis_cache_path(cache.paths, cache.plugin_id);
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = directory.join(format!(
+        ".{}.tmp-{}-{nonce}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("analysis"),
+        std::process::id()
+    ));
+    let write_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        #[cfg(unix)]
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, &path)?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    write_result
+}
+
+fn analysis_severity(value: &str) -> Option<omasafe_analyzer::Severity> {
+    match value {
+        "info" => Some(omasafe_analyzer::Severity::Info),
+        "low" => Some(omasafe_analyzer::Severity::Low),
+        "medium" => Some(omasafe_analyzer::Severity::Medium),
+        "high" => Some(omasafe_analyzer::Severity::High),
+        "critical" => Some(omasafe_analyzer::Severity::Critical),
+        _ => None,
+    }
+}
+
+fn analysis_threshold_breached(
+    result: &serde_json::Value,
+    threshold: Option<omasafe_analyzer::Severity>,
+) -> bool {
+    threshold.is_some_and(|threshold| {
+        result["analysis"]["findings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|finding| {
+                finding["severity"]
+                    .as_str()
+                    .and_then(analysis_severity)
+                    .is_some_and(|severity| severity >= threshold)
+            })
+    })
+}
+
+fn emit_cached_analysis_report(
+    mut result: serde_json::Value,
+    target: serde_json::Value,
+    format: &str,
+    fail_on: Option<omasafe_analyzer::Severity>,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    if format != "json" {
+        return Err("cached analysis requires --format json".into());
+    }
+    result["target"] = target;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&Report::new(TOOL_VERSION, now(), result.clone()))?
+    );
+    Ok(if analysis_threshold_breached(&result, fail_on) {
+        4
+    } else {
+        0
+    })
 }
 
 /// Digest-bound content readers, boxed per source at the emit boundary.
@@ -5803,17 +6791,9 @@ fn emit_analysis_report(
     // --fail-on: findings are success; CI opts into a failure threshold.
     // Suppressed findings are de-enforced, so the threshold only sees
     // visible findings. Exit code 4 (documented separately from scan's 3).
-    let severity_of = |value: &str| match value {
-        "info" => Some(omasafe_analyzer::Severity::Info),
-        "low" => Some(omasafe_analyzer::Severity::Low),
-        "medium" => Some(omasafe_analyzer::Severity::Medium),
-        "high" => Some(omasafe_analyzer::Severity::High),
-        "critical" => Some(omasafe_analyzer::Severity::Critical),
-        _ => None,
-    };
     let threshold_breached = options.fail_on.is_some_and(|threshold| {
         findings.iter().any(|finding| {
-            severity_of(&finding.severity).is_some_and(|severity| severity >= threshold)
+            analysis_severity(&finding.severity).is_some_and(|severity| severity >= threshold)
         })
     });
 
@@ -5826,33 +6806,39 @@ fn emit_analysis_report(
         "unreferenced": inventory.state_count(omasafe_analyzer::CoverageState::Unreferenced),
     });
 
+    let mut result = serde_json::json!({
+        "target": target.clone(),
+        "analysis": &analysis,
+        "suppressions": {
+            "policy": suppression_policy,
+            "consulted": consulted,
+            "applied": &applied_suppressions,
+            "reconfirmation_required": &suppression_reconfirmations,
+            "active_records": active_records,
+        },
+        "payload_inventory": {
+            "totals": {
+                "files_seen": inventory.total_files_seen,
+                "bytes_ingested": inventory.total_bytes_ingested,
+                "entries": inventory.entries.len(),
+            },
+            "coverage_states": &states,
+            "limitations": &inventory.limitations,
+            "entries": &inventory.entries,
+        },
+    });
+    if let Some(acquisition) = acquisition.as_ref() {
+        result["acquisition"] = serde_json::to_value(acquisition)?;
+    }
+    if options.report_profile == "review" {
+        apply_review_profile(&mut result)?;
+    }
     if options.format == "json" {
-        let mut result = serde_json::json!({
-            "target": target,
-            "analysis": analysis,
-            "suppressions": {
-                "policy": suppression_policy,
-                "consulted": consulted,
-                "applied": applied_suppressions,
-                "reconfirmation_required": suppression_reconfirmations,
-                "active_records": active_records,
-            },
-            "payload_inventory": {
-                "totals": {
-                    "files_seen": inventory.total_files_seen,
-                    "bytes_ingested": inventory.total_bytes_ingested,
-                    "entries": inventory.entries.len(),
-                },
-                "coverage_states": states,
-                "limitations": inventory.limitations,
-                "entries": inventory.entries,
-            },
-        });
-        if let Some(acquisition) = acquisition.as_ref() {
-            result["acquisition"] = serde_json::to_value(acquisition)?;
-        }
-        if options.report_profile == "review" {
-            apply_review_profile(&mut result)?;
+        if let Some(cache) = options.analysis_cache.as_ref() {
+            // Cache failures are deliberately non-fatal: the analysis result
+            // remains authoritative even when a cache directory is damaged or
+            // cannot be written.
+            let _ = persist_analysis_cache(cache, &result, &policy_identity_string);
         }
         println!(
             "{}",

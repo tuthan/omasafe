@@ -13,6 +13,7 @@ use omasafe_core::bounds::{
 
 /// Public re-export preserving the v0.1 API surface.
 pub use omasafe_core::bounds::MAX_DIFF_BYTES;
+pub const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 
 pub mod baseline;
 
@@ -241,25 +242,33 @@ fn register_active_bar(inventory: &mut Inventory, id: &str, non_builtin: bool) {
 }
 
 fn manifest_id(path: &Path) -> Option<String> {
-    let contents = fs::read(path.join("manifest.json")).ok()?;
+    let contents = read_bounded_file(&path.join("manifest.json"), MAX_MANIFEST_BYTES).ok()??;
     serde_json::from_slice::<Manifest>(&contents).ok()?.id
 }
 
 pub fn query_shell() -> (Option<String>, Option<String>) {
-    let output = Command::new("omarchy")
-        .args(["plugin", "list", "--json"])
-        .output();
+    let mut command = Command::new("omarchy");
+    command.args(["plugin", "list", "--json"]);
+    let output = omasafe_core::bounds::run_bounded_capped(
+        &mut command,
+        omasafe_core::bounds::GIT_PROCESS_BUDGET,
+        omasafe_core::bounds::MAX_PROCESS_OUTPUT_BYTES_PER_STREAM,
+    );
     match output {
-        Ok(output) if output.status.success() => (
+        Ok(Some(output)) if output.status.success() && !output.truncated => (
             Some(String::from_utf8_lossy(&output.stdout).into_owned()),
             None,
         ),
-        Ok(output) => (
+        Ok(Some(output)) => (
             None,
             Some(format!(
-                "omarchy plugin list --json failed with {}",
+                "omarchy plugin list --json failed or exceeded its bound ({})",
                 output.status
             )),
+        ),
+        Ok(None) => (
+            None,
+            Some("omarchy plugin list --json timed out or was interrupted".into()),
         ),
         Err(error) => (
             None,
@@ -329,8 +338,8 @@ fn inspect_plugin(path: &Path, name: &str, shell: Option<&ShellPlugin>) -> Plugi
     }
 
     let manifest_path = path.join("manifest.json");
-    let manifest = match fs::read_to_string(&manifest_path) {
-        Ok(contents) => match serde_json::from_str::<Manifest>(&contents) {
+    let manifest = match read_bounded_file(&manifest_path, MAX_MANIFEST_BYTES) {
+        Ok(Some(contents)) => match serde_json::from_slice::<Manifest>(&contents) {
             Ok(manifest) if manifest.schema_version == Some(1) && manifest.id.is_some() => manifest,
             Ok(_) => {
                 return with_reason(
@@ -340,6 +349,7 @@ fn inspect_plugin(path: &Path, name: &str, shell: Option<&ShellPlugin>) -> Plugi
             }
             Err(error) => return with_reason(base, &format!("manifest is malformed: {error}")),
         },
+        Ok(None) => return with_reason(base, "manifest is unavailable: file not found"),
         Err(error) => return with_reason(base, &format!("manifest is unavailable: {error}")),
     };
     let id = manifest.id.clone().unwrap_or_else(|| name.to_owned());
@@ -383,6 +393,38 @@ fn inspect_plugin(path: &Path, name: &str, shell: Option<&ShellPlugin>) -> Plugi
         record.classification_reason = Some(source.limitations.join(", "));
     }
     record
+}
+
+/// Reads an untrusted manifest with a size bound before allocating or
+/// deserializing it. Symlinks are metadata and never followed.
+fn read_bounded_file(path: &Path, cap: usize) -> std::io::Result<Option<Vec<u8>>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(std::io::Error::other("manifest is not a regular file"));
+    }
+    if metadata.len() > cap as u64 {
+        return Err(std::io::Error::other("manifest exceeds its byte bound"));
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = options.open(path)?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize + 1);
+    Read::by_ref(&mut file)
+        .take(cap as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > cap {
+        return Err(std::io::Error::other("manifest exceeds its byte bound"));
+    }
+    Ok(Some(bytes))
 }
 
 fn with_reason(mut record: PluginRecord, reason: &str) -> PluginRecord {

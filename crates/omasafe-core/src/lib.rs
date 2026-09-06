@@ -3,6 +3,7 @@ pub mod error;
 pub mod git;
 pub mod interrupt;
 pub mod paths;
+pub mod scan_snapshot;
 pub mod source;
 pub mod suppress;
 

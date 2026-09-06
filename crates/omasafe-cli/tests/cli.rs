@@ -550,7 +550,7 @@ fn schedule_status_reports_cli_owned_policy_and_systemd_result() {
     let systemctl = fixture.bin.path().join("systemctl");
     fs::write(
         &systemctl,
-        "#!/bin/sh\nif [ \"$2\" = \"show\" ]; then\n  printf '%s\\n' 'ActiveState=inactive' 'SubState=dead' 'ExecMainStatus=0' 'ExecMainExitTimestamp=Tue 2026-09-01 12:00:00 UTC'\nfi\nexit 0\n",
+        "#!/bin/sh\nif [ \"$2\" = \"show\" ]; then\n  printf '%s\\n' 'ActiveState=inactive' 'SubState=dead' 'ExecMainStatus=0' 'ExecMainExitTimestamp=Tue 2026-09-01 12:00:00 UTC' 'NextElapseUSecRealtime=Wed 2026-09-02 12:00:00 UTC' 'LastTriggerUSec=Tue 2026-09-01 12:00:00 UTC'\nfi\nexit 0\n",
     )
     .unwrap();
     fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
@@ -580,6 +580,113 @@ fn schedule_status_reports_cli_owned_policy_and_systemd_result() {
     assert_eq!(result["unit_identity"].as_str().unwrap().len(), 64);
     assert_eq!(result["last_known_execution"]["available"], true);
     assert_eq!(result["last_known_execution"]["service_exit_code"], 0);
+    assert_eq!(result["last_known_execution"]["service_result"], "success");
+}
+
+#[test]
+#[cfg(unix)]
+fn schedule_status_reports_next_run_and_failed_outcome() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let systemctl = fixture.bin.path().join("systemctl");
+    fs::write(
+        &systemctl,
+        "#!/bin/sh\nif [ \"$2\" = \"show\" ]; then\n  case \"$3\" in\n    omasafe-scan.timer) printf '%s\\n' 'ActiveState=active' 'SubState=waiting' 'NextElapseUSecRealtime=Wed 2026-09-02 12:00:00 UTC' 'LastTriggerUSec=Tue 2026-09-01 12:00:00 UTC' ;;\n    omasafe-scan.service) printf '%s\\n' 'ActiveState=inactive' 'SubState=dead' 'ExecMainStatus=1' 'ExecMainExitTimestamp=Tue 2026-09-01 12:00:00 UTC' ;;\n  esac\nfi\nexit 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+    fixture
+        .command()
+        .args(["schedule", "install"])
+        .assert()
+        .success();
+    let output = fixture
+        .command()
+        .args(["schedule", "status", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let execution = &report["result"]["last_known_execution"];
+    assert_eq!(execution["timer_next_run"], "Wed 2026-09-02 12:00:00 UTC");
+    assert_eq!(execution["service_result"], "failed");
+    assert_eq!(execution["service_exit_code"], 1);
+}
+
+#[test]
+#[cfg(unix)]
+fn schedule_uninstall_removes_only_owned_units_and_metadata() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let systemctl = fixture.bin.path().join("systemctl");
+    fs::write(
+        &systemctl,
+        "#!/bin/sh\nif [ \"$2\" = \"show\" ]; then\n  printf '%s\\n' 'ActiveState=inactive' 'SubState=dead' 'ExecMainStatus=0' 'ExecMainExitTimestamp='\nfi\nexit 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+    fixture
+        .command()
+        .args(["schedule", "install", "--policy", "hardened"])
+        .assert()
+        .success();
+    fixture
+        .command()
+        .args(["schedule", "uninstall"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Disabled and removed"));
+    assert!(
+        !fixture
+            .config
+            .path()
+            .join("systemd/user/omasafe-scan.service")
+            .exists()
+    );
+    assert!(
+        !fixture
+            .config
+            .path()
+            .join("systemd/user/omasafe-scan.timer")
+            .exists()
+    );
+    assert!(!fixture.state.path().join("omasafe/schedule.json").exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn schedule_uninstall_refuses_modified_units() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let systemctl = fixture.bin.path().join("systemctl");
+    fs::write(&systemctl, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+    fixture
+        .command()
+        .args(["schedule", "install"])
+        .assert()
+        .success();
+    let service_path = fixture
+        .config
+        .path()
+        .join("systemd/user/omasafe-scan.service");
+    let mut service = fs::read(&service_path).unwrap();
+    service.extend_from_slice(b"# local change\n");
+    fs::write(&service_path, service).unwrap();
+    fixture
+        .command()
+        .args(["schedule", "uninstall"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("ownership identity"));
+    assert!(service_path.exists());
+    assert!(
+        fixture
+            .config
+            .path()
+            .join("systemd/user/omasafe-scan.timer")
+            .exists()
+    );
 }
 
 #[test]
@@ -1114,6 +1221,108 @@ fn analyze_is_deterministic_for_unchanged_input() {
     let first: Value = serde_json::from_slice(&first).unwrap();
     let second: Value = serde_json::from_slice(&second).unwrap();
     assert_eq!(first["result"], second["result"]);
+}
+
+#[test]
+fn analyze_output_cache_survives_a_new_cli_process() {
+    let fixture = Fixture::new();
+    enrich_plugin(&fixture.plugin);
+    let first = fixture
+        .command()
+        .args([
+            "plugins",
+            "analyze",
+            "io.example.cli",
+            "--format",
+            "json",
+            "--refresh",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let cache_dir = fixture.cache.path().join("omasafe/analysis-snapshots");
+    let cache_entries: Vec<_> = fs::read_dir(&cache_dir).unwrap().flatten().collect();
+    assert_eq!(cache_entries.len(), 1);
+
+    let second = fixture
+        .command()
+        .args([
+            "plugins",
+            "analyze",
+            "io.example.cli",
+            "--format",
+            "json",
+            "--cached",
+        ])
+        .output()
+        .unwrap();
+    assert!(second.status.success());
+    let first: Value = serde_json::from_slice(&first).unwrap();
+    let second: Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(first["result"], second["result"]);
+}
+
+#[test]
+fn analyze_refresh_bypasses_a_matching_persistent_cache() {
+    let fixture = Fixture::new();
+    enrich_plugin(&fixture.plugin);
+    let first = fixture
+        .command()
+        .args([
+            "plugins",
+            "analyze",
+            "io.example.cli",
+            "--format",
+            "json",
+            "--refresh",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let first: Value = serde_json::from_slice(&first).unwrap();
+
+    // Keep the cache identity fields intact and corrupt only the cached result.
+    // A refresh must still ingest the installed files instead of returning this
+    // matching-but-stale entry.
+    let cache_dir = fixture.cache.path().join("omasafe/analysis-snapshots");
+    let cache_path = fs::read_dir(&cache_dir)
+        .unwrap()
+        .flatten()
+        .find(|entry| entry.path().extension().and_then(|value| value.to_str()) == Some("json"))
+        .expect("analysis cache entry")
+        .path();
+    let mut cache: Value = serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+    cache["result"]["analysis"]["analysis_fingerprint"] = Value::String("tampered".into());
+    fs::write(&cache_path, serde_json::to_vec(&cache).unwrap()).unwrap();
+
+    let refreshed = fixture
+        .command()
+        .args([
+            "plugins",
+            "analyze",
+            "io.example.cli",
+            "--format",
+            "json",
+            "--refresh",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let refreshed: Value = serde_json::from_slice(&refreshed).unwrap();
+    assert_ne!(
+        refreshed["result"]["analysis"]["analysis_fingerprint"],
+        "tampered"
+    );
+    assert_eq!(
+        refreshed["result"]["analysis"]["analysis_fingerprint"],
+        first["result"]["analysis"]["analysis_fingerprint"]
+    );
 }
 
 #[test]
@@ -5081,4 +5290,438 @@ fn rejected_candidate_request_does_not_create_analysis_cache() {
             "paste only the GitHub repository URL",
         ));
     assert!(!fixture.cache.path().join("omasafe/analysis").exists());
+}
+
+#[test]
+fn scan_cache_is_cli_owned_profiled_and_generation_bound() {
+    let fixture = Fixture::new();
+    let scan = fixture
+        .command()
+        .args(["scan", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(scan.status.code(), Some(3));
+    let live: Value = serde_json::from_slice(&scan.stdout).unwrap();
+    let path = fixture
+        .cache
+        .path()
+        .join("omasafe/scan-snapshots/installed-basic.json");
+    assert!(path.is_file());
+    let snapshot: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(snapshot["schema"], "omasafe.scan-snapshot.v1");
+    assert_eq!(snapshot["scan_profile"], "installed-basic");
+    assert_eq!(
+        snapshot["alerts"].as_array().unwrap().len(),
+        live["result"]["outstanding"].as_u64().unwrap() as usize
+    );
+    assert!(snapshot["cache_persistence"].is_null());
+
+    let hydrated = fixture
+        .command()
+        .args([
+            "scan-cache",
+            "show",
+            "--profile",
+            "installed-basic",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(hydrated.status.success());
+    let hydrated: Value = serde_json::from_slice(&hydrated.stdout).unwrap();
+    assert_eq!(hydrated["result"]["state"], "cached-unvalidated");
+    assert_eq!(hydrated["result"]["stale_reasons"][0], "unvalidated");
+    assert_eq!(hydrated["result"]["generation"], snapshot["generation"]);
+
+    let validated = fixture
+        .command()
+        .args([
+            "scan-cache",
+            "show",
+            "--profile",
+            "installed-basic",
+            "--validate",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(validated.status.success());
+    let validated: Value = serde_json::from_slice(&validated.stdout).unwrap();
+    assert_eq!(validated["result"]["state"], "cached-valid");
+    assert_eq!(validated["result"]["generation"], snapshot["generation"]);
+}
+
+#[test]
+fn expired_override_bounds_cached_snapshot_validity() {
+    let fixture = Fixture::new();
+    let overrides = serde_json::json!({
+        "schema_version": 1,
+        "overrides": [{
+            "schema": "omasafe.override.v1",
+            "plugin_id": "io.example.cli",
+            "commit": "a".repeat(40),
+            "tree": null,
+            "content_digest": "digest",
+            "analyzer_policy_identity": omasafe_analyzer::policy_identity(),
+            "enforcement_policy_identity": "test-policy",
+            "rule_ids": ["oma.test.rule"],
+            "coverage_limitations": [],
+            "reason": "expired fixture authorization",
+            "created_at": "2020-01-01T00:00:00Z",
+            "expires_at": "2020-01-02T00:00:00Z"
+        }]
+    });
+    fs::create_dir_all(fixture.state.path().join("omasafe")).unwrap();
+    fs::write(
+        fixture
+            .state
+            .path()
+            .join("omasafe/enforcement-overrides.json"),
+        serde_json::to_vec(&overrides).unwrap(),
+    )
+    .unwrap();
+
+    fixture.command().args(["scan"]).assert().code(3);
+    let snapshot: Value = serde_json::from_slice(
+        &fs::read(
+            fixture
+                .cache
+                .path()
+                .join("omasafe/scan-snapshots/installed-basic.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(snapshot["valid_until"], "2020-01-02T00:00:00Z");
+
+    let output = fixture
+        .command()
+        .args([
+            "scan-cache",
+            "show",
+            "--profile",
+            "installed-basic",
+            "--validate",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["result"]["state"], "cached-stale");
+    assert!(
+        report["result"]["stale_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason == "expired")
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn live_scan_reports_enforcement_blocks_as_non_quiet() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    let omarchy = fixture.bin.path().join("omarchy");
+    fs::write(
+        &omarchy,
+        "#!/bin/sh\nprintf '%s' '[{\"id\":\"io.example.cli\",\"enabled\":false,\"active\":false,\"firstParty\":false,\"clonedFrom\":\"https://example.test/plugin.git\",\"kinds\":[\"bar-widget\"]}]'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&omarchy, fs::Permissions::from_mode(0o755)).unwrap();
+    fixture.trust_current();
+    let decision = omasafe_report::enforcement::EnforcementDecision {
+        schema: omasafe_report::enforcement::ENFORCEMENT_SCHEMA_VERSION.into(),
+        plugin_id: "io.example.cli".into(),
+        operation: "enable".into(),
+        evaluation_state: omasafe_report::enforcement::EvaluationState::Evaluated,
+        outcome: omasafe_report::enforcement::EnforcementOutcome::Block,
+        authorization_basis: Some(omasafe_report::enforcement::AuthorizationBasis::Policy),
+        installed_tree_postconditions_passed: false,
+        reason_codes: vec!["blocking-rule-family".into()],
+        blocking_rule_ids: vec!["oma.test.rule".into()],
+        coverage_counts: Default::default(),
+        coverage_limitations: Vec::new(),
+        commit: None,
+        tree: None,
+        content_digest: None,
+        analyzer_policy_identity: None,
+        enforcement_policy_identity: "test-policy".into(),
+        override_binding: None,
+        audit_event_id: "test-audit".into(),
+        evaluated_at: "2026-09-04T00:00:00Z".into(),
+        native_install_not_interposed: true,
+    };
+    let mut history = omasafe_plugin_trust::baseline::EnforcementHistory::default();
+    history.record_decision(decision);
+    let history_path = fixture
+        .state
+        .path()
+        .join("omasafe/enforcement-history.json");
+    fs::create_dir_all(history_path.parent().unwrap()).unwrap();
+    fs::write(&history_path, serde_json::to_vec(&history).unwrap()).unwrap();
+
+    let output = fixture
+        .command()
+        .args(["scan", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["result"]["quiet"], false);
+    assert_eq!(report["result"]["outstanding"], 0);
+    assert_eq!(
+        report["result"]["enforcement_summary"]["decisions"][0]["outcome"],
+        "block"
+    );
+}
+
+#[test]
+fn only_new_scan_does_not_persist_a_filtered_alert_set() {
+    let fixture = Fixture::new();
+    fixture.trust_current();
+    fs::write(
+        fixture.plugin.join("main.qml"),
+        "Item { property bool changed: true }\n",
+    )
+    .unwrap();
+    let full = fixture
+        .command()
+        .args(["scan", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(full.status.code(), Some(3));
+    let full: Value = serde_json::from_slice(&full.stdout).unwrap();
+    let filtered = fixture
+        .command()
+        .args(["scan", "--only-new", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(filtered.status.code(), Some(3));
+    let filtered: Value = serde_json::from_slice(&filtered.stdout).unwrap();
+    let snapshot: Value = serde_json::from_slice(
+        &fs::read(
+            fixture
+                .cache
+                .path()
+                .join("omasafe/scan-snapshots/installed-basic.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        snapshot["alerts"].as_array().unwrap().len(),
+        full["result"]["alerts"].as_array().unwrap().len()
+    );
+    assert!(!filtered["result"]["alerts"].as_array().unwrap().is_empty());
+}
+
+#[test]
+#[cfg(unix)]
+fn scan_snapshot_files_are_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let _ = fixture.command().args(["scan"]).output().unwrap();
+    let cache = fixture.cache.path().join("omasafe");
+    let snapshots = cache.join("scan-snapshots");
+    assert_eq!(
+        fs::metadata(&cache).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(&snapshots).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    for name in [
+        "installed-basic.json",
+        "installed-basic.generation",
+        "installed-basic.lock",
+    ] {
+        assert_eq!(
+            fs::metadata(snapshots.join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+}
+
+#[test]
+fn cache_persistence_failure_is_additive_to_scan_result() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.cache.path().join("omasafe"),
+        b"cache-root-is-not-a-directory",
+    )
+    .unwrap();
+    let output = fixture
+        .command()
+        .args(["scan", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["result"]["cache_persistence"]["state"],
+        "unavailable"
+    );
+    assert!(
+        report["result"]["cache_persistence"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("without a snapshot"))
+    );
+}
+
+#[test]
+fn cache_profiles_are_independent_and_corruption_is_non_quarantining() {
+    let fixture = Fixture::new();
+    fixture.command().args(["scan"]).assert().code(3);
+    let analysis_scan = fixture
+        .command()
+        .args(["scan", "--include-analysis"])
+        .output()
+        .unwrap();
+    assert!(matches!(analysis_scan.status.code(), Some(0 | 3)));
+    let snapshots = fixture.cache.path().join("omasafe/scan-snapshots");
+    let basic: Value =
+        serde_json::from_slice(&fs::read(snapshots.join("installed-basic.json")).unwrap()).unwrap();
+    let analysis: Value =
+        serde_json::from_slice(&fs::read(snapshots.join("installed-analysis.json")).unwrap())
+            .unwrap();
+    assert_eq!(basic["scan_profile"], "installed-basic");
+    assert_eq!(analysis["scan_profile"], "installed-analysis");
+
+    fs::write(
+        snapshots.join("installed-basic.json"),
+        br#"{"schema":"omasafe.scan-snapshot.v1","schema":"duplicate"}"#,
+    )
+    .unwrap();
+    let output = fixture
+        .command()
+        .args([
+            "scan-cache",
+            "show",
+            "--profile",
+            "installed-basic",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["result"]["state"], "corrupt");
+    assert!(snapshots.join("installed-basic.json").exists());
+}
+
+#[test]
+fn cache_validation_reports_inventory_mutation_without_rewriting_snapshot() {
+    let fixture = Fixture::new();
+    fixture.command().args(["scan"]).assert().code(3);
+    let path = fixture
+        .cache
+        .path()
+        .join("omasafe/scan-snapshots/installed-basic.json");
+    let before = fs::read(&path).unwrap();
+    fs::write(fixture.plugin.join("lifecycle-probe.qml"), "Item {}\n").unwrap();
+    let output = fixture
+        .command()
+        .args([
+            "scan-cache",
+            "show",
+            "--profile",
+            "installed-basic",
+            "--validate",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["result"]["state"], "cached-stale");
+    assert!(
+        report["result"]["stale_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason == "inventory-changed")
+    );
+    assert_eq!(before, fs::read(&path).unwrap());
+}
+
+#[test]
+fn cache_validation_detects_in_place_nested_plugin_mutation() {
+    let fixture = Fixture::new();
+    fixture.command().args(["scan"]).assert().code(3);
+    let path = fixture
+        .cache
+        .path()
+        .join("omasafe/scan-snapshots/installed-basic.json");
+    let before = fs::read(&path).unwrap();
+
+    // Keep the directory entry unchanged: only the contents of an existing
+    // nested source file are edited.
+    fs::write(
+        fixture.plugin.join("main.qml"),
+        "Item { property bool changed: true }\n",
+    )
+    .unwrap();
+    let output = fixture
+        .command()
+        .args([
+            "scan-cache",
+            "show",
+            "--profile",
+            "installed-basic",
+            "--validate",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["result"]["state"], "cached-stale");
+    assert!(
+        report["result"]["stale_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason == "inventory-changed")
+    );
+    assert_eq!(before, fs::read(&path).unwrap());
+}
+
+#[test]
+fn cache_validation_never_quarantines_malformed_state() {
+    let fixture = Fixture::new();
+    fixture.command().args(["scan"]).assert().code(3);
+    let state_path = fixture.state.path().join("omasafe/trust-history.json");
+    fs::write(&state_path, b"{ malformed state").unwrap();
+    let output = fixture
+        .command()
+        .args([
+            "scan-cache",
+            "show",
+            "--profile",
+            "installed-basic",
+            "--validate",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["result"]["state"], "cached-unvalidated");
+    assert_eq!(report["result"]["stale_reasons"][0], "state-input-invalid");
+    assert_eq!(fs::read(&state_path).unwrap(), b"{ malformed state");
 }

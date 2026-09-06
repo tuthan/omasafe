@@ -2919,6 +2919,52 @@ scripts/determinism-canary.sh                            # exit 0
 git diff --check                                         # clean
 ```
 
+## v0.2.3 — CLI-owned installed-scan caching
+
+Status: **implementation complete; release gates pending clean-VM access**
+
+Implemented:
+
+- Profile-specific `installed-basic` and `installed-analysis` snapshots with
+  schema/version checks, monotonic generation reservation, private locks,
+  atomic `0600` replacement, bounded reads, duplicate-key rejection, and
+  symlink/ownership/size validation.
+- `scan-cache show` with explicit missing, incompatible, corrupt,
+  cached-unvalidated, cached-valid, and cached-stale states. Validation uses
+  bounded inventory/context witnesses and shared locks without quarantining or
+  modifying malformed state.
+- Canonical complete alert persistence independent of `--only-new`, typed
+  enforcement summaries, cache-write warnings that preserve scan exit status,
+  and component fingerprints for inventory, trust, marketplace, analysis policy,
+  enforcement, and runtime context.
+- QML hydration through the CLI only: lazy panel loading, cached provenance/age,
+  stale disclosure, retained prior results on failed scans, and no direct cache
+  filesystem access. The plugin requires CLI 0.2.3 for persistent hydration.
+- Independent agent-skill 1.1.1 transport hotfix: local review profiles no longer
+  require remote acquisition; remote selectors retain fail-closed acquisition
+  checks; structured summary reduction is distinct from raw-stream truncation.
+- ADR, CLI/plugin documentation, generated man/completions, cache lifecycle
+  integration tests, and agent-skill golden coverage.
+
+Verification:
+
+```text
+cargo fmt --all -- --check
+cargo test --workspace
+cargo test --workspace --no-default-features
+cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+./scripts/generate-cli-assets.sh --check
+scripts/determinism-canary.sh
+python3 ../omasafe-agent-skill/tests/runner_test.py
+../omasafe-agent-skill/tests/structural.sh
+(cd ../omasafe-plugin && qmllint -I /usr/share/omarchy/shell -I /usr/lib/qt6/qml BarWidget.qml Panel.qml components/*.qml views/*.qml graph/*.qml && node scripts/flow-test.js && omarchy plugin validate .)
+```
+
+Remaining release verification requires the disposable Omarchy VM for systemd,
+shell restart hydration, plugin validation, timer profile coexistence, package
+upgrade/removal, and signed artifact checks.
+
 ## Stage B — Typed Child Programs and IR Walk Closure (2026-08-31)
 
 Status: **complete**

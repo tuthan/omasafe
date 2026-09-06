@@ -73,6 +73,12 @@ actionable findings remain. \fB--include-analysis\fR opts in to per-plugin
 analysis events (new capabilities, finding regressions, analyzer-policy
 updates, fingerprint instability); default scans stay quiet.
 .TP
+.B scan-cache show [--profile installed-basic|installed-analysis] [--validate]
+Read the CLI-owned normalized installed-scan snapshot. The default response is
+cached and unvalidated; \fB--validate\fR performs one bounded, read-only
+context check and reports cached-valid or a named stale reason. Cache data is
+disposable and never replaces trust, enforcement, or notification state.
+.TP
 .B plugins inventory
 Print the installed plugin inventory and marketplace correlation.
 .TP
@@ -138,7 +144,7 @@ Print one rule's full definition: severity, capability, verified surface
 anchor, summary, review guidance, and any recorded marketplace-baseline
 equivalence entries.
 .TP
-.B plugins analyze PLUGIN_ID [--format text|json] [--fail-on SEVERITY]
+.B plugins analyze PLUGIN_ID [--format text|json] [--refresh|--cached] [--fail-on SEVERITY]
 Inventory every shipped payload file of an installed plugin with type, mode,
 size, digest, executable bit, and explicit analysis coverage state. Exit
 status is 0 even when findings exist; CI policy uses --fail-on.
@@ -161,10 +167,14 @@ Install the user-level scheduled scan unit. Advisory keeps the lightweight
 drift scan; hardened explicitly includes analysis and never changes an
 existing timer policy silently.
 .TP
+.B schedule uninstall
+Disable and remove the OmaSafe-owned user-level scheduled scan units. Modified
+or foreign units are left intact when ownership metadata does not match.
+.TP
 .B schedule status [--format text|json]
 Print the CLI-owned installed schedule policy, unit identity, report-only
-behavior, and last known systemd execution result. Missing or stale metadata is
-reported as unavailable rather than inferred from unit text.
+behavior, next trigger, and last known systemd execution result. Missing or
+stale metadata is reported as unavailable rather than inferred from unit text.
 .SH FILES
 The configuration, state, and cache roots follow XDG_CONFIG_HOME,
 XDG_STATE_HOME, and XDG_CACHE_HOME, defaulting to ~/.config/omasafe,
@@ -207,7 +217,7 @@ _omasafe_cli() {
     fi
     case "\${COMP_WORDS[1]}" in
         scan|provenance|plugins|marketplace|rules|scan-plugin)
-            COMPREPLY=(\$(compgen -W "--format --notify --only-new --include-analysis --yes --expected-head --expected-tree --expected-digest --note --policy --action --scope --to --reason --rule --path --commit --expires --latest --git --revision --request --marketplace --plugin-id --report-profile --fail-on" -- "\${cur}"))
+            COMPREPLY=(\$(compgen -W "--format --notify --only-new --include-analysis --refresh --cached --yes --expected-head --expected-tree --expected-digest --note --policy --action --scope --to --reason --rule --path --commit --expires --latest --git --revision --request --marketplace --plugin-id --report-profile --fail-on" -- "\${cur}"))
             ;;
         paths|schedule)
             COMPREPLY=()
@@ -221,7 +231,7 @@ EOF
 write_asset docs/completions/_omasafe-cli "$(cat <<EOF
 #compdef omasafe-cli
 # zsh completion for omasafe-cli; generated from docs/cli-surface.txt
-_arguments '1:command:($top_level)' '*:option:(--format --notify --only-new --include-analysis --yes --expected-head --expected-tree --expected-digest --note --policy --action --scope --to --reason --rule --path --commit --expires --latest --git --revision --request --marketplace --plugin-id --report-profile --fail-on)'
+_arguments '1:command:($top_level)' '*:option:(--format --notify --only-new --include-analysis --refresh --cached --yes --expected-head --expected-tree --expected-digest --note --policy --action --scope --to --reason --rule --path --commit --expires --latest --git --revision --request --marketplace --plugin-id --report-profile --fail-on)'
 EOF
 )"
 
@@ -232,6 +242,8 @@ complete -c omasafe-cli -l format -r -a "text json"
 complete -c omasafe-cli -l notify
 complete -c omasafe-cli -l only-new
 complete -c omasafe-cli -l include-analysis
+complete -c omasafe-cli -l refresh
+complete -c omasafe-cli -l cached
 complete -c omasafe-cli -l yes
 complete -c omasafe-cli -l policy -r -a "advisory hardened"
 complete -c omasafe-cli -l expected-head -r

@@ -24,15 +24,63 @@ impl XdgPaths {
 
     pub fn ensure(&self) -> Result<()> {
         for path in [&self.config, &self.state, &self.cache] {
-            std::fs::create_dir_all(path)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-            }
+            ensure_private_directory(path)?;
         }
         Ok(())
     }
+
+    /// Ensure the configuration and state roots needed for a normal scan.
+    /// Cache setup is intentionally separate so a cache-only failure can be
+    /// reported additively without changing scan/state behavior.
+    pub fn ensure_scan_roots(&self) -> Result<()> {
+        for path in [&self.config, &self.state] {
+            ensure_private_directory(path)?;
+        }
+        Ok(())
+    }
+
+    pub fn ensure_cache(&self) -> Result<()> {
+        ensure_private_directory(&self.cache)
+    }
+
+    pub fn scan_snapshots(&self) -> PathBuf {
+        self.cache.join("scan-snapshots")
+    }
+}
+
+fn ensure_private_directory(path: &std::path::Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(Error::InvalidPath(format!(
+                "{} is not a private directory",
+                path.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(path)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(Error::InvalidPath(format!(
+            "{} is not a private directory",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(Error::InvalidPath(format!(
+                "{} is not owned by the current user",
+                path.display()
+            )));
+        }
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 fn xdg_dir(variable: &str, fallback: PathBuf) -> PathBuf {

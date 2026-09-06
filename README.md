@@ -49,10 +49,11 @@ CLI commands.
 
 ## Status
 
-**v0.2.2 is the current release** — the signed CLI now combines the v0.1 local
+**v0.2.3 is the current development release** — the signed CLI now combines the v0.1 local
 trust layer with bounded payload analysis, capability and finding reports,
-reviewed updates, opt-in enforcement controls, and scan-only review of exact
-GitHub/marketplace candidates. v0.3 and later work remain on the
+reviewed updates, opt-in enforcement controls, scan-only review of exact
+GitHub/marketplace candidates, and CLI-owned cached installed-scan hydration.
+v0.3 and later work remain on the
 [roadmap](docs/plans/README.md).
 
 See [`docs/brainstorm.md`](docs/brainstorm.md) for the product thesis and
@@ -91,6 +92,9 @@ omasafe-cli plugins diff PLUGIN_ID
 
 # Analyze an installed plugin's complete shipped payload
 omasafe-cli plugins analyze PLUGIN_ID --format json
+# Read a matching saved analysis or force a fresh one
+omasafe-cli plugins analyze PLUGIN_ID --format json --cached
+omasafe-cli plugins analyze PLUGIN_ID --format json --refresh
 
 # Analyze a local directory or an immutable remote Git revision
 omasafe-cli scan-plugin --path ./plugin --format json --fail-on high
@@ -139,12 +143,17 @@ omasafe-cli plugins override list --format json
 # Post-change drift scan across all plugins (optionally include analysis and notify only new alerts)
 omasafe-cli scan --format json --include-analysis --notify --only-new
 
+# Inspect the CLI-owned installed-scan snapshot (validation is bounded/read-only)
+omasafe-cli scan-cache show --profile installed-analysis --format json
+omasafe-cli scan-cache show --profile installed-analysis --validate --format json
+
 # Deterministic self-inventory / provenance report
 omasafe-cli provenance --format json
 
 # Opt in to a daily report-only systemd user timer
 omasafe-cli schedule install --policy advisory
 omasafe-cli schedule install --policy hardened
+omasafe-cli schedule uninstall
 omasafe-cli schedule status --format json
 ```
 
@@ -160,7 +169,21 @@ Runtime state uses XDG paths only:
 
 - Configuration: `${XDG_CONFIG_HOME:-~/.config}/omasafe`
 - State (trust baselines, decisions): `${XDG_STATE_HOME:-~/.local/state}/omasafe`
-- Cache (disposable catalog/Git objects): `${XDG_CACHE_HOME:-~/.cache}/omasafe`
+- Cache (disposable catalog/Git objects, scan snapshots, and analysis snapshots): `${XDG_CACHE_HOME:-~/.cache}/omasafe`
+
+Installed-scan snapshots live under `scan-snapshots/` and are private,
+disposable startup hydration data. Detailed installed-plugin analysis lives under
+`analysis-snapshots/`, one bounded file per plugin. Analysis entries are accepted
+only when source identity, analyzer policy, and suppression configuration match;
+stale or oversized entries are ignored. Deleting either directory does not delete
+trust baselines, review decisions, enforcement history, or notification state.
+
+The scheduled scan is an opt-in daily systemd user timer. Advisory runs the
+lightweight report-only drift scan; hardened also includes analysis. Exit 0 means
+no actionable findings, exit 3 means findings were reported, and exit 1 means the
+scheduled scan failed. `schedule status` reports the next trigger and last outcome;
+`schedule uninstall` disables and removes only units whose OmaSafe ownership
+metadata still matches.
 
 These directories are created privately on first use. Baselines store identities,
 digests, and decisions — never plugin file contents.

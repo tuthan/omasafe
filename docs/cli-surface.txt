@@ -3,6 +3,7 @@
 paths	print XDG configuration, state, and cache paths
 provenance	[--format text|json]
 scan	[--format text|json] [--notify] [--only-new] [--include-analysis]
+scan-cache show	[--profile installed-basic|installed-analysis] [--validate] [--format text|json]
 plugins inventory	[--format text|json]
 plugins trust PLUGIN_ID	[--yes] [--expected-head VALUE] [--expected-tree VALUE] [--expected-digest VALUE] [--note TEXT]
 plugins status PLUGIN_ID	[--format text|json]
@@ -13,11 +14,12 @@ plugins review-update PLUGIN_ID	[--expected-commit SHA] [--yes] [--policy adviso
 plugins enforcement-status PLUGIN_ID	[--format text|json]
 plugins override create PLUGIN_ID	--rule RULE_ID [--rule RULE_ID ...] --commit SHA --reason TEXT --expires TIMESTAMP
 plugins override list	[--format text|json]
-plugins analyze PLUGIN_ID	[--format text|json] [--fail-on info|low|medium|high|critical]
+plugins analyze PLUGIN_ID	[--format text|json] [--refresh|--cached] [--fail-on info|low|medium|high|critical]
 scan-plugin	(--path DIR | --git URL [--revision COMMIT] | --request TEXT | --marketplace PLUGIN_ID) [--plugin-id PLUGIN_ID] [--report-profile full|review] [--format text|json] [--fail-on info|low|medium|high|critical]
 rules list	[--format text|json]
 rules coverage	[--format text|json]
 rules explain RULE_ID	[--format text|json]
 marketplace refresh	(--commit COMMIT | --latest)
 schedule install	[--policy advisory|hardened]
+schedule uninstall
 schedule status	[--format text|json]

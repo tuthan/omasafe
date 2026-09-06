@@ -50,16 +50,62 @@ step "install ${version}" "
 step "cli responds" "\$HOME/.local/bin/omasafe-cli --version"
 step "provenance json" "\$HOME/.local/bin/omasafe-cli provenance --format json | head -c 400"
 
-# 2. First scan works on a clean machine and writes state atomically.
-step "first scan" "\$HOME/.local/bin/omasafe-cli scan --format json | head -c 400"
+# 2. A clean VM starts without installed-scan snapshots. The first scan writes
+# the advisory profile atomically and never treats cache persistence as a scan
+# failure (exit 0 or the documented actionable exit 3 are both valid).
+step "no snapshot on clean VM" "! test -e \"\$HOME/.cache/omasafe/scan-snapshots/installed-basic.json\" && ! test -e \"\$HOME/.cache/omasafe/scan-snapshots/installed-analysis.json\""
+step "first scan" "
+  set -e
+  set +e
+  \$HOME/.local/bin/omasafe-cli scan --format json >/tmp/omasafe-first-scan.json
+  code=\$?
+  set -e
+  test \"\$code\" -eq 0 || test \"\$code\" -eq 3
+"
+step "basic snapshot is private and complete" "
+  test -f \"\$HOME/.cache/omasafe/scan-snapshots/installed-basic.json\" &&
+  test \"\$(stat -c '%a' \"\$HOME/.cache/omasafe/scan-snapshots/installed-basic.json\")\" = 600 &&
+  grep -q '\"schema\": \"omasafe.scan-snapshot.v1\"' \"\$HOME/.cache/omasafe/scan-snapshots/installed-basic.json\" &&
+  grep -q '\"scan_profile\": \"installed-basic\"' \"\$HOME/.cache/omasafe/scan-snapshots/installed-basic.json\"
+"
 
-# 3. Schedule coexistence: omasafe timer installed alongside omarchy timers.
+# 3. Advisory timers write the basic profile; hardened timers write the shared
+# analysis profile. Both retain the same private cache path in ReadWritePaths.
+step "advisory timer writes basic profile" "
+  \$HOME/.local/bin/omasafe-cli schedule install --policy advisory >/dev/null &&
+  grep -q 'scan --notify --only-new$' \"\$HOME/.config/systemd/user/omasafe-scan.service\" &&
+  ! grep -q -- '--include-analysis' \"\$HOME/.config/systemd/user/omasafe-scan.service\"
+"
+step "hardened timer writes analysis profile" "
+  \$HOME/.local/bin/omasafe-cli schedule install --policy hardened >/dev/null &&
+  grep -q 'scan --notify --only-new --include-analysis$' \"\$HOME/.config/systemd/user/omasafe-scan.service\" &&
+  grep -q 'ReadWritePaths=.*\.cache/omasafe' \"\$HOME/.config/systemd/user/omasafe-scan.service\"
+"
+
+# 4. Schedule coexistence: omasafe timer installed alongside omarchy timers.
 step "schedule coexistence" "
   systemctl --user list-timers | grep -i omasafe &&
   systemctl --user list-timers | grep -i omarchy
 "
 
-# 4. Upgrade = rerun installer for the same version; downgrade = explicit
+# 5. Generate the shared analysis profile, then exercise read-only hydration
+# and validation. The widget uses this same profile through scan-cache show.
+step "analysis scan profile" "
+  set +e
+  \$HOME/.local/bin/omasafe-cli scan --include-analysis --format json >/tmp/omasafe-analysis-scan.json
+  code=\$?
+  set -e
+  test \"\$code\" -eq 0 || test \"\$code\" -eq 3
+"
+step "analysis snapshot hydrates" "
+  test -f \"\$HOME/.cache/omasafe/scan-snapshots/installed-analysis.json\" &&
+  \$HOME/.local/bin/omasafe-cli scan-cache show --profile installed-analysis --format json | grep -q 'cached-unvalidated'
+"
+step "basic snapshot validates" "
+  \$HOME/.local/bin/omasafe-cli scan-cache show --profile installed-basic --validate --format json | grep -q 'cached-valid\|cached-stale\|cached-unvalidated'
+"
+
+# 6. Upgrade = rerun installer for the same version; downgrade = explicit
 # older pin. Both must succeed without orphaning state.
 step "upgrade re-run" "
   bash /tmp/omasafe-install-review.sh --version '${version}' &&
@@ -75,7 +121,7 @@ if [[ -n ${OMASAFE_PREVIOUS_VERSION:-} ]]; then
   "
 fi
 
-# 5. Panel lifecycle: validate, enable + rescan, disable cleanly. Requires
+# 7. Panel lifecycle: validate, enable + rescan, disable cleanly. Requires
 # the omasafe-plugin checkout in the VM.
 step "panel validate" "cd ~/Projects/omasafe-plugin && omarchy plugin validate ."
 step "panel enable/rescan" "
@@ -83,9 +129,60 @@ step "panel enable/rescan" "
   omarchy-shell shell rescanPlugins
 "
 step "panel visible in inventory" "\$HOME/.local/bin/omasafe-cli plugins inventory | grep io.github.tuthan.omasafe"
+step "panel cache hydration" "
+  \$HOME/.local/bin/omasafe-cli scan-cache show --profile installed-analysis --format json | grep -q 'cached-'
+"
 step "panel disable" "omarchy plugin disable io.github.tuthan.omasafe"
 
-# 6. Third-party-bar notification independence: with the default bar forced
+# 8. Mutation, failed rescan retention, restored replacement, incompatible
+# schema refusal, and safe cache deletion. All of these operate on the
+# disposable VM cache only; trust/enforcement state stays outside this tree.
+step "inventory mutation becomes stale" "
+  probe=\"\$HOME/.config/omarchy/plugins/io.github.tuthan.omasafe/.omasafe-lifecycle-probe\"
+  touch \"\$probe\"
+  \$HOME/.local/bin/omasafe-cli scan-cache show --profile installed-basic --validate --format json | grep -q 'cached-stale\|inventory-changed'
+  rm -f \"\$probe\"
+"
+step "failed rescan retains snapshot" "
+  cache=\"\$HOME/.cache/omasafe/scan-snapshots/installed-basic.json\"
+  cli=\"\$HOME/.local/bin/omasafe-cli\"
+  backup=\"\$HOME/.local/bin/omasafe-cli.lifecycle-backup\"
+  test -f \"\$cache\"
+  mv \"\$cli\" \"\$backup\"
+  set +e
+  \"\$cli\" scan --format json >/dev/null 2>&1
+  code=\$?
+  set -e
+  mv \"\$backup\" \"\$cli\"
+  test \"\$code\" -ne 0 && test -s \"\$cache\"
+"
+step "successful rescan advances generation" "
+  cache=\"\$HOME/.cache/omasafe/scan-snapshots/installed-basic.json\"
+  before=\$(sed -n 's/.*\"generation\": \([0-9][0-9]*\),/\1/p' \"\$cache\")
+  set +e
+  \$HOME/.local/bin/omasafe-cli scan --format json >/dev/null 2>&1
+  code=\$?
+  set -e
+  after=\$(sed -n 's/.*\"generation\": \([0-9][0-9]*\),/\1/p' \"\$cache\")
+  test \"\$code\" -eq 0 || test \"\$code\" -eq 3
+  test -n \"\$before\" && test -n \"\$after\" && test \"\$after\" -gt \"\$before\"
+"
+step "incompatible schema is refused" "
+  cache=\"\$HOME/.cache/omasafe/scan-snapshots/installed-basic.json\"
+  backup=\"\$cache.lifecycle-backup\"
+  cp \"\$cache\" \"\$backup\"
+  sed -i 's/omasafe.scan-snapshot.v1/omasafe.scan-snapshot.legacy/' \"\$cache\"
+  \$HOME/.local/bin/omasafe-cli scan-cache show --profile installed-basic --format json | grep -q 'incompatible\|corrupt'
+  mv \"\$backup\" \"\$cache\"
+"
+step "cache deletion preserves state" "
+  test -d \"\$HOME/.local/state/omasafe\" &&
+  rm -rf -- \"\$HOME/.cache/omasafe/scan-snapshots\" &&
+  ! test -e \"\$HOME/.cache/omasafe/scan-snapshots/installed-basic.json\" &&
+  test -d \"\$HOME/.local/state/omasafe\"
+"
+
+# 9. Third-party-bar notification independence: with the default bar forced
 # back on, notify-send must still reach the session (OmaSafe never assumes
 # its own panel is mounted).
 step "notify independence" "
@@ -93,7 +190,7 @@ step "notify independence" "
   notify-send 'omasafe-lifecycle' 'independent of active bar'
 "
 
-# 7. Uninstall: remove binary, schedule, and XDG trees; then verify nothing
+# 10. Uninstall: remove binary, schedule, and XDG trees; then verify nothing
 # of OmaSafe persists. The panel plugin is native-managed and out of scope
 # here beyond being disabled above.
 step "uninstall" "
