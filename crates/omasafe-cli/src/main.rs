@@ -61,7 +61,7 @@ const SCHEDULE_SCHEMA_VERSION: &str = "omasafe.schedule.v1";
 const DEFAULT_SCAN_MEMORY_LIMIT_MB: u64 = 768;
 const SCHEDULE_PROCESS_BUDGET: Duration = Duration::from_secs(5);
 const SCHEDULE_PROCESS_OUTPUT_CAP: usize = 64 * 1024;
-const ANALYSIS_CACHE_SCHEMA_VERSION: &str = "omasafe.analysis-cache.v1";
+const ANALYSIS_CACHE_SCHEMA_VERSION: &str = "omasafe.analysis-cache.v2";
 const ANALYSIS_CACHE_MAX_BYTES: usize = 2 * 1024 * 1024;
 const ANALYSIS_CACHE_MAX_READ_BYTES: usize = ANALYSIS_CACHE_MAX_BYTES + 1;
 
@@ -3376,9 +3376,11 @@ fn scan(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
         result.outstanding > 0
     };
     if format == "json" {
+        let mut rendered = serde_json::to_value(&result)?;
+        sanitize_display_alerts(&mut rendered["alerts"]);
         println!(
             "{}",
-            serde_json::to_string_pretty(&Report::new(TOOL_VERSION, generated_at, result))?
+            serde_json::to_string_pretty(&Report::new(TOOL_VERSION, generated_at, rendered))?
         );
     } else if result.quiet || (only_new && result.alerts.is_empty()) {
         println!("No new actionable changes detected.");
@@ -3457,13 +3459,19 @@ fn scan_cache_show(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "generation": snapshot.as_ref().map(|value| value.generation),
         "generated_at": snapshot.as_ref().map(|value| value.generated_at.clone()),
         "valid_until": snapshot.as_ref().and_then(|value| value.valid_until.clone()),
-        "alerts": snapshot.as_ref().map_or_else(Vec::new, |value| value.alerts.clone()),
+        "alerts": snapshot.as_ref().map_or_else(Vec::new, |value| {
+            value.alerts.iter().map(display_cached_alert).collect::<Vec<_>>()
+        }),
         "outstanding": snapshot.as_ref().map_or(0, |value| value.alerts.len()),
         "new": 0,
         "highest_severity": snapshot.as_ref().map_or("none".into(), |value| value.alerts.iter().max_by_key(|alert| alert_severity_rank(&alert.severity)).map_or("none".into(), |alert| alert.severity.clone())),
         "quiet": snapshot.as_ref().is_none_or(|value| value.alerts.is_empty() && value.enforcement_summary.decisions.iter().all(|decision| decision.outcome != "block")),
         "enforcement_summary": snapshot.as_ref().map(|value| value.enforcement_summary.clone()),
-        "snapshot": snapshot,
+        "snapshot": snapshot.as_ref().map(|value| {
+            let mut copy = serde_json::to_value(value).unwrap_or_else(|_| serde_json::json!({}));
+            sanitize_display_alerts(&mut copy["alerts"]);
+            copy
+        }),
         "limitation": limitation,
     });
     if format == "json" {
@@ -4018,7 +4026,7 @@ fn notify_user(alert: &ScanAlert) {
         "{}: [{}] {}",
         safe_text(&alert.plugin_id),
         safe_text(&alert.severity),
-        safe_text(&alert.message)
+        display_source_text(&alert.message)
     );
     let result = std::process::Command::new("notify-send")
         .args(["--urgency=critical", "OmaSafe", &body])
@@ -4041,16 +4049,235 @@ fn write_if_changed(
 fn safe_text(value: &str) -> String {
     value
         .chars()
-        .map(|character| {
-            if matches!(character, '\n' | '\t') {
-                character.to_string()
-            } else if character.is_control() {
+        .map(|character| match character {
+            '\n' => "\\n".to_owned(),
+            '\r' => "\\r".to_owned(),
+            '\t' => "\\t".to_owned(),
+            character
+                if character.is_control()
+                    || matches!(
+                        character,
+                        '\u{2028}'
+                            | '\u{2029}'
+                            | '\u{061c}'
+                            | '\u{200e}'
+                            | '\u{200f}'
+                            | '\u{202a}'..='\u{202e}'
+                            | '\u{2066}'..='\u{2069}'
+                    ) =>
+            {
                 format!("\\u{{{:x}}}", character as u32)
-            } else {
-                character.to_string()
             }
+            character => character.to_string(),
         })
         .collect()
+}
+
+fn display_source_text(value: &str) -> String {
+    let mut output = safe_text(value);
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for marker in [
+        "authorization:",
+        "proxy-authorization:",
+        "cookie:",
+        "set-cookie:",
+    ] {
+        let lower = output.to_ascii_lowercase();
+        let mut cursor = 0usize;
+        while let Some(found) = lower[cursor..].find(marker) {
+            let start = cursor + found + marker.len();
+            let end = output[start..]
+                .find(['\\', ','])
+                .map_or(output.len(), |offset| start + offset);
+            spans.push((start, end));
+            cursor = end;
+            if cursor >= output.len() {
+                break;
+            }
+        }
+    }
+    let mut cursor = 0usize;
+    while let Some(relative) = output[cursor..].find("://") {
+        let authority_start = cursor + relative + 3;
+        let url_end = output[authority_start..]
+            // Commas are valid query data and must not terminate a URL before
+            // its complete value has been redacted.
+            .find([' ', '\\', '"', '\''])
+            .map_or(output.len(), |offset| authority_start + offset);
+        let authority_end = output[authority_start..url_end]
+            .find(['/', '?', '#'])
+            .map_or(url_end, |offset| authority_start + offset);
+        if let Some(at) = output[authority_start..authority_end].rfind('@') {
+            let at = authority_start + at;
+            spans.push((authority_start, at));
+        }
+        if let Some(query) = output[authority_start..url_end].find('?') {
+            let query = authority_start + query;
+            let fragment = output[query..url_end]
+                .find('#')
+                .map_or(url_end, |offset| query + offset);
+            let mut index = query + 1;
+            while index < fragment {
+                let amp = output[index..fragment]
+                    .find('&')
+                    .map_or(fragment, |offset| index + offset);
+                if let Some(equal) = output[index..amp].find('=') {
+                    let equal = index + equal;
+                    spans.push((equal + 1, amp));
+                }
+                index = amp.saturating_add(1);
+            }
+            if fragment < url_end {
+                spans.push((fragment, url_end));
+            }
+        } else if let Some(fragment) = output[authority_start..url_end].find('#') {
+            spans.push((authority_start + fragment, url_end));
+        }
+        cursor = url_end.max(authority_start);
+        if cursor >= output.len() {
+            break;
+        }
+    }
+    // Explicit named assignments are supported without an entropy heuristic,
+    // including the common `password = 'value'` spelling. Preserve whitespace
+    // and quotes while replacing only the value bytes.
+    let mut index = 0usize;
+    let lower = output.to_ascii_lowercase();
+    while index < output.len() {
+        let Some(found) = lower[index..].find(|character: char| {
+            character == 't' || character == 'p' || character == 's' || character == 'a'
+        }) else {
+            break;
+        };
+        let start = index + found;
+        let before_ok = start == 0 || !output.as_bytes()[start - 1].is_ascii_alphanumeric();
+        let end_name = output[start..]
+            .find(|character: char| {
+                character == '=' || character == ':' || character.is_whitespace()
+            })
+            .map_or(start, |offset| start + offset);
+        let name = lower[start..end_name].trim();
+        let secret_name = name.contains("token")
+            || name.contains("password")
+            || name.contains("secret")
+            || name.contains("api_key")
+            || name.contains("apikey");
+        if before_ok && secret_name {
+            let mut assignment = end_name;
+            while assignment < output.len()
+                && output[assignment..]
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_whitespace)
+            {
+                assignment += output[assignment..].chars().next().unwrap().len_utf8();
+            }
+            if output[assignment..].starts_with(['=', ':']) {
+                assignment += 1;
+                while assignment < output.len()
+                    && output[assignment..]
+                        .chars()
+                        .next()
+                        .is_some_and(char::is_whitespace)
+                {
+                    assignment += output[assignment..].chars().next().unwrap().len_utf8();
+                }
+                let value_start = assignment;
+                let quoted = output
+                    .as_bytes()
+                    .get(value_start)
+                    .is_some_and(|byte| *byte == b'\'' || *byte == b'"');
+                let value_end = if quoted {
+                    let quote = output.as_bytes()[value_start] as char;
+                    output[value_start + 1..]
+                        .find(quote)
+                        .map_or(output.len(), |offset| value_start + 1 + offset)
+                } else {
+                    output[value_start..]
+                        .find(['&', ' ', ',', ';', '\\'])
+                        .map_or(output.len(), |offset| value_start + offset)
+                };
+                spans.push((value_start + usize::from(quoted), value_end));
+            }
+        }
+        index = end_name.max(start + 1);
+    }
+    spans.retain(|(start, end)| start < end);
+    spans.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+    for (start, end) in spans {
+        if let Some((_, previous_end)) = merged.last_mut()
+            && start <= *previous_end
+        {
+            *previous_end = (*previous_end).max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    for (start, end) in merged.into_iter().rev() {
+        output.replace_range(start..end, "[REDACTED]");
+    }
+    output
+}
+
+fn display_cached_alert(alert: &omasafe_core::scan_snapshot::CachedScanAlert) -> serde_json::Value {
+    serde_json::json!({
+        "key": alert.key,
+        "plugin_id": alert.plugin_id,
+        "kind": alert.kind,
+        "severity": alert.severity,
+        "reason_code": alert.reason_code,
+        "message": display_source_text(&alert.message),
+        "post_change": alert.post_change,
+    })
+}
+
+fn sanitize_display_alerts(value: &mut serde_json::Value) {
+    if let Some(alerts) = value.as_array_mut() {
+        for alert in alerts {
+            if let Some(message) = alert.get("message").and_then(serde_json::Value::as_str) {
+                alert["message"] = serde_json::json!(display_source_text(message));
+            }
+        }
+    }
+}
+
+fn sanitize_analysis_display(analysis: &mut serde_json::Value) {
+    for key in ["findings", "capabilities"] {
+        if let Some(items) = analysis[key].as_array_mut() {
+            for item in items {
+                if let Some(path) = item
+                    .get("relative_path")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    item["display_relative_path"] = serde_json::json!(display_source_text(path));
+                }
+                for field in ["evidence", "detail", "explanation", "review_guidance"] {
+                    if let Some(value) = item.get(field).and_then(serde_json::Value::as_str) {
+                        item[field] = serde_json::json!(display_source_text(value));
+                    }
+                }
+                if let Some(steps) = item
+                    .get_mut("evidence_steps")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    for step in steps {
+                        if let Some(path) = step
+                            .get("relative_path")
+                            .and_then(serde_json::Value::as_str)
+                        {
+                            step["display_relative_path"] =
+                                serde_json::json!(display_source_text(path));
+                        }
+                        if let Some(value) = step.get("detail").and_then(serde_json::Value::as_str)
+                        {
+                            step["detail"] = serde_json::json!(display_source_text(value));
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn schedule_install(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -4727,6 +4954,11 @@ fn suppression_review(
                 policy_identity: Some(serde_json::to_string(&serde_json::to_value(
                     omasafe_analyzer::policy_identity(),
                 )?)?),
+                rule_semantic_identity_digest: omasafe_analyzer::rule_semantic_identity_digest(
+                    rule_id,
+                ),
+                review_compatibility_declaration_id: omasafe_analyzer::policy_identity()
+                    .review_compatibility_declaration_id,
                 active: true,
                 reinstated_at: None,
             });
@@ -5574,6 +5806,26 @@ fn rules_list(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let policy_identity = omasafe_analyzer::policy_identity();
     let catalog = omasafe_analyzer::catalog();
     if format == "json" {
+        let support: std::collections::BTreeMap<_, _> = catalog
+            .iter()
+            .filter_map(|definition| {
+                omasafe_analyzer::rule_support(definition.id).map(|value| (definition.id, value))
+            })
+            .collect();
+        let semantic: std::collections::BTreeMap<_, _> = catalog
+            .iter()
+            .filter_map(|definition| {
+                omasafe_analyzer::rule_semantic_identity(definition.id).map(|identity| {
+                    (
+                        definition.id,
+                        serde_json::json!({
+                            "identity": identity,
+                            "digest": omasafe_analyzer::rule_semantic_identity_digest(definition.id),
+                        }),
+                    )
+                })
+            })
+            .collect();
         let result = serde_json::json!({
             "policy_identity": policy_identity,
             "rule_catalog_version": omasafe_analyzer::RULE_CATALOG_VERSION,
@@ -5581,6 +5833,8 @@ fn rules_list(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "supported_surface_version": omasafe_analyzer::SUPPORTED_SURFACE_VERSION,
             "equivalence_map_version": omasafe_analyzer::EQUIVALENCE_MAP_VERSION,
             "rules": catalog,
+            "rule_support": support,
+            "rule_semantics": semantic,
         });
         println!(
             "{}",
@@ -5638,6 +5892,18 @@ fn rules_coverage(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .map(|entry| entry.external_id.clone())
         .collect();
     if format == "json" {
+        let local_support: Vec<_> = omasafe_analyzer::catalog()
+            .iter()
+            .filter_map(|definition| {
+                omasafe_analyzer::rule_support(definition.id).map(|support| {
+                    serde_json::json!({
+                        "rule_id": definition.id,
+                        "support": support,
+                        "semantic_identity_digest": omasafe_analyzer::rule_semantic_identity_digest(definition.id),
+                    })
+                })
+            })
+            .collect();
         let result = serde_json::json!({
             "policy_identity": omasafe_analyzer::policy_identity(),
             "map_version": map.map_version,
@@ -5647,6 +5913,7 @@ fn rules_coverage(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "verified_at_commit": map.verified_at_commit,
             "coverage": entries,
             "not_covered": not_covered,
+            "local_support": local_support,
         });
         println!(
             "{}",
@@ -5707,6 +5974,14 @@ fn rules_explain(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
         let result = serde_json::json!({
             "policy_identity": omasafe_analyzer::policy_identity(),
             "rule": definition,
+            "rule_support": omasafe_analyzer::rule_support(definition.id),
+            "rule_semantic_identity": omasafe_analyzer::rule_semantic_identity(definition.id),
+            "rule_semantic_identity_digest": omasafe_analyzer::rule_semantic_identity_digest(definition.id),
+            "blocking_admission": {
+                "admitted": false,
+                "enforcement_policy_identity": "omasafe.enforcement.v1",
+                "evidence_reference": "no v0.2.4 blocking-family admission",
+            },
             "external_equivalences": external_ids
                 .iter()
                 .map(|external_id| {
@@ -6411,7 +6686,10 @@ fn read_analysis_cache(
         return None;
     }
     let result = entry.result;
-    (result["analysis"]["schema"] == "omasafe.analysis.v1").then_some(result)
+    (result["analysis"]["schema"] == "omasafe.analysis.v1"
+        && result["report_profile"]["presentation_version"] == 1
+        && result["report_profile"]["redaction_policy_version"] == 1)
+        .then_some(result)
 }
 
 fn persist_analysis_cache(
@@ -6478,6 +6756,14 @@ fn analysis_threshold_breached(
     result: &serde_json::Value,
     threshold: Option<omasafe_analyzer::Severity>,
 ) -> bool {
+    if let Some(maximum) = result["review_summary"]["max_severity"].as_str() {
+        return threshold.is_some_and(|threshold| {
+            analysis_severity(maximum).is_some_and(|severity| severity >= threshold)
+        });
+    }
+    if let Some(breached) = result["review_summary"]["threshold_breached"].as_bool() {
+        return threshold.is_some() && breached;
+    }
     threshold.is_some_and(|threshold| {
         result["analysis"]["findings"]
             .as_array()
@@ -6502,6 +6788,28 @@ fn emit_cached_analysis_report(
         return Err("cached analysis requires --format json".into());
     }
     result["target"] = target;
+    if result["review_summary"].is_object() {
+        result["review_summary"]["freshness"] = serde_json::json!("cached-current");
+        let revision = result["target"]["revision"].as_str();
+        let exact = revision
+            .filter(|value| {
+                matches!(value.len(), 40 | 64)
+                    && value.chars().all(|character| character.is_ascii_hexdigit())
+            })
+            .is_some_and(|revision| {
+                let acquisition = &result["acquisition"];
+                acquisition["resolved_identity"]["value"]
+                    .as_str()
+                    .is_some_and(|value| value.eq_ignore_ascii_case(revision))
+                    && acquisition["integrity"]["observed"]
+                        .as_str()
+                        .is_some_and(|value| value.eq_ignore_ascii_case(revision))
+                    && acquisition["integrity"]["state"] == "resolved-exact"
+            });
+        if exact {
+            result["review_summary"]["source_identity_state"] = serde_json::json!("exact");
+        }
+    }
     println!(
         "{}",
         serde_json::to_string_pretty(&Report::new(TOOL_VERSION, now(), result.clone()))?
@@ -6673,6 +6981,8 @@ fn emit_analysis_report(
     // emitted, and the caller unwinds to a 130 exit.
     interruption_checkpoint("analysis finished; report not yet emitted")?;
     let rendered = artifacts.rendered_findings();
+    let findings_before_suppression = rendered.clone();
+    let analysis_produced_at = now();
     let policy_identity = omasafe_analyzer::policy_identity();
     let policy_identity_string = serde_json::to_string(&serde_json::to_value(&policy_identity)?)?;
 
@@ -6707,11 +7017,29 @@ fn emit_analysis_report(
                 let findings: Vec<_> = rendered
                     .into_iter()
                     .filter(|finding| {
-                        let stale = suppressions.requires_reconfirmation(
+                        let rule_semantic_digest =
+                            omasafe_analyzer::rule_semantic_identity_digest(&finding.rule_id);
+                        let current_declaration = policy_identity
+                            .review_compatibility_declaration_id
+                            .as_deref();
+                        let compatibility = omasafe_core::suppress::SuppressionCompatibility {
+                            policy_identity: &policy_identity_string,
+                            rule_semantic_identity: rule_semantic_digest.as_deref(),
+                            declaration_id: current_declaration,
+                        };
+                        let stale = suppressions.requires_reconfirmation_with_semantics(
                             &finding.rule_id,
                             plugin_context,
                             &finding.relative_path,
-                            &policy_identity_string,
+                            &compatibility,
+                            |record| {
+                                omasafe_analyzer::suppression_semantic_compatible(
+                                    &finding.rule_id,
+                                    record.rule_semantic_identity_digest.as_deref(),
+                                    record.review_compatibility_declaration_id.as_deref(),
+                                    current_declaration,
+                                )
+                            },
                         );
                         if stale {
                             suppression_reconfirmations.push(serde_json::json!({
@@ -6720,11 +7048,19 @@ fn emit_analysis_report(
                                 "reason": "analyzer-policy-changed",
                             }));
                         }
-                        let hit = suppressions.matches_policy(
+                        let hit = suppressions.matches_policy_with_semantics(
                             &finding.rule_id,
                             plugin_context,
                             &finding.relative_path,
-                            &policy_identity_string,
+                            &compatibility,
+                            |record| {
+                                omasafe_analyzer::suppression_semantic_compatible(
+                                    &finding.rule_id,
+                                    record.rule_semantic_identity_digest.as_deref(),
+                                    record.review_compatibility_declaration_id.as_deref(),
+                                    current_declaration,
+                                )
+                            },
                         );
                         if hit {
                             applied_suppressions.push(serde_json::json!({
@@ -6777,7 +7113,7 @@ fn emit_analysis_report(
         external_ruleset_name: equivalence_map.external_ruleset_name.clone(),
         external_ruleset_version: equivalence_map.external_ruleset_version.clone(),
     };
-    let analysis = omasafe_report::analysis::AnalysisSection::new(
+    let mut analysis = omasafe_report::analysis::AnalysisSection::new(
         policy_identity.clone(),
         fingerprint,
         coverage_limitations.clone(),
@@ -6787,6 +7123,8 @@ fn emit_analysis_report(
         omasafe_analyzer::parser_metadata(),
         Some(equivalence_summary),
     );
+    analysis.parsers = Some(omasafe_analyzer::parser_report_metadata());
+    analysis.coverage_gaps = artifacts.coverage_gaps.clone();
 
     // --fail-on: findings are success; CI opts into a failure threshold.
     // Suppressed findings are de-enforced, so the threshold only sees
@@ -6796,6 +7134,14 @@ fn emit_analysis_report(
             analysis_severity(&finding.severity).is_some_and(|severity| severity >= threshold)
         })
     });
+    let review_summary = build_review_summary(
+        &findings,
+        &findings_before_suppression,
+        &artifacts.coverage_gaps,
+        threshold_breached,
+        options.fail_on,
+        &analysis_produced_at,
+    );
 
     let states = serde_json::json!({
         "analyzed": inventory.state_count(omasafe_analyzer::CoverageState::Analyzed),
@@ -6809,6 +7155,7 @@ fn emit_analysis_report(
     let mut result = serde_json::json!({
         "target": target.clone(),
         "analysis": &analysis,
+        "review_summary": review_summary,
         "suppressions": {
             "policy": suppression_policy,
             "consulted": consulted,
@@ -6827,11 +7174,49 @@ fn emit_analysis_report(
             "entries": &inventory.entries,
         },
     });
+    enrich_review_summary(
+        &mut result["review_summary"],
+        &policy_identity,
+        &artifacts.capabilities,
+        &artifacts.coverage_gaps,
+        &states,
+        suppression_policy,
+        suppression_reconfirmations.len(),
+        &target,
+        acquisition.as_ref(),
+    );
     if let Some(acquisition) = acquisition.as_ref() {
         result["acquisition"] = serde_json::to_value(acquisition)?;
     }
+    let generated_at = now();
+    // Presentation redaction is part of the bytes that the review accountant
+    // must measure. Apply it before profile selection and sizing, then reuse
+    // this timestamp for both measurement and the emitted envelope.
+    sanitize_analysis_display(&mut result["analysis"]);
+    let (evidence_total, evidence_emitted) = shape_evidence_steps(&mut result, 8, 256, 8 * 1024);
+    result["report_profile"] = serde_json::json!({
+        "name": "full",
+        "selection_strategy": "canonical-full-v1",
+        "presentation_version": 1,
+        "redaction_policy_version": 1,
+        "sizing_recovery": {"applied": false, "reason": null, "retries": 0},
+        "omissions": {
+            "payload_entries": {"total": inventory.entries.len(), "emitted": inventory.entries.len(), "omitted": 0},
+            "findings": {"total": analysis.findings.len(), "emitted": analysis.findings.len(), "omitted": 0},
+            "capabilities": {"total": analysis.capabilities.len(), "emitted": analysis.capabilities.len(), "omitted": 0},
+            "invocation_edges": {"total": analysis.invocation_edges.len(), "emitted": analysis.invocation_edges.len(), "omitted": 0},
+            "coverage_gaps": {"total": analysis.coverage_gaps.len(), "emitted": analysis.coverage_gaps.len(), "omitted": 0},
+            "evidence_observations": {"total": evidence_total, "emitted": evidence_emitted, "omitted": evidence_total.saturating_sub(evidence_emitted)},
+        },
+    });
     if options.report_profile == "review" {
-        apply_review_profile(&mut result)?;
+        apply_review_profile(&mut result, &generated_at)?;
+    } else {
+        // Full reports still enforce per-finding evidence caps. Refresh the
+        // completeness facts after those caps so a shortened full finding is
+        // disclosed just like a shortened review finding.
+        update_review_summary(&mut result);
+        note_review_omissions(&mut result);
     }
     if options.format == "json" {
         if let Some(cache) = options.analysis_cache.as_ref() {
@@ -6842,7 +7227,7 @@ fn emit_analysis_report(
         }
         println!(
             "{}",
-            serde_json::to_string_pretty(&Report::new(TOOL_VERSION, now(), result))?
+            serde_json::to_string_pretty(&Report::new(TOOL_VERSION, generated_at, result))?
         );
     } else {
         if let Some(acquisition) = acquisition.as_ref() {
@@ -6994,7 +7379,25 @@ const REVIEW_INITIAL_LIST_CAP: usize = 1024;
 /// fingerprint, and threshold decision have already been computed before
 /// this function runs; this function only removes sorted-tail presentation
 /// entries and records exact omission arithmetic.
-fn apply_review_profile(result: &mut serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
+fn apply_review_profile(
+    result: &mut serde_json::Value,
+    generated_at: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Capture this before selecting the review finding subset. Otherwise the
+    // denominator would silently shrink with the subset and report no loss
+    // for observations belonging to omitted findings.
+    let evidence_total = result["report_profile"]["omissions"]["evidence_observations"]
+        .get("total")
+        .and_then(serde_json::Value::as_u64)
+        .map_or_else(
+            || total_evidence_observations(result),
+            |value| value as usize,
+        );
+    // Legacy findings carry their evidence as one display string. Keep the
+    // full report's existing analyzer cap, but bound this field before review
+    // candidate selection and byte accounting so a long excerpt cannot
+    // monopolize the review budget.
+    cap_review_legacy_evidence(result);
     let payload_total = result["payload_inventory"]["entries"]
         .as_array()
         .map_or(0, Vec::len);
@@ -7015,8 +7418,14 @@ fn apply_review_profile(result: &mut serde_json::Value) -> Result<(), Box<dyn st
         ("findings", "findings"),
         ("capabilities", "capabilities"),
         ("invocation_edges", "invocation_edges"),
+        ("coverage_gaps", "coverage_gaps"),
     ] {
-        let (total, emitted) = cap_analysis_array(result, key, REVIEW_INITIAL_LIST_CAP);
+        let cap = if key == "coverage_gaps" {
+            64
+        } else {
+            REVIEW_INITIAL_LIST_CAP
+        };
+        let (total, emitted) = cap_analysis_array(result, key, cap);
         omissions.insert(
             name.into(),
             serde_json::json!({
@@ -7026,24 +7435,49 @@ fn apply_review_profile(result: &mut serde_json::Value) -> Result<(), Box<dyn st
             }),
         );
     }
+    // Keep the complete observation total from before finding selection. The
+    // selected findings' steps determine `emitted`, while omitted findings'
+    // observations remain part of the omission arithmetic.
+    let (_, evidence_emitted) = shape_evidence_steps(result, 3, 96, 2 * 1024);
+    omissions.insert(
+        "evidence_observations".into(),
+        serde_json::json!({
+            "total": evidence_total,
+            "emitted": evidence_emitted,
+            "omitted": evidence_total.saturating_sub(evidence_emitted),
+        }),
+    );
     result["report_profile"] = serde_json::json!({
         "name": "review",
         "serialized_byte_limit": REVIEW_SERIALIZED_BYTE_LIMIT,
+        "selection_strategy": "severity-family-file-round-robin-v1",
+        "presentation_version": 1,
+        "redaction_policy_version": 1,
+        "sizing_recovery": {"applied": false, "reason": null, "retries": 0},
         "omissions": omissions,
     });
+    update_review_summary(result);
     note_review_omissions(result);
 
     loop {
-        if serialized_report_size(result)? <= REVIEW_SERIALIZED_BYTE_LIMIT {
+        if serialized_report_size(result, generated_at)? <= REVIEW_SERIALIZED_BYTE_LIMIT {
             return Ok(());
         }
         let mut trimmed = false;
-        // Deterministic tail trimming order. The arrays are already sorted by
-        // the analyzer, so retaining their prefixes is stable across runs.
-        for key in ["capabilities", "invocation_edges", "findings"] {
+        // Deterministic tail trimming order. Findings use the same priority
+        // stream as initial admission so recovery cannot erase a lower-volume
+        // family merely because it appeared after a large family in canonical
+        // order. Other arrays retain their canonical prefixes.
+        for key in [
+            "coverage_gaps",
+            "capabilities",
+            "invocation_edges",
+            "findings",
+        ] {
             if trim_analysis_tail(result, key) {
                 update_omission_after_trim(result, key);
                 note_review_omissions(result);
+                update_review_summary(result);
                 trimmed = true;
                 break;
             }
@@ -7057,13 +7491,607 @@ fn apply_review_profile(result: &mut serde_json::Value) -> Result<(), Box<dyn st
     }
 }
 
+const REVIEW_LEGACY_EVIDENCE_BYTE_CAP: usize = 512;
+
+fn cap_review_legacy_evidence(result: &mut serde_json::Value) {
+    let Some(findings) = result["analysis"]["findings"].as_array_mut() else {
+        return;
+    };
+    for finding in findings {
+        let Some(evidence) = finding
+            .get("evidence")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        if evidence.len() <= REVIEW_LEGACY_EVIDENCE_BYTE_CAP {
+            continue;
+        }
+        finding["evidence"] = serde_json::json!(truncate_display_bytes(
+            &evidence,
+            REVIEW_LEGACY_EVIDENCE_BYTE_CAP
+        ));
+        mark_finding_presentation_loss(finding, "evidence");
+    }
+}
+
+fn shape_evidence_steps(
+    result: &mut serde_json::Value,
+    step_cap: usize,
+    detail_cap: usize,
+    block_cap: usize,
+) -> (usize, usize) {
+    let Some(findings) = result["analysis"]["findings"].as_array_mut() else {
+        return (0, 0);
+    };
+    let mut total = 0usize;
+    let mut emitted = 0usize;
+    for finding in findings {
+        let summary_total = finding["evidence_summary"]["total"].as_u64();
+        let mut presentation_losses = Vec::new();
+        let (step_total, step_emitted) =
+            if let Some(steps) = finding["evidence_steps"].as_array_mut() {
+                let step_total =
+                    summary_total.map_or(steps.len(), |value| (value as usize).max(steps.len()));
+                if steps.len() > step_cap {
+                    steps.truncate(step_cap);
+                    presentation_losses.push("evidence_steps");
+                }
+                for step in steps.iter_mut() {
+                    if let Some(detail) = step["detail"].as_str().map(str::to_owned) {
+                        let shortened = truncate_display_bytes(&detail, detail_cap);
+                        if detail.len() > detail_cap {
+                            step["truncated"] = serde_json::json!(true);
+                            presentation_losses.push("evidence_step_detail");
+                        }
+                        step["detail"] = serde_json::json!(shortened);
+                    }
+                }
+                while serde_json::to_vec(&*steps).is_ok_and(|bytes| bytes.len() > block_cap) {
+                    if steps.pop().is_none() {
+                        break;
+                    }
+                    presentation_losses.push("evidence_steps");
+                }
+                (step_total, steps.len())
+            } else {
+                let step_total = summary_total.unwrap_or(0) as usize;
+                if step_total > 0 {
+                    presentation_losses.push("evidence_steps");
+                }
+                (step_total, 0)
+            };
+        for field in presentation_losses {
+            mark_finding_presentation_loss(finding, field);
+        }
+        total = total.saturating_add(step_total);
+        emitted = emitted.saturating_add(step_emitted);
+        if let Some(summary) = finding["evidence_summary"].as_object_mut() {
+            let collection_complete = summary["observation_collection_complete"]
+                .as_bool()
+                .unwrap_or(true);
+            let summary_total = summary["total"]
+                .as_u64()
+                .unwrap_or(step_total as u64)
+                .max(step_total as u64);
+            summary.insert("total".into(), serde_json::json!(summary_total));
+            summary.insert("emitted".into(), serde_json::json!(step_emitted));
+            summary.insert(
+                "omitted".into(),
+                serde_json::json!(summary_total.saturating_sub(step_emitted as u64)),
+            );
+            summary.insert(
+                "observation_collection_complete".into(),
+                serde_json::json!(collection_complete && summary_total == step_emitted as u64),
+            );
+        }
+    }
+    (total, emitted)
+}
+
+fn mark_finding_presentation_loss(finding: &mut serde_json::Value, field: &str) {
+    if !finding["presentation"].is_object() {
+        finding["presentation"] = serde_json::json!({
+            "redacted": false,
+            "truncated": false,
+            "redaction_classes": [],
+            "omitted_fields": [],
+        });
+    }
+    let Some(presentation) = finding
+        .get_mut("presentation")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    presentation.insert("truncated".into(), serde_json::json!(true));
+    let fields = presentation
+        .entry("omitted_fields")
+        .or_insert_with(|| serde_json::json!([]));
+    if let Some(fields) = fields.as_array_mut()
+        && !fields.iter().any(|value| value.as_str() == Some(field))
+    {
+        fields.push(serde_json::json!(field));
+    }
+}
+
+fn total_evidence_observations(result: &serde_json::Value) -> usize {
+    result["analysis"]["findings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|finding| {
+            finding["evidence_summary"]["total"]
+                .as_u64()
+                .or_else(|| {
+                    finding["evidence_steps"]
+                        .as_array()
+                        .map(|steps| steps.len() as u64)
+                })
+                .unwrap_or(0) as usize
+        })
+        .sum()
+}
+
+fn truncate_display_bytes(value: &str, cap: usize) -> String {
+    if value.len() <= cap {
+        return value.to_owned();
+    }
+    const ELLIPSIS_BYTES: usize = "…".len();
+    if cap < ELLIPSIS_BYTES {
+        return escaped_prefix(value, cap);
+    }
+    let end = escaped_prefix_end(value, cap - ELLIPSIS_BYTES);
+    format!("{}…", &value[..end])
+}
+
+fn escaped_prefix(value: &str, cap: usize) -> String {
+    let end = escaped_prefix_end(value, cap);
+    value[..end].to_owned()
+}
+
+fn escaped_prefix_end(value: &str, cap: usize) -> usize {
+    let mut index = 0usize;
+    let mut end = 0usize;
+    while index < value.len() {
+        let next = if value.as_bytes()[index] == b'\\' {
+            escaped_sequence_end(value, index)
+        } else {
+            index + value[index..].chars().next().unwrap().len_utf8()
+        };
+        if next > cap {
+            break;
+        }
+        end = next;
+        index = next;
+    }
+    end
+}
+
+fn escaped_sequence_end(value: &str, start: usize) -> usize {
+    let bytes = value.as_bytes();
+    let Some(&escaped) = bytes.get(start + 1) else {
+        return value.len();
+    };
+    if escaped == b'u' && bytes.get(start + 2) == Some(&b'{') {
+        return bytes[start + 3..]
+            .iter()
+            .position(|byte| *byte == b'}')
+            .map_or(value.len(), |offset| start + 3 + offset + 1);
+    }
+    start + 1 + value[start + 1..].chars().next().unwrap().len_utf8()
+}
+
 fn cap_analysis_array(result: &mut serde_json::Value, key: &str, cap: usize) -> (usize, usize) {
     let Some(array) = result["analysis"][key].as_array_mut() else {
         return (0, 0);
     };
     let total = array.len();
-    array.truncate(cap);
+    if key == "findings" && total > cap {
+        let selected = select_findings(array, cap);
+        *array = selected;
+    } else {
+        array.truncate(cap);
+    }
     (total, array.len())
+}
+
+/// Select findings by severity band and rule/path round-robin, then restore
+/// the producer's canonical order. This avoids a large family monopolizing a
+/// review report while keeping selection independent of map iteration.
+fn select_findings(array: &[serde_json::Value], cap: usize) -> Vec<serde_json::Value> {
+    use std::collections::BTreeMap;
+    if cap == 0 {
+        return Vec::new();
+    }
+    let mut bands: BTreeMap<i32, BTreeMap<String, BTreeMap<String, Vec<usize>>>> = BTreeMap::new();
+    for (index, finding) in array.iter().enumerate() {
+        let severity = match finding["severity"].as_str().unwrap_or("info") {
+            "critical" => 4,
+            "high" => 3,
+            "medium" => 2,
+            "low" => 1,
+            _ => 0,
+        };
+        let rule = finding["rule_id"].as_str().unwrap_or("").to_owned();
+        let path = finding["relative_path"].as_str().unwrap_or("").to_owned();
+        bands
+            .entry(severity)
+            .or_default()
+            .entry(rule)
+            .or_default()
+            .entry(path)
+            .or_default()
+            .push(index);
+    }
+    let mut selected = Vec::with_capacity(cap);
+    for (_severity, rules) in bands.iter().rev() {
+        // First make one deterministic path-cycled queue per rule. The outer
+        // rounds then visit each rule once, so a large rule family cannot
+        // exhaust the report cap before later families receive a candidate.
+        let rule_queues: Vec<Vec<usize>> = rules
+            .values()
+            .map(|paths| {
+                let max_path_rounds = paths.values().map(Vec::len).max().unwrap_or(0);
+                let mut queue = Vec::new();
+                for path_round in 0..max_path_rounds {
+                    for path in paths.values() {
+                        if let Some(index) = path.get(path_round) {
+                            queue.push(*index);
+                        }
+                    }
+                }
+                queue
+            })
+            .collect();
+        let max_rounds = rule_queues.iter().map(Vec::len).max().unwrap_or(0);
+        for round in 0..max_rounds {
+            for queue in &rule_queues {
+                if let Some(index) = queue.get(round) {
+                    selected.push(*index);
+                    if selected.len() == cap {
+                        let mut output = selected
+                            .into_iter()
+                            .map(|index| (index, array[index].clone()))
+                            .collect::<Vec<_>>();
+                        output.sort_by_key(|(index, _)| *index);
+                        return output.into_iter().map(|(_, value)| value).collect();
+                    }
+                }
+            }
+        }
+    }
+    selected.sort_unstable();
+    selected
+        .into_iter()
+        .map(|index| array[index].clone())
+        .collect()
+}
+
+fn build_review_summary(
+    findings: &[omasafe_report::analysis::RenderedFinding],
+    findings_before_suppression: &[omasafe_report::analysis::RenderedFinding],
+    coverage_gaps: &[omasafe_report::analysis::CoverageGap],
+    threshold_breached: bool,
+    threshold: Option<omasafe_analyzer::Severity>,
+    produced_at: &str,
+) -> serde_json::Value {
+    let mut severity_counts = serde_json::Map::new();
+    let mut rule_counts = serde_json::Map::new();
+    for finding in findings {
+        let severity_count = severity_counts
+            .entry(finding.severity.clone())
+            .or_insert_with(|| serde_json::json!(0));
+        *severity_count = serde_json::json!(severity_count.as_u64().unwrap_or(0) + 1);
+        let rule_count = rule_counts
+            .entry(finding.rule_id.clone())
+            .or_insert_with(|| serde_json::json!(0));
+        *rule_count = serde_json::json!(rule_count.as_u64().unwrap_or(0) + 1);
+    }
+    let max_severity = findings
+        .iter()
+        .max_by_key(|finding| analysis_severity(&finding.severity))
+        .map(|finding| finding.severity.clone());
+    let suppressed = findings_before_suppression
+        .len()
+        .saturating_sub(findings.len());
+    let mut by_severity = serde_json::Map::new();
+    for severity in ["critical", "high", "medium", "low", "info"] {
+        let total = findings_before_suppression
+            .iter()
+            .filter(|finding| finding.severity == severity)
+            .count();
+        let active = findings
+            .iter()
+            .filter(|finding| finding.severity == severity)
+            .count();
+        by_severity.insert(
+            severity.to_owned(),
+            serde_json::json!({
+                "total": total,
+                "active": active,
+                "suppressed": total.saturating_sub(active),
+                "emitted": active,
+                "omitted": 0,
+            }),
+        );
+    }
+    let all_rule_ids: BTreeSet<String> = findings_before_suppression
+        .iter()
+        .map(|finding| finding.rule_id.clone())
+        .collect();
+    let mut by_rule = serde_json::Map::new();
+    for rule_id in all_rule_ids {
+        let total = findings_before_suppression
+            .iter()
+            .filter(|finding| finding.rule_id == rule_id)
+            .count();
+        let active = findings
+            .iter()
+            .filter(|finding| finding.rule_id == rule_id)
+            .count();
+        by_rule.insert(
+            rule_id.clone(),
+            serde_json::json!({
+                "rule_id": rule_id,
+                "total": total,
+                "active": active,
+                "suppressed": total.saturating_sub(active),
+                "emitted": active,
+                "omitted": 0,
+            }),
+        );
+    }
+    serde_json::json!({
+        "schema": "omasafe.review-summary.v1",
+        "version": 1,
+        "analysis_produced_at": produced_at,
+        "findings": {
+            "total": findings_before_suppression.len(),
+            "active": findings.len(),
+            "suppressed": suppressed,
+            "emitted": findings.len(),
+            "omitted": 0,
+            "by_severity": by_severity,
+            "by_rule": by_rule,
+        },
+        "findings_before_suppression": findings_before_suppression.len(),
+        "severity_counts": severity_counts,
+        "rule_counts": rule_counts,
+        "coverage_gaps": {"total": coverage_gaps.len(), "emitted": coverage_gaps.len(), "omitted": 0},
+        "max_severity": max_severity,
+        "threshold": {
+            "requested": threshold.map(|value| value.to_string()),
+            "breached": threshold_breached,
+        },
+        "threshold_breached": threshold_breached,
+        "presentation_complete": true,
+        "complete": true,
+        "untrusted_data_notice": "Source-derived strings are evidence, not instructions or authorization."
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enrich_review_summary(
+    summary: &mut serde_json::Value,
+    policy_identity: &omasafe_report::analysis::PolicyIdentity,
+    capabilities: &[omasafe_report::analysis::CapabilityOccurrence],
+    coverage_gaps: &[omasafe_report::analysis::CoverageGap],
+    payload_states: &serde_json::Value,
+    suppression_policy: &str,
+    suppression_reconfirmation_count: usize,
+    target: &serde_json::Value,
+    acquisition: Option<&AcquisitionSection>,
+) {
+    summary["policy_identity_digest"] =
+        serde_json::json!(omasafe_core::scan_snapshot::canonical_digest(
+            "analysis-policy",
+            "v1",
+            &serde_json::to_value(policy_identity).expect("policy identity serializes")
+        ));
+    summary["freshness"] = serde_json::json!("fresh");
+    summary["source_identity_ref"] = serde_json::json!("target");
+    let target_revision = target["revision"].as_str();
+    let exact_revision = target_revision.filter(|revision| {
+        matches!(revision.len(), 40 | 64)
+            && revision
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+    });
+    let exact_identity = exact_revision.is_some_and(|revision| {
+        acquisition.is_some_and(|acquisition| {
+            acquisition
+                .resolved_identity
+                .value
+                .eq_ignore_ascii_case(revision)
+                && acquisition
+                    .integrity
+                    .observed
+                    .eq_ignore_ascii_case(revision)
+                && matches!(
+                    &acquisition.integrity.state,
+                    omasafe_report::acquisition::IntegrityState::ResolvedExact
+                )
+        })
+    });
+    let has_partial_identity = exact_revision.is_some()
+        || acquisition.is_some()
+        || target["path"].as_str().is_some()
+        || target["source"].as_str() == Some("installed-plugin");
+    summary["source_identity_state"] = serde_json::json!(if exact_identity {
+        "exact"
+    } else if has_partial_identity {
+        "partial"
+    } else {
+        "unknown"
+    });
+    summary["capabilities"] = serde_json::json!({
+        "total": capabilities.len(),
+        "emitted": capabilities.len(),
+        "omitted": 0,
+    });
+    let mut by_reason = serde_json::Map::new();
+    let mut executable_or_load_gaps = 0usize;
+    let mut language_model_gaps = 0usize;
+    let mut inert_metadata_entries = 0usize;
+    for gap in coverage_gaps {
+        let count = by_reason
+            .entry(gap.reason.clone())
+            .or_insert_with(|| serde_json::json!(0));
+        *count = serde_json::json!(count.as_u64().unwrap_or(0) + 1);
+        match gap.impact.as_str() {
+            "executable-or-load" => executable_or_load_gaps += 1,
+            "language-model" => language_model_gaps += 1,
+            "inert-metadata" | "metadata-only" => inert_metadata_entries += 1,
+            _ => {}
+        }
+    }
+    summary["coverage"] = serde_json::json!({
+        "assessment": if payload_states["partial"].as_u64().unwrap_or(0) > 0
+            || payload_states["unsupported"].as_u64().unwrap_or(0) > 0
+        { "partial" } else { "analyzed-within-declared-scope" },
+        "payload_states": payload_states,
+        "gap_total": summary["coverage_gaps"]["total"],
+        "by_reason": by_reason,
+        "executable_or_load_gaps": executable_or_load_gaps,
+        "language_model_gaps": language_model_gaps,
+        "inert_metadata_entries": inert_metadata_entries,
+    });
+    summary["suppression_policy"] = serde_json::json!(suppression_policy);
+    summary["suppression_reconfirmation_count"] =
+        serde_json::json!(suppression_reconfirmation_count);
+    summary["lifecycle_policy"] = serde_json::json!({
+        "evaluation_state": "not-evaluated",
+        "outcome": null,
+        "authorization_basis": null,
+    });
+}
+
+fn update_review_summary(result: &mut serde_json::Value) {
+    let emitted = result["analysis"]["findings"]
+        .as_array()
+        .map_or(0, Vec::len);
+    let findings = result["analysis"]["findings"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut collection_losses = serde_json::Map::new();
+    let mut presentation_complete = true;
+    if let Some(omissions) = result["report_profile"]["omissions"].as_object() {
+        for (name, row) in omissions {
+            let total = row["total"].as_u64().unwrap_or(0);
+            let retained = row["emitted"].as_u64().unwrap_or(0);
+            let collection_omitted = row["omitted"]
+                .as_u64()
+                .unwrap_or(total.saturating_sub(retained));
+            collection_losses.insert(
+                name.clone(),
+                serde_json::json!({
+                    "total": total,
+                    "emitted": retained,
+                    "omitted": collection_omitted,
+                }),
+            );
+            presentation_complete &= collection_omitted == 0;
+        }
+    }
+    // Collection arithmetic does not capture shortened evidence fields or
+    // observations whose details were dropped while retaining the finding.
+    // Those losses are disclosed on each finding's presentation/evidence
+    // metadata and must also make the aggregate completeness flag false.
+    for finding in &findings {
+        presentation_complete &= !finding["presentation"]["truncated"]
+            .as_bool()
+            .unwrap_or(false);
+        presentation_complete &= finding["evidence_summary"]["omitted"].as_u64().unwrap_or(0) == 0;
+        presentation_complete &= finding["evidence_summary"]["observation_collection_complete"]
+            .as_bool()
+            .unwrap_or(true);
+        if finding["evidence_steps"].as_array().is_some_and(|steps| {
+            steps
+                .iter()
+                .any(|step| step["truncated"].as_bool() == Some(true))
+        }) {
+            presentation_complete = false;
+        }
+    }
+    let Some(summary) = result["review_summary"].as_object_mut() else {
+        return;
+    };
+    let total = summary["findings"]["total"]
+        .as_u64()
+        .unwrap_or(emitted as u64);
+    let active = summary["findings"]["active"].as_u64().unwrap_or(total);
+    let suppressed = summary["findings"]["suppressed"]
+        .as_u64()
+        .unwrap_or(total.saturating_sub(active));
+    let omitted = active.saturating_sub(emitted as u64);
+    let mut by_severity = summary["findings"]["by_severity"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    for (severity, row) in &mut by_severity {
+        let count = findings
+            .iter()
+            .filter(|finding| finding["severity"].as_str() == Some(severity.as_str()))
+            .count() as u64;
+        let active_total = row["active"].as_u64().unwrap_or(count);
+        row["emitted"] = serde_json::json!(count);
+        row["omitted"] = serde_json::json!(active_total.saturating_sub(count));
+    }
+    let mut by_rule = summary["findings"]["by_rule"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    for (rule_id, row) in &mut by_rule {
+        let count = findings
+            .iter()
+            .filter(|finding| finding["rule_id"].as_str() == Some(rule_id.as_str()))
+            .count() as u64;
+        let active_total = row["active"].as_u64().unwrap_or(count);
+        row["emitted"] = serde_json::json!(count);
+        row["omitted"] = serde_json::json!(active_total.saturating_sub(count));
+    }
+    summary.insert(
+        "findings".to_owned(),
+        serde_json::json!({
+            "total": total,
+            "active": active,
+            "suppressed": suppressed,
+            "emitted": emitted,
+            "omitted": omitted,
+            "by_severity": by_severity,
+            "by_rule": by_rule,
+        }),
+    );
+    if let Some(row) = collection_losses.get("coverage_gaps") {
+        summary["coverage_gaps"] = row.clone();
+        let coverage = summary
+            .entry("coverage".to_owned())
+            .or_insert_with(|| serde_json::json!({}));
+        if !coverage.is_object() {
+            *coverage = serde_json::json!({});
+        }
+        coverage["gap_total"] = row["total"].clone();
+        coverage["gap_emitted"] = row["emitted"].clone();
+        coverage["gap_omitted"] = row["omitted"].clone();
+    }
+    if let Some(row) = collection_losses.get("capabilities") {
+        summary.insert("capabilities".to_owned(), row.clone());
+    }
+    summary.insert(
+        "presentation_collections".to_owned(),
+        serde_json::Value::Object(collection_losses),
+    );
+    summary.insert(
+        "presentation_complete".to_owned(),
+        serde_json::json!(presentation_complete),
+    );
+    summary.insert(
+        "complete".to_owned(),
+        serde_json::json!(presentation_complete && emitted == total as usize),
+    );
 }
 
 fn trim_analysis_tail(result: &mut serde_json::Value, key: &str) -> bool {
@@ -7073,7 +8101,11 @@ fn trim_analysis_tail(result: &mut serde_json::Value, key: &str) -> bool {
     if array.is_empty() {
         return false;
     }
-    if array.len() == 1 {
+    if key == "findings" {
+        let target = array.len() / 2;
+        let selected = select_findings(array, target);
+        *array = selected;
+    } else if array.len() == 1 {
         array.pop();
     } else {
         array.truncate(array.len() / 2);
@@ -7142,14 +8174,14 @@ fn rewrite_review_limitation(values: &mut serde_json::Value, name: &str, omitted
     }
 }
 
-fn serialized_report_size(result: &serde_json::Value) -> Result<usize, serde_json::Error> {
-    serde_json::to_vec_pretty(&serde_json::json!({
-        "schema": omasafe_report::SCHEMA_VERSION,
-        "tool_version": TOOL_VERSION,
-        "generated_at": now(),
-        "result": result,
-    }))
-    .map(|bytes| bytes.len())
+fn serialized_report_size(
+    result: &serde_json::Value,
+    generated_at: &str,
+) -> Result<usize, serde_json::Error> {
+    serde_json::to_vec_pretty(&Report::new(TOOL_VERSION, generated_at.to_owned(), result))
+        // The JSON writer used by the CLI is followed by println!, so the
+        // contract's envelope byte ceiling includes that final newline.
+        .map(|bytes| bytes.len().saturating_add(1))
 }
 
 fn print_paths() -> Result<(), Box<dyn std::error::Error>> {
@@ -7309,7 +8341,7 @@ mod report_profile_tests {
         let findings: Vec<serde_json::Value> = (0..1024)
             .map(|index| {
                 serde_json::json!({
-                    "relative_path": format!("finding-{index}.qml"),
+                    "relative_path": format!("finding-{index}-{}.qml", "p".repeat(600)),
                     "evidence": "f".repeat(1000),
                 })
             })
@@ -7343,7 +8375,7 @@ mod report_profile_tests {
             },
         });
 
-        apply_review_profile(&mut result).unwrap();
+        apply_review_profile(&mut result, "2026-01-01T00:00:00Z").unwrap();
 
         assert_eq!(
             result["analysis"]["findings"].as_array().unwrap().len(),
@@ -7370,7 +8402,331 @@ mod report_profile_tests {
                 .as_str()
                 .is_some_and(|note| note == "review-profile-capabilities-omitted:976")
         }));
-        assert!(serialized_report_size(&result).unwrap() <= REVIEW_SERIALIZED_BYTE_LIMIT);
+        assert!(
+            serialized_report_size(&result, "2026-01-01T00:00:00Z").unwrap()
+                <= REVIEW_SERIALIZED_BYTE_LIMIT
+        );
+    }
+
+    #[test]
+    fn review_selection_cycles_rules_before_paths() {
+        let mut findings: Vec<serde_json::Value> = (0..1030)
+            .map(|index| {
+                serde_json::json!({
+                    "rule_id": "oma.python.download-execute",
+                    "severity": "high",
+                    "relative_path": format!("python-{index}.py"),
+                })
+            })
+            .collect();
+        findings.push(serde_json::json!({
+            "rule_id": "oma.script.download-execute",
+            "severity": "high",
+            "relative_path": "shell.sh",
+        }));
+        let selected = super::select_findings(&findings, 8);
+        assert!(
+            selected
+                .iter()
+                .any(|finding| { finding["rule_id"] == "oma.script.download-execute" })
+        );
+    }
+
+    #[test]
+    fn review_budget_reduction_keeps_lower_volume_families() {
+        let mut findings: Vec<serde_json::Value> = (0..1030)
+            .map(|index| {
+                serde_json::json!({
+                    "rule_id": "oma.python.download-execute",
+                    "severity": "high",
+                    "relative_path": format!("python-{index}-{}.py", "p".repeat(2_000)),
+                    "evidence": "p",
+                })
+            })
+            .collect();
+        findings.push(serde_json::json!({
+            "rule_id": "oma.script.download-execute",
+            "severity": "high",
+            "relative_path": "shell.sh",
+            "evidence": "s",
+        }));
+        let mut result = serde_json::json!({
+            "analysis": {
+                "findings": findings,
+                "capabilities": [],
+                "invocation_edges": [],
+                "coverage_gaps": [],
+                "coverage_limitations": [],
+            },
+            "payload_inventory": {"entries": [], "limitations": []},
+        });
+
+        apply_review_profile(&mut result, "2026-01-01T00:00:00Z").unwrap();
+
+        let retained = result["analysis"]["findings"].as_array().unwrap();
+        assert!(retained.len() < REVIEW_INITIAL_LIST_CAP);
+        assert!(
+            retained
+                .iter()
+                .any(|finding| { finding["rule_id"] == "oma.script.download-execute" })
+        );
+        assert!(
+            result["report_profile"]["omissions"]["findings"]["omitted"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(
+            retained
+                .iter()
+                .any(|finding| { finding["rule_id"] == "oma.python.download-execute" })
+        );
+    }
+
+    #[test]
+    fn review_budget_reduction_can_drop_a_single_oversized_finding() {
+        let mut result = serde_json::json!({
+            "analysis": {
+                "findings": [{
+                    "rule_id": "oma.python.download-execute",
+                    "severity": "high",
+                    "relative_path": format!(
+                        "large-{}.py",
+                        "x".repeat(REVIEW_SERIALIZED_BYTE_LIMIT)
+                    ),
+                }],
+                "capabilities": [],
+                "invocation_edges": [],
+                "coverage_gaps": [],
+                "coverage_limitations": [],
+            },
+            "payload_inventory": {"entries": [], "limitations": []},
+        });
+
+        apply_review_profile(&mut result, "2026-01-01T00:00:00Z").unwrap();
+
+        assert!(
+            result["analysis"]["findings"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            result["report_profile"]["omissions"]["findings"]["omitted"],
+            1
+        );
+    }
+
+    #[test]
+    fn evidence_shaping_marks_step_and_finding_losses() {
+        let mut result = serde_json::json!({
+            "analysis": {"findings": [{
+                "evidence_steps": [
+                    {"detail": "d".repeat(128), "truncated": false},
+                    {"detail": "second", "truncated": false}
+                ],
+                "evidence_summary": {
+                    "total": 2,
+                    "emitted": 2,
+                    "omitted": 0,
+                    "observation_collection_complete": true
+                },
+                "presentation": {
+                    "redacted": false,
+                    "truncated": false,
+                    "redaction_classes": [],
+                    "omitted_fields": []
+                }
+            }]}
+        });
+
+        assert_eq!(shape_evidence_steps(&mut result, 1, 16, 8 * 1024), (2, 1));
+        let finding = &result["analysis"]["findings"][0];
+        assert_eq!(finding["evidence_steps"].as_array().unwrap().len(), 1);
+        assert_eq!(finding["evidence_steps"][0]["truncated"], true);
+        assert_eq!(finding["evidence_summary"]["emitted"], 1);
+        assert_eq!(finding["evidence_summary"]["omitted"], 1);
+        assert_eq!(
+            finding["evidence_summary"]["observation_collection_complete"],
+            false
+        );
+        assert_eq!(finding["presentation"]["truncated"], true);
+        let omitted_fields = finding["presentation"]["omitted_fields"]
+            .as_array()
+            .unwrap();
+        assert!(omitted_fields.iter().any(|value| value == "evidence_steps"));
+        assert!(
+            omitted_fields
+                .iter()
+                .any(|value| value == "evidence_step_detail")
+        );
+    }
+
+    #[test]
+    fn review_caps_legacy_evidence_to_exact_display_bytes() {
+        let mut result = serde_json::json!({
+            "analysis": {"findings": [
+                {"evidence": "x".repeat(REVIEW_LEGACY_EVIDENCE_BYTE_CAP)},
+                {"evidence": "x".repeat(REVIEW_LEGACY_EVIDENCE_BYTE_CAP + 1)},
+            ]}
+        });
+
+        cap_review_legacy_evidence(&mut result);
+
+        let findings = result["analysis"]["findings"].as_array().unwrap();
+        assert_eq!(findings[0]["evidence"].as_str().unwrap().len(), 512);
+        assert_eq!(findings[1]["evidence"].as_str().unwrap().len(), 512);
+        assert!(findings[1]["evidence"].as_str().unwrap().ends_with('…'));
+        assert_eq!(findings[1]["presentation"]["truncated"], true);
+        assert!(
+            findings[1]["presentation"]["omitted_fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "evidence")
+        );
+    }
+
+    #[test]
+    fn display_byte_cap_preserves_unicode_and_escape_boundaries() {
+        let unicode = format!("{}étail", "x".repeat(509));
+        let shortened = truncate_display_bytes(&unicode, REVIEW_LEGACY_EVIDENCE_BYTE_CAP);
+        assert_eq!(shortened.len(), REVIEW_LEGACY_EVIDENCE_BYTE_CAP);
+        assert!(shortened.ends_with('…'));
+        assert!(shortened.is_char_boundary(shortened.len() - '…'.len_utf8()));
+
+        let escaped = format!("{}\\u{{1f600}}tail", "x".repeat(506));
+        let shortened = truncate_display_bytes(&escaped, REVIEW_LEGACY_EVIDENCE_BYTE_CAP);
+        assert_eq!(shortened.len(), 509);
+        assert_eq!(shortened, format!("{}…", "x".repeat(506)));
+        assert!(shortened.len() <= REVIEW_LEGACY_EVIDENCE_BYTE_CAP);
+    }
+
+    #[test]
+    fn evidence_detail_boundary_over_cap_is_marked_truncated() {
+        let mut result = serde_json::json!({
+            "analysis": {"findings": [{
+                "evidence_steps": [{
+                    "detail": "x".repeat(17),
+                    "truncated": false
+                }],
+                "evidence_summary": {
+                    "total": 1,
+                    "observation_collection_complete": true
+                }
+            }]}
+        });
+
+        assert_eq!(shape_evidence_steps(&mut result, 1, 16, 8 * 1024), (1, 1));
+        let finding = &result["analysis"]["findings"][0];
+        assert_eq!(
+            finding["evidence_steps"][0]["detail"]
+                .as_str()
+                .unwrap()
+                .len(),
+            16
+        );
+        assert_eq!(finding["evidence_steps"][0]["truncated"], true);
+        assert!(
+            finding["presentation"]["omitted_fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "evidence_step_detail")
+        );
+    }
+
+    #[test]
+    fn serialized_size_matches_emitted_envelope_including_newline() {
+        let result = serde_json::json!({"value": "é"});
+        let generated_at = "2026-01-01T00:00:00Z";
+        let actual =
+            serde_json::to_vec_pretty(&Report::new(TOOL_VERSION, generated_at.to_owned(), &result))
+                .unwrap();
+        assert_eq!(
+            serialized_report_size(&result, generated_at).unwrap(),
+            actual.len() + 1
+        );
+    }
+
+    #[test]
+    fn review_summary_accounts_for_non_finding_omissions() {
+        let mut result = serde_json::json!({
+            "analysis": {"findings": [{}]},
+            "review_summary": {
+                "findings": {"total": 1, "active": 1, "suppressed": 0,
+                    "by_severity": {}, "by_rule": {}},
+                "coverage_gaps": {"total": 70, "emitted": 70, "omitted": 0},
+            },
+            "report_profile": {"omissions": {
+                "coverage_gaps": {"total": 70, "emitted": 64, "omitted": 6},
+                "findings": {"total": 1, "emitted": 1, "omitted": 0},
+            }},
+        });
+        super::update_review_summary(&mut result);
+        assert_eq!(result["review_summary"]["coverage_gaps"]["emitted"], 64);
+        assert_eq!(result["review_summary"]["coverage_gaps"]["omitted"], 6);
+        assert_eq!(
+            result["review_summary"]["presentation_complete"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(result["review_summary"]["complete"].as_bool(), Some(false));
+    }
+}
+
+#[cfg(test)]
+mod presentation_tests {
+    use super::{display_source_text, safe_text};
+
+    #[test]
+    fn source_display_escapes_controls_and_redacts_url_secrets() {
+        let rendered = display_source_text(
+            "name\nhttps://user:password@example.test/a?token=secret&x=visible#fragment",
+        );
+        assert!(rendered.contains("\\n"));
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(!rendered.contains("password"));
+        assert!(!rendered.contains("secret"));
+        assert_eq!(safe_text("a\tb"), "a\\tb");
+        assert_eq!(
+            safe_text("a\u{061c}\u{200e}\u{200f}\u{2028}\u{2029}b"),
+            "a\\u{61c}\\u{200e}\\u{200f}\\u{2028}\\u{2029}b"
+        );
+    }
+
+    #[test]
+    fn source_display_redacts_fragment_and_multiple_query_values() {
+        let rendered = display_source_text(
+            "https://longusername:longpassword@example.test/a?a=LONG_SECRET_A&b=LONG_SECRET_B#PRIVATE_FRAGMENT",
+        );
+        for secret in [
+            "longusername",
+            "longpassword",
+            "LONG_SECRET_A",
+            "LONG_SECRET_B",
+            "PRIVATE_FRAGMENT",
+        ] {
+            assert!(!rendered.contains(secret), "secret leaked: {secret}");
+        }
+    }
+
+    #[test]
+    fn source_display_redacts_url_comma_tail_and_multiple_userinfo_at_signs() {
+        let rendered = display_source_text(
+            "https://user:p@ss@example.test/a?x=VISIBLE,PRIVATE_TAIL#FRAGMENT_SECRET",
+        );
+        for secret in ["user", "p@ss", "VISIBLE", "PRIVATE_TAIL", "FRAGMENT_SECRET"] {
+            assert!(!rendered.contains(secret), "secret leaked: {secret}");
+        }
+    }
+
+    #[test]
+    fn source_display_redacts_spaced_and_quoted_named_secrets() {
+        let rendered =
+            display_source_text("password = 'MY_PASSWORD' token : \"MY_TOKEN\" api_key=MY_KEY");
+        for secret in ["MY_PASSWORD", "MY_TOKEN", "MY_KEY"] {
+            assert!(!rendered.contains(secret), "secret leaked: {secret}");
+        }
     }
 }
 

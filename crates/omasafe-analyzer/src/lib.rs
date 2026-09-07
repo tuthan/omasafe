@@ -18,7 +18,7 @@ pub mod rules;
 #[cfg(feature = "qml-parser")]
 pub mod qml;
 
-pub use detect::{AnalysisArtifacts, analyze_inventory, parser_metadata};
+pub use detect::{AnalysisArtifacts, analyze_inventory, parser_metadata, parser_report_metadata};
 pub use equivalence::EquivalenceMap;
 pub use fingerprint::{Confidence, NormalizedResult, fingerprint_analysis, fingerprint_results};
 pub use ingest::{
@@ -29,8 +29,10 @@ pub use ingest::{
 };
 pub use omasafe_core::bounds::TimeBudget;
 pub use payload::{CoverageState, PayloadEntry, PayloadInventory, PayloadKind};
-pub use policy::policy_identity;
+pub use policy::{policy_identity, suppression_semantic_compatible};
 pub use rules::{
     Capability, EQUIVALENCE_MAP_VERSION, Language, RULE_CATALOG_VERSION, RuleDefinition,
-    SEVERITY_TABLE_VERSION, SUPPORTED_SURFACE_VERSION, Severity, catalog, rule,
+    RuleSemanticIdentity, RuleSupport, SEVERITY_TABLE_VERSION, SUPPORTED_SURFACE_VERSION, Severity,
+    catalog, rule, rule_semantic_identity, rule_semantic_identity_digest,
+    rule_semantics_catalog_digest, rule_support,
 };

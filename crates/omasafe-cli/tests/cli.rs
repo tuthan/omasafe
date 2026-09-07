@@ -1076,7 +1076,7 @@ fn rules_list_text_is_deterministic() {
         .clone();
     assert_eq!(first, second);
     let rendered = String::from_utf8(first).unwrap();
-    assert!(rendered.contains("rule catalog v7"));
+    assert!(rendered.contains("rule catalog v8"));
     assert!(rendered.contains("oma.qml.session-lock"));
 }
 
@@ -1172,7 +1172,7 @@ fn analyze_reports_full_payload_inventory_end_to_end() {
     assert_eq!(report["result"]["target"]["source"], "installed-plugin");
     let analysis = &report["result"]["analysis"];
     assert_eq!(analysis["schema"], "omasafe.analysis.v1");
-    assert_eq!(analysis["policy_identity"]["rule_catalog_version"], 7);
+    assert_eq!(analysis["policy_identity"]["rule_catalog_version"], 8);
     let inventory = &report["result"]["payload_inventory"];
     let states = &inventory["coverage_states"];
     // S3+S4: analyzable files land in analyzed/unreferenced/partial; only
@@ -1219,7 +1219,12 @@ fn analyze_is_deterministic_for_unchanged_input() {
         .stdout
         .clone();
     let first: Value = serde_json::from_slice(&first).unwrap();
-    let second: Value = serde_json::from_slice(&second).unwrap();
+    let mut second: Value = serde_json::from_slice(&second).unwrap();
+    assert_eq!(
+        second["result"]["review_summary"]["freshness"],
+        "cached-current"
+    );
+    second["result"]["review_summary"]["freshness"] = Value::String("fresh".into());
     assert_eq!(first["result"], second["result"]);
 }
 
@@ -1260,7 +1265,12 @@ fn analyze_output_cache_survives_a_new_cli_process() {
         .unwrap();
     assert!(second.status.success());
     let first: Value = serde_json::from_slice(&first).unwrap();
-    let second: Value = serde_json::from_slice(&second.stdout).unwrap();
+    let mut second: Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(
+        second["result"]["review_summary"]["freshness"],
+        "cached-current"
+    );
+    second["result"]["review_summary"]["freshness"] = Value::String("fresh".into());
     assert_eq!(first["result"], second["result"]);
 }
 
@@ -2164,6 +2174,18 @@ fn h4_bound_exhaustion_fixture_is_partial() {
         report["result"]["payload_inventory"]["coverage_states"]["partial"],
         1
     );
+    assert_eq!(
+        report["result"]["review_summary"]["coverage"]["by_reason"]["dataflow-assignment-depth-limit"],
+        1
+    );
+    assert_eq!(
+        report["result"]["review_summary"]["coverage"]["executable_or_load_gaps"],
+        0
+    );
+    assert_eq!(
+        report["result"]["review_summary"]["coverage"]["language_model_gaps"],
+        1
+    );
 }
 
 #[test]
@@ -2470,7 +2492,16 @@ fn stale_suppression_is_reported_for_reconfirmation_after_policy_change() {
 
     let path = fixture.config.path().join("omasafe/suppressions.json");
     let mut state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let current_record = state["suppressions"][0].clone();
     state["suppressions"][0]["policy_identity"] = Value::String("old-policy".into());
+    state["suppressions"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("rule_semantic_identity_digest");
+    state["suppressions"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("review_compatibility_declaration_id");
     fs::write(&path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
 
     let output = fixture
@@ -2510,6 +2541,51 @@ fn stale_suppression_is_reported_for_reconfirmation_after_policy_change() {
             .unwrap()
             .len(),
         1
+    );
+
+    // A record carrying the current rule semantic identity and declaration
+    // remains reusable when only the full policy identity changes. The
+    // process-execution rule is unaffected by the current semantic revision.
+    state["suppressions"][0] = current_record;
+    state["suppressions"][0]["policy_identity"] = Value::String("old-policy".into());
+    fs::write(&path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+    let output = fixture
+        .command()
+        .args([
+            "plugins",
+            "analyze",
+            "io.example.cli",
+            "--format",
+            "json",
+            "--fail-on",
+            "low",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let compatible: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(
+        compatible["result"]["suppressions"]["applied"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        compatible["result"]["suppressions"]["reconfirmation_required"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        compatible["result"]["analysis"]["findings"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
     );
 }
 
@@ -5259,6 +5335,7 @@ fn marketplace_candidate_scan_uses_verified_listing_and_exact_cached_commit() {
     assert_eq!(result["target"]["source"], "marketplace-listing");
     assert_eq!(result["target"]["id"], "io.example.marketplace");
     assert_eq!(result["target"]["revision"], candidate_revision);
+    assert_eq!(result["review_summary"]["source_identity_state"], "exact");
     assert_eq!(result["acquisition"]["input_kind"], "marketplace-id");
     assert_eq!(result["acquisition"]["cache"]["result"], "hit");
     assert_eq!(result["acquisition"]["network_used"], false);

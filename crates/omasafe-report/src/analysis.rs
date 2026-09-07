@@ -39,6 +39,16 @@ pub struct PolicyIdentity {
     pub equivalence_map_version: Option<String>,
     /// Version of the verified Omarchy security-surface reference document.
     pub supported_surface_version: String,
+    /// Build-derived detector implementation identity. Missing on legacy
+    /// producers and therefore never treated as current full identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detector_logic_fingerprint: Option<String>,
+    /// Digest of the declared per-rule semantic meanings, when reviewed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_semantics_catalog_digest: Option<String>,
+    /// Immutable compatibility declaration covering the current build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_compatibility_declaration_id: Option<String>,
 }
 
 /// The parser build actually used, per ADR 0001. Absent (`null`) in
@@ -70,6 +80,76 @@ pub struct RenderedFinding {
     pub confidence: Option<String>,
     pub explanation: String,
     pub review_guidance: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_semantic_identity_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis_method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_summary: Option<EvidenceSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation: Option<PresentationMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_relative_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurrence_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_steps: Option<Vec<EvidenceStep>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behavior_context: Option<BehaviorContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EvidenceStep {
+    pub id: String,
+    pub role: String,
+    pub relative_path: String,
+    pub display_relative_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub column: Option<u32>,
+    pub analysis_method: String,
+    pub detail: String,
+    pub origin: String,
+    pub redacted: bool,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EvidenceSummary {
+    pub total: usize,
+    pub emitted: usize,
+    pub omitted: usize,
+    pub observation_collection_complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PresentationMetadata {
+    pub redacted: bool,
+    pub truncated: bool,
+    pub redaction_classes: Vec<String>,
+    pub omitted_fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BehaviorContext {
+    pub connection: String,
+    pub source_class: String,
+    pub sink_kind: String,
+    pub sink_argument_role: String,
+    pub trigger: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destination: Option<DestinationContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DestinationContext {
+    pub scheme: Option<String>,
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub path_display: Option<String>,
+    pub dynamic: bool,
+    pub redacted: bool,
 }
 
 /// An observed ability. Capability occurrences are context, never assertions
@@ -128,6 +208,29 @@ pub struct AnalysisSection {
     pub parser: Option<ParserMetadata>,
     /// External baseline mapping summary; `None` when no map ships.
     pub equivalence: Option<EquivalenceSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parsers: Option<BTreeMap<String, ParserReportMetadata>>,
+    #[serde(default)]
+    pub coverage_gaps: Vec<CoverageGap>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ParserReportMetadata {
+    pub method: String,
+    pub grammar: String,
+    pub grammar_version: String,
+    pub runtime_version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CoverageGap {
+    pub reason: String,
+    pub language: String,
+    pub rule_ids: Vec<String>,
+    pub relative_path: Option<String>,
+    pub line: Option<u32>,
+    pub impact: String,
+    pub detail: String,
 }
 
 impl AnalysisSection {
@@ -152,6 +255,8 @@ impl AnalysisSection {
             invocation_edges,
             parser,
             equivalence,
+            parsers: None,
+            coverage_gaps: Vec::new(),
         }
     }
 }

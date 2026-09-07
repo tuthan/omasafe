@@ -12,8 +12,9 @@ path = "src/main.rs"
 # The shipped CLI parses real QML syntax (ADR 0001); the alias lets
 # `--no-default-features` exercise the documented lexical-fallback mode.
 [features]
-default = ["qml-parser"]
+default = ["qml-parser", "python-parser"]
 qml-parser = ["omasafe-analyzer/qml-parser"]
+python-parser = ["omasafe-analyzer/python-parser"]
 
 [dependencies]
 omasafe-analyzer = { path = "../omasafe-analyzer" }

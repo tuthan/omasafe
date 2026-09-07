@@ -51,6 +51,14 @@ pub struct SuppressionRecord {
     /// suppress newly discovered evidence under a changed predicate.
     #[serde(default)]
     pub policy_identity: Option<String>,
+    /// Rule meaning identity used for future compatibility-aware review
+    /// reuse. Legacy records omit this and therefore require reconfirmation.
+    #[serde(default)]
+    pub rule_semantic_identity_digest: Option<String>,
+    /// Declaration that authorized reuse of the semantic identity, when one
+    /// exists. This is provenance, never a standalone permission.
+    #[serde(default)]
+    pub review_compatibility_declaration_id: Option<String>,
     #[serde(default = "default_active")]
     pub active: bool,
     #[serde(default)]
@@ -59,6 +67,14 @@ pub struct SuppressionRecord {
 
 fn default_active() -> bool {
     true
+}
+
+/// Current full-policy provenance plus the per-rule semantic declaration
+/// needed to evaluate a cross-build suppression match.
+pub struct SuppressionCompatibility<'a> {
+    pub policy_identity: &'a str,
+    pub rule_semantic_identity: Option<&'a str>,
+    pub declaration_id: Option<&'a str>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -162,17 +178,8 @@ impl SuppressionState {
         plugin_context: Option<&str>,
         relative_path: &str,
     ) -> bool {
-        self.active().any(|record| {
-            record.rule_id == rule_id
-                && match &record.plugin_id {
-                    None => true,
-                    Some(target) => plugin_context == Some(target.as_str()),
-                }
-                && match &record.path_scope {
-                    None => true,
-                    Some(scope) => path_matches_scope(relative_path, scope),
-                }
-        })
+        self.active()
+            .any(|record| record_scope_matches(record, rule_id, plugin_context, relative_path))
     }
 
     /// True when an active scope match was created under a different analyzer
@@ -221,6 +228,77 @@ impl SuppressionState {
                 current_policy_identity,
             )
     }
+
+    /// Policy-aware matching with the v0.2.4 semantic compatibility boundary.
+    /// Exact full-policy provenance remains preferred; a cross-build match is
+    /// accepted only when the caller validates the stored/current declaration
+    /// lineage for the specific rule and semantic identity.
+    pub fn matches_policy_with_semantics<F>(
+        &self,
+        rule_id: &str,
+        plugin_context: Option<&str>,
+        relative_path: &str,
+        compatibility: &SuppressionCompatibility<'_>,
+        compatible_declaration: F,
+    ) -> bool
+    where
+        F: Fn(&SuppressionRecord) -> bool,
+    {
+        self.active().any(|record| {
+            if !record_scope_matches(record, rule_id, plugin_context, relative_path) {
+                return false;
+            }
+            if record.policy_identity.as_deref() == Some(compatibility.policy_identity) {
+                return true;
+            }
+            record.rule_semantic_identity_digest.as_deref() == compatibility.rule_semantic_identity
+                && compatibility.declaration_id.is_some()
+                && record.review_compatibility_declaration_id.is_some()
+                && compatible_declaration(record)
+        })
+    }
+
+    /// The semantic-aware stale check used by reporting. It deliberately
+    /// reports a scope match that is neither exact nor declared-compatible so
+    /// operators can re-confirm it instead of losing the audit trail.
+    pub fn requires_reconfirmation_with_semantics<F>(
+        &self,
+        rule_id: &str,
+        plugin_context: Option<&str>,
+        relative_path: &str,
+        compatibility: &SuppressionCompatibility<'_>,
+        compatible_declaration: F,
+    ) -> bool
+    where
+        F: Fn(&SuppressionRecord) -> bool,
+    {
+        self.active().any(|record| {
+            record_scope_matches(record, rule_id, plugin_context, relative_path)
+                && record.policy_identity.as_deref() != Some(compatibility.policy_identity)
+                && !(record.rule_semantic_identity_digest.as_deref()
+                    == compatibility.rule_semantic_identity
+                    && compatibility.declaration_id.is_some()
+                    && record.review_compatibility_declaration_id.is_some()
+                    && compatible_declaration(record))
+        })
+    }
+}
+
+fn record_scope_matches(
+    record: &SuppressionRecord,
+    rule_id: &str,
+    plugin_context: Option<&str>,
+    relative_path: &str,
+) -> bool {
+    record.rule_id == rule_id
+        && match &record.plugin_id {
+            None => true,
+            Some(target) => plugin_context == Some(target.as_str()),
+        }
+        && match &record.path_scope {
+            None => true,
+            Some(scope) => path_matches_scope(relative_path, scope),
+        }
 }
 
 /// Creation-time validation for CLI input: non-empty rule id, human reason,
@@ -345,6 +423,8 @@ mod tests {
             reason: "reviewed".to_owned(),
             created_at: "t0".to_owned(),
             policy_identity: None,
+            rule_semantic_identity_digest: None,
+            review_compatibility_declaration_id: None,
             active: true,
             reinstated_at: None,
         }
@@ -373,6 +453,39 @@ mod tests {
             Some("io.example.x"),
             "Main.qml",
             "old-policy"
+        ));
+    }
+
+    #[test]
+    fn declared_semantic_compatibility_can_reuse_cross_build_review() {
+        let mut state = SuppressionState::default();
+        let mut compatible = record("oma.qml.dynamic-reference", Some("io.example.x"), None);
+        compatible.policy_identity = Some("old-policy".to_owned());
+        compatible.rule_semantic_identity_digest = Some("semantic".to_owned());
+        compatible.review_compatibility_declaration_id = Some("old-declaration".to_owned());
+        state.add(compatible);
+        let compatibility = SuppressionCompatibility {
+            policy_identity: "new-policy",
+            rule_semantic_identity: Some("semantic"),
+            declaration_id: Some("new-declaration"),
+        };
+        assert!(state.matches_policy_with_semantics(
+            "oma.qml.dynamic-reference",
+            Some("io.example.x"),
+            "Main.qml",
+            &compatibility,
+            |_| true,
+        ));
+        let different = SuppressionCompatibility {
+            rule_semantic_identity: Some("different-semantic"),
+            ..compatibility
+        };
+        assert!(!state.matches_policy_with_semantics(
+            "oma.qml.dynamic-reference",
+            Some("io.example.x"),
+            "Main.qml",
+            &different,
+            |_| true,
         ));
     }
 

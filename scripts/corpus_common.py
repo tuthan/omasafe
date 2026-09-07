@@ -27,6 +27,15 @@ MATERIAL_LIMITATIONS = frozenset(
 )
 
 VALID_DISPOSITIONS = frozenset({"true-positive", "false-positive"})
+LEDGER_V2_SCHEMA_VERSION = 2
+
+
+def _valid_hex(value, lengths):
+    return (
+        isinstance(value, str)
+        and len(value) in lengths
+        and all(char in "0123456789abcdefABCDEF" for char in value)
+    )
 
 
 def sample_plugins(plugins, count):
@@ -86,6 +95,10 @@ def load_ledger(path):
                 continue
             try:
                 record = json.loads(line)
+                if record.get("schema_version") == LEDGER_V2_SCHEMA_VERSION:
+                    raise ValueError(
+                        "occurrence ledger records require load_occurrence_ledger()"
+                    )
                 commit = record["commit"]
                 disposition = record["disposition"]
                 plugin_id = record["plugin_id"]
@@ -93,11 +106,7 @@ def load_ledger(path):
                 note = record["note"]
             except (json.JSONDecodeError, KeyError) as error:
                 raise ValueError(f"ledger line {number}: malformed record: {error}") from error
-            if not (
-                isinstance(commit, str)
-                and len(commit) in (40, 64)
-                and all(char in "0123456789abcdefABCDEF" for char in commit)
-            ):
+            if not _valid_hex(commit, (40, 64)):
                 raise ValueError(f"ledger line {number}: commit is not 40/64-hex: {commit!r}")
             if disposition not in VALID_DISPOSITIONS:
                 raise ValueError(
@@ -107,6 +116,71 @@ def load_ledger(path):
             if not isinstance(note, str) or not note.strip():
                 raise ValueError(f"ledger line {number}: a human note is required")
             ledger[(plugin_id, commit, rule_id)] = disposition
+    return ledger
+
+
+def load_occurrence_ledger(path):
+    """Load append-only v2 labels keyed by exact finding occurrence.
+
+    The legacy rule-only ledger is intentionally kept separate: a v1 label
+    must never fan out to every occurrence of a rule. Last record wins for the
+    full compatibility key, while the producer/declaration digests remain in
+    the returned audit record.
+    """
+    ledger = {}
+    path = Path(path)
+    if not path.exists():
+        return ledger
+    with open(path, encoding="utf-8") as handle:
+        for number, line in enumerate(handle, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+                schema_version = record["schema_version"]
+                plugin_id = record["plugin_id"]
+                commit = record["commit"]
+                rule_id = record["rule_id"]
+                occurrence_id = record["occurrence_id"]
+                semantic_digest = record["rule_semantic_identity_digest"]
+                policy_digest = record["observed_policy_identity_digest"]
+                declaration_id = record["review_compatibility_declaration_id"]
+                disposition = record["disposition"]
+                note = record["note"]
+            except (json.JSONDecodeError, KeyError, TypeError) as error:
+                raise ValueError(f"ledger v2 line {number}: malformed record: {error}") from error
+            if schema_version != LEDGER_V2_SCHEMA_VERSION:
+                raise ValueError(f"ledger v2 line {number}: schema_version must be 2")
+            if not isinstance(plugin_id, str) or not plugin_id.strip():
+                raise ValueError(f"ledger v2 line {number}: plugin_id is required")
+            if not _valid_hex(commit, (40, 64)):
+                raise ValueError(f"ledger v2 line {number}: commit is not 40/64-hex")
+            if not isinstance(rule_id, str) or not rule_id.strip():
+                raise ValueError(f"ledger v2 line {number}: rule_id is required")
+            if not _valid_hex(occurrence_id, (64,)):
+                raise ValueError(f"ledger v2 line {number}: occurrence_id is not SHA-256")
+            if not _valid_hex(semantic_digest, (64,)):
+                raise ValueError(
+                    f"ledger v2 line {number}: rule_semantic_identity_digest is not SHA-256"
+                )
+            if not _valid_hex(policy_digest, (64,)):
+                raise ValueError(
+                    f"ledger v2 line {number}: observed_policy_identity_digest is not SHA-256"
+                )
+            if declaration_id is not None and (
+                not isinstance(declaration_id, str) or not declaration_id.strip()
+            ):
+                raise ValueError(f"ledger v2 line {number}: invalid declaration id")
+            if disposition not in VALID_DISPOSITIONS:
+                raise ValueError(
+                    f"ledger v2 line {number}: disposition must be one of "
+                    f"{sorted(VALID_DISPOSITIONS)}"
+                )
+            if not isinstance(note, str) or not note.strip():
+                raise ValueError(f"ledger v2 line {number}: a human note is required")
+            key = (plugin_id, commit, rule_id, occurrence_id, semantic_digest)
+            ledger[key] = record
     return ledger
 
 

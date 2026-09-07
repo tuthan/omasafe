@@ -21,11 +21,13 @@ mod references;
 mod script;
 mod shell;
 
+use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet};
 
 use omasafe_core::bounds::{MAX_EVIDENCE_BYTES_PER_RESULT, MAX_FILE_BYTES, MAX_SINK_REJECTIONS};
 use omasafe_report::analysis::{
-    CapabilityOccurrence, InvocationEdge, ParserMetadata, RenderedFinding,
+    BehaviorContext, CapabilityOccurrence, CoverageGap, EvidenceStep, EvidenceSummary,
+    InvocationEdge, ParserMetadata, ParserReportMetadata, PresentationMetadata, RenderedFinding,
 };
 
 use crate::TimeBudget;
@@ -65,6 +67,8 @@ pub struct AnalysisArtifacts {
     pub edges: Vec<InvocationEdge>,
     /// Analysis-level disclosures (budget exhaustion, unavailable content).
     pub limitations: Vec<String>,
+    /// Typed coverage disclosures retained alongside legacy strings.
+    pub coverage_gaps: Vec<CoverageGap>,
 }
 
 impl AnalysisArtifacts {
@@ -86,6 +90,11 @@ impl AnalysisArtifacts {
             let Some(definition) = rule(result.rule_id()) else {
                 continue;
             };
+            let (evidence_steps, behavior_context) = finding_context(result);
+            let (evidence, redacted, truncated, redaction_classes) =
+                display_text_with_metadata(result.semantic_value(), MAX_EVIDENCE_BYTES_PER_RESULT);
+            let analysis_method = finding_analysis_method(result);
+            let evidence_total = evidence_steps.as_ref().map_or(0, Vec::len);
             rendered.push((
                 definition.default_severity,
                 RenderedFinding {
@@ -96,16 +105,33 @@ impl AnalysisArtifacts {
                     capability: definition.capability.to_string(),
                     relative_path: result.relative_path().to_owned(),
                     line: result.line(),
-                    evidence: truncate_bytes(
-                        result.semantic_value(),
-                        MAX_EVIDENCE_BYTES_PER_RESULT,
-                    ),
+                    evidence,
                     confidence: result.confidence().map(|confidence| match confidence {
                         Confidence::AstBacked => "ast-backed".to_owned(),
                         Confidence::LexicalFallback => "lexical-fallback".to_owned(),
                     }),
                     explanation: definition.summary.to_owned(),
                     review_guidance: definition.review_guidance.to_owned(),
+                    rule_semantic_identity_digest: crate::rule_semantic_identity_digest(
+                        result.rule_id(),
+                    ),
+                    analysis_method: Some(analysis_method),
+                    evidence_summary: Some(EvidenceSummary {
+                        total: evidence_total,
+                        emitted: evidence_total,
+                        omitted: 0,
+                        observation_collection_complete: true,
+                    }),
+                    presentation: Some(PresentationMetadata {
+                        redacted,
+                        truncated,
+                        redaction_classes,
+                        omitted_fields: Vec::new(),
+                    }),
+                    display_relative_path: Some(display_text(result.relative_path(), 512)),
+                    occurrence_id: Some(occurrence_id(result)),
+                    evidence_steps,
+                    behavior_context,
                 },
             ));
         }
@@ -140,6 +166,131 @@ impl AnalysisArtifacts {
     }
 }
 
+fn finding_analysis_method(result: &NormalizedResult) -> String {
+    if result.rule_id() == PYTHON_DOWNLOAD_EXECUTE_RULE {
+        return "ast-dataflow".to_owned();
+    }
+    if result.rule_id() == SCRIPT_DOWNLOAD_EXECUTE_RULE {
+        return "shell-ir-flow".to_owned();
+    }
+    if result.rule_id().contains("sensitive-data-egress")
+        || result.rule_id().contains("background")
+        || result.rule_id().contains("omasafe-state-tamper")
+    {
+        return "lexical-correlation".to_owned();
+    }
+    match result.confidence() {
+        Some(Confidence::AstBacked) => "ast-syntax".to_owned(),
+        Some(Confidence::LexicalFallback) => "lexical-pattern".to_owned(),
+        None => "inventory-reference".to_owned(),
+    }
+}
+
+fn finding_context(
+    result: &NormalizedResult,
+) -> (Option<Vec<EvidenceStep>>, Option<BehaviorContext>) {
+    let method = finding_analysis_method(result);
+    let display_path = display_text(result.relative_path(), 512);
+    let mut steps = Vec::new();
+    let semantic = result.semantic_value();
+    if let Some(source_line) = semantic
+        .split("source-line-")
+        .nth(1)
+        .and_then(|value| {
+            value
+                .split(|character: char| !character.is_ascii_digit())
+                .next()
+        })
+        .and_then(|value| value.parse::<u32>().ok())
+    {
+        let (sink_detail, sink_redacted, sink_truncated, _) =
+            display_text_with_metadata(semantic, MAX_EVIDENCE_BYTES_PER_RESULT);
+        steps.push(EvidenceStep {
+            id: "source".to_owned(),
+            role: "source".to_owned(),
+            relative_path: result.relative_path().to_owned(),
+            display_relative_path: display_path.clone(),
+            line: Some(source_line),
+            column: None,
+            analysis_method: method.clone(),
+            detail: "network response bytes".to_owned(),
+            origin: "source-derived".to_owned(),
+            redacted: false,
+            truncated: false,
+        });
+        steps.push(EvidenceStep {
+            id: "sink".to_owned(),
+            role: "sink".to_owned(),
+            relative_path: result.relative_path().to_owned(),
+            display_relative_path: display_path.clone(),
+            line: result.line(),
+            column: result.column(),
+            analysis_method: method.clone(),
+            detail: sink_detail,
+            origin: "source-derived".to_owned(),
+            redacted: sink_redacted,
+            truncated: sink_truncated,
+        });
+    } else {
+        let (detail, redacted, truncated, _) =
+            display_text_with_metadata(semantic, MAX_EVIDENCE_BYTES_PER_RESULT);
+        steps.push(EvidenceStep {
+            id: "observation".to_owned(),
+            role: "observation".to_owned(),
+            relative_path: result.relative_path().to_owned(),
+            display_relative_path: display_path,
+            line: result.line(),
+            column: result.column(),
+            analysis_method: method,
+            detail,
+            origin: "source-derived".to_owned(),
+            redacted,
+            truncated,
+        });
+    }
+    let context = if result.rule_id().contains("download-execute") {
+        Some(BehaviorContext {
+            connection: "connected".to_owned(),
+            source_class: "network-bytes".to_owned(),
+            sink_kind: if result.rule_id().starts_with("oma.python.") {
+                "python-code".to_owned()
+            } else {
+                "shell-code".to_owned()
+            },
+            sink_argument_role: "exec-arg0".to_owned(),
+            trigger: "unknown".to_owned(),
+            destination: None,
+        })
+    } else if result.rule_id().contains("sensitive-data-egress") {
+        Some(BehaviorContext {
+            connection: "connected".to_owned(),
+            source_class: "sensitive-local-data".to_owned(),
+            sink_kind: "network-send".to_owned(),
+            sink_argument_role: "request-body".to_owned(),
+            trigger: "unknown".to_owned(),
+            destination: None,
+        })
+    } else {
+        None
+    };
+    (Some(steps), context)
+}
+
+fn occurrence_id(result: &NormalizedResult) -> String {
+    let mut canonical = BTreeMap::new();
+    canonical.insert("column", serde_json::json!(result.column()));
+    canonical.insert("line", serde_json::json!(result.line()));
+    canonical.insert("relative_path", serde_json::json!(result.relative_path()));
+    canonical.insert("rule_id", serde_json::json!(result.rule_id()));
+    canonical.insert("semantic_value", serde_json::json!(result.semantic_value()));
+    let canonical = serde_json::to_vec(&canonical).expect("occurrence identity serialization");
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"omasafe.occurrence.v1\0");
+    hasher.update(canonical);
+    let digest = hasher.finalize();
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// Parser identity for report embedding; `None` in lexical-fallback builds.
 pub fn parser_metadata() -> Option<ParserMetadata> {
     #[cfg(feature = "qml-parser")]
@@ -154,6 +305,53 @@ pub fn parser_metadata() -> Option<ParserMetadata> {
     }
     #[cfg(not(feature = "qml-parser"))]
     None
+}
+
+/// Additive language metadata used by the v0.2.4 report contract. The
+/// existing `parser` field remains QML-specific for legacy consumers.
+pub fn parser_report_metadata() -> BTreeMap<String, ParserReportMetadata> {
+    let mut parsers = BTreeMap::new();
+    #[cfg(feature = "qml-parser")]
+    parsers.insert(
+        "qml".to_owned(),
+        ParserReportMetadata {
+            method: "tree-sitter".to_owned(),
+            grammar: "tree-sitter-qmljs".to_owned(),
+            grammar_version: "0.3.1".to_owned(),
+            runtime_version: Some("0.26.13".to_owned()),
+        },
+    );
+    #[cfg(not(feature = "qml-parser"))]
+    parsers.insert(
+        "qml".to_owned(),
+        ParserReportMetadata {
+            method: "lexical-fallback".to_owned(),
+            grammar: "none".to_owned(),
+            grammar_version: "none".to_owned(),
+            runtime_version: None,
+        },
+    );
+    #[cfg(feature = "python-parser")]
+    parsers.insert(
+        "python".to_owned(),
+        ParserReportMetadata {
+            method: "tree-sitter".to_owned(),
+            grammar: "tree-sitter-python".to_owned(),
+            grammar_version: "0.25.0".to_owned(),
+            runtime_version: Some("0.26.13".to_owned()),
+        },
+    );
+    #[cfg(not(feature = "python-parser"))]
+    parsers.insert(
+        "python".to_owned(),
+        ParserReportMetadata {
+            method: "lexical-fallback-no-python-flow".to_owned(),
+            grammar: "none".to_owned(),
+            grammar_version: "none".to_owned(),
+            runtime_version: None,
+        },
+    );
+    parsers
 }
 /// Run every detector over a fully ingested inventory. `read_content` must
 /// return bounded bytes for an entry; entries without a detector are skipped.
@@ -210,16 +408,49 @@ pub fn analyze_inventory(
             entry.kind,
             PayloadKind::Qml | PayloadKind::JavaScript | PayloadKind::Shell | PayloadKind::Python
         );
-        if !analyzable
-            || !matches!(entry.coverage_state, CoverageState::Unsupported)
+        if !analyzable {
+            continue;
+        }
+        if !matches!(entry.coverage_state, CoverageState::Unsupported)
             || entry.size > MAX_FILE_BYTES
         {
+            artifacts.coverage_gaps.push(CoverageGap {
+                reason: match entry.coverage_state {
+                    CoverageState::Skipped => "payload-skipped",
+                    CoverageState::Truncated => "payload-truncated",
+                    _ if entry.size > MAX_FILE_BYTES => "file-size-limit",
+                    _ => "payload-unavailable",
+                }
+                .to_owned(),
+                language: payload_language(&entry.kind).to_owned(),
+                rule_ids: python_rule_ids(&entry.kind),
+                relative_path: Some(entry.relative_path.clone()),
+                line: None,
+                impact: if matches!(entry.kind, PayloadKind::Python) {
+                    "language-model".to_owned()
+                } else {
+                    "executable-or-load".to_owned()
+                },
+                detail: "the payload was inventoried but not fully analyzed; no clean verdict is implied"
+                    .to_owned(),
+            });
             continue;
         }
         let Some(content) = read_content(&entry) else {
             artifacts
                 .limitations
                 .push(format!("content_unavailable:{}", entry.relative_path));
+            artifacts.coverage_gaps.push(CoverageGap {
+                reason: "content-unavailable".to_owned(),
+                language: payload_language(&entry.kind).to_owned(),
+                rule_ids: python_rule_ids(&entry.kind),
+                relative_path: Some(entry.relative_path.clone()),
+                line: None,
+                impact: "executable-or-load".to_owned(),
+                detail:
+                    "source bytes were unavailable to the analyzer; no clean verdict is implied"
+                        .to_owned(),
+            });
             continue;
         };
         let source = String::from_utf8_lossy(&content).into_owned();
@@ -262,6 +493,20 @@ pub fn analyze_inventory(
             artifacts
                 .limitations
                 .push(format!("{limitation}:{}", entry.relative_path));
+            artifacts.coverage_gaps.push(CoverageGap {
+                reason: limitation.clone(),
+                language: payload_language(&entry_kind).to_owned(),
+                rule_ids: python_rule_ids(&entry_kind),
+                relative_path: Some(entry.relative_path.clone()),
+                line: None,
+                impact: if limitation.contains("parser") || limitation.contains("flow") {
+                    "language-model".to_owned()
+                } else {
+                    "executable-or-load".to_owned()
+                },
+                detail: "analysis coverage is bounded or parser-gated; no clean verdict is implied"
+                    .to_owned(),
+            });
         }
         for capability in &mut outcome.capabilities {
             capability.relative_path = entry.relative_path.clone();
@@ -428,8 +673,35 @@ pub fn analyze_inventory(
             && a.line == b.line
             && a.detail == b.detail
     });
+    artifacts.coverage_gaps.sort_by(|a, b| {
+        (&a.reason, &a.language, &a.relative_path, a.line).cmp(&(
+            &b.reason,
+            &b.language,
+            &b.relative_path,
+            b.line,
+        ))
+    });
+    artifacts.coverage_gaps.dedup();
 
     artifacts
+}
+
+fn payload_language(kind: &PayloadKind) -> &'static str {
+    match kind {
+        PayloadKind::Qml => "qml",
+        PayloadKind::JavaScript => "javascript",
+        PayloadKind::Shell => "shell",
+        PayloadKind::Python => "python",
+        _ => "unknown",
+    }
+}
+
+fn python_rule_ids(kind: &PayloadKind) -> Vec<String> {
+    if matches!(kind, PayloadKind::Python) {
+        vec!["oma.python.download-execute".to_owned()]
+    } else {
+        Vec::new()
+    }
 }
 
 fn is_native_executable(kind: &PayloadKind) -> bool {
@@ -581,6 +853,7 @@ struct H6Assignment {
     name: String,
     scope_id: usize,
     provenance: H6Provenance,
+    line: u32,
 }
 
 /// H6 capability and escalation observations for user-data access, desktop
@@ -765,11 +1038,13 @@ fn apply_h6_user_data_observations(source: &str, kind: &PayloadKind, outcome: &m
                 assignment.scope_id == current_scope && assignment.name == variable
             }) {
                 existing.provenance = provenance;
+                existing.line = number;
             } else if assignments.len() < MAX_H6_ASSIGNMENTS {
                 assignments.push(H6Assignment {
                     name: variable,
                     scope_id: current_scope,
                     provenance,
+                    line: number,
                 });
             } else if !outcome
                 .limitations
@@ -799,18 +1074,15 @@ fn apply_h6_user_data_observations(source: &str, kind: &PayloadKind, outcome: &m
         let egress = EGRESS_TOOLS
             .iter()
             .any(|needle| find_word(&lower_code, needle).is_some());
-        let sensitive_read_to_egress = egress
-            && (egress_uses_sensitive_variable(
-                &line_lower,
-                &lower_code,
-                &assignments,
-                &scope_stack,
-            ) || sensitive_read_connected_to_egress(
-                &line_lower,
-                &lower_code,
-                kind,
-                sensitive_path,
-            ));
+        let variable_source_line = if egress {
+            egress_uses_sensitive_variable(&line_lower, &lower_code, &assignments, &scope_stack)
+        } else {
+            None
+        };
+        let direct_sensitive_connection = egress
+            && sensitive_read_connected_to_egress(&line_lower, &lower_code, kind, sensitive_path);
+        let sensitive_read_to_egress =
+            variable_source_line.is_some() || direct_sensitive_connection;
         if sensitive_read_to_egress {
             let rule_id = if matches!(language, Language::Shell | Language::Python) {
                 SENSITIVE_DATA_EGRESS_RULE_SCRIPT
@@ -820,7 +1092,10 @@ fn apply_h6_user_data_observations(source: &str, kind: &PayloadKind, outcome: &m
             outcome.result_parts.push(parts(
                 rule_id,
                 number,
-                "sensitive-read-to-egress",
+                format!(
+                    "sensitive-read-to-egress:source-line-{}:sink-line-{number}",
+                    variable_source_line.unwrap_or(number)
+                ),
                 outcome.confidence,
             ));
         }
@@ -1023,7 +1298,7 @@ fn egress_uses_sensitive_variable(
     code_lower: &str,
     assignments: &[H6Assignment],
     scope_stack: &[usize],
-) -> bool {
+) -> Option<u32> {
     const EGRESS_TOOLS: [&str; 10] = [
         "curl",
         "wget",
@@ -1036,18 +1311,16 @@ fn egress_uses_sensitive_variable(
         "fetch",
         "xmlhttprequest",
     ];
-    let Some(egress_offset) = EGRESS_TOOLS
+    let egress_offset = EGRESS_TOOLS
         .iter()
         .filter_map(|tool| find_word(code_lower, tool))
-        .min()
-    else {
-        return false;
-    };
-    line_lower.get(egress_offset..).is_some_and(|tail| {
-        assignments.iter().rev().any(|assignment| {
-            assignment.provenance == H6Provenance::SensitiveValue
+        .min()?;
+    line_lower.get(egress_offset..).and_then(|tail| {
+        assignments.iter().rev().find_map(|assignment| {
+            (assignment.provenance == H6Provenance::SensitiveValue
                 && scope_stack.contains(&assignment.scope_id)
-                && find_word(tail, &assignment.name).is_some()
+                && find_word(tail, &assignment.name).is_some())
+            .then_some(assignment.line)
         })
     })
 }

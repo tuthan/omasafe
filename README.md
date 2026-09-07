@@ -49,12 +49,21 @@ CLI commands.
 
 ## Status
 
-**v0.2.3 is the current development release** — the signed CLI now combines the v0.1 local
+**v0.2.4 is the current development release** — the signed CLI now combines the v0.1 local
 trust layer with bounded payload analysis, capability and finding reports,
 reviewed updates, opt-in enforcement controls, scan-only review of exact
 GitHub/marketplace candidates, and CLI-owned cached installed-scan hydration.
 v0.3 and later work remain on the
 [roadmap](docs/plans/README.md).
+
+The [v0.2.4 implementation plan](docs/plans/v0.2.4-rule-detection-clarity.md) and
+[report contract](docs/reference/v0.2.4-review-report-contract.md) define the
+implemented evidence, coverage, identity, and risk-reporting updates. The shipped
+CLI enables bounded Python syntax-flow analysis by default; constrained fallback
+builds explicitly report `python-parser-disabled` coverage and no longer emit the
+unsound same-line Python download-to-execution heuristic. See the
+[rule architecture review](docs/reviews/2026-09-06-rule-detection-clarity-review.md)
+for verified examples and residual limitations.
 
 See [`docs/brainstorm.md`](docs/brainstorm.md) for the product thesis and
 [`docs/plans/`](docs/plans/) for the release plans.

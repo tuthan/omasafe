@@ -4,12 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[build-dependencies]
+sha2.workspace = true
+
 [features]
 default = []
 # tree-sitter pulls a C compiler into the build; the feature keeps the crate
 # buildable in constrained environments, with lexical fallback semantics
 # documented in docs/adr/0001-qml-parser.md.
 qml-parser = ["dep:tree-sitter", "dep:tree-sitter-qmljs"]
+python-parser = ["dep:tree-sitter", "dep:tree-sitter-python"]
 
 [dependencies]
 omasafe-core = { path = "../omasafe-core" }
@@ -21,6 +25,7 @@ libc.workspace = true
 thiserror.workspace = true
 tree-sitter = { version = "=0.26.13", optional = true }
 tree-sitter-qmljs = { version = "=0.3.1", optional = true }
+tree-sitter-python = { version = "=0.25.0", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

@@ -35,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from corpus_common import (  # noqa: E402
     MATERIAL_LIMITATIONS,
     load_ledger,
+    load_occurrence_ledger,
     resolve_plugin_dir,
     run_git,
     sample_plugins,
@@ -98,7 +99,7 @@ def clone_pinned(repository, commit, destination):
 def run_scan(bin_path, plugin_dir):
     """scan-plugin under an isolated XDG environment.
 
-    Returns (findings, material_loss_reasons): any inventory-level coverage
+    Returns (findings, material_loss_reasons, compatibility): any inventory-level coverage
     limitation outside the benign set, or truncated entries, means the scan
     saw less than the repository and the caller must count INCOMPLETE.
     """
@@ -134,7 +135,17 @@ def run_scan(bin_path, plugin_dir):
     states = inventory_section.get("coverage_states", {})
     if states.get("truncated", 0) or states.get("skipped", 0):
         loss.append("entries_truncated_or_skipped")
-    return analysis["findings"], loss
+    policy_identity = analysis.get("policy_identity")
+    review_summary = report["result"].get("review_summary", {})
+    compatibility = {
+        "observed_policy_identity_digest": review_summary.get("policy_identity_digest"),
+        "review_compatibility_declaration_id": (
+            policy_identity.get("review_compatibility_declaration_id")
+            if isinstance(policy_identity, dict)
+            else None
+        ),
+    }
+    return analysis["findings"], loss, compatibility
 
 
 def main():
@@ -161,10 +172,27 @@ def main():
         plugins = sample_plugins(plugins, arguments.sample)
         mode = f"sample:{arguments.sample}"
 
+    # Rule-only v1 dispositions are historical evidence and deliberately do
+    # not participate in corpus gating.  Only the occurrence ledger can
+    # classify an emitted result without fanning one label out to every
+    # occurrence of that rule.
     ledger_default = (
-        Path(arguments.manifest).parent / "expectations" / "dispositions.jsonl"
+        Path(arguments.manifest).parent / "expectations" / "dispositions-v2.jsonl"
     )
-    ledger = load_ledger(arguments.ledger or ledger_default)
+    ledger_path = Path(arguments.ledger or ledger_default)
+    # Accept an explicitly selected historical ledger for migration tooling,
+    # but validate it and discard its labels. Only schema-v2 records are ever
+    # eligible to classify a gate result.
+    legacy_ledger = False
+    if ledger_path.exists():
+        with open(ledger_path, encoding="utf-8") as handle:
+            first_record = next((json.loads(line) for line in handle if line.strip()), None)
+        legacy_ledger = isinstance(first_record, dict) and "schema_version" not in first_record
+    if legacy_ledger:
+        load_ledger(ledger_path)
+        ledger = {}
+    else:
+        ledger = load_occurrence_ledger(ledger_path)
 
     cache_root = Path(arguments.cache or tempfile.mkdtemp(prefix="omasafe-corpus-cache-"))
     cache_root.mkdir(parents=True, exist_ok=True)
@@ -203,7 +231,7 @@ def main():
             incomplete.append({"pluginId": plugin_id, "reason": reason})
             continue
         try:
-            findings, loss = run_scan(bin_path, plugin_dir)
+            findings, loss, compatibility = run_scan(bin_path, plugin_dir)
         except (RuntimeError, json.JSONDecodeError, subprocess.TimeoutExpired) as error:
             log(f"  INCOMPLETE: analysis failed: {error}")
             incomplete.append({"pluginId": plugin_id, "reason": str(error)[:400]})
@@ -217,7 +245,23 @@ def main():
         for finding in findings:
             rule_id = finding.get("rule_id", "<unknown>")
             severity = finding.get("severity", "info")
-            disposition = ledger.get((plugin_id, commit, rule_id), "untriaged")
+            occurrence_id = finding.get("occurrence_id")
+            semantic_digest = finding.get("rule_semantic_identity_digest")
+            record = ledger.get(
+                (plugin_id, commit, rule_id, occurrence_id, semantic_digest)
+            )
+            disposition = "untriaged"
+            if isinstance(record, dict):
+                # The occurrence and rule meaning are necessary but not
+                # sufficient: a label is valid only for the policy/declaration
+                # that was actually observed when it was reviewed.
+                if (
+                    record.get("observed_policy_identity_digest")
+                    == compatibility.get("observed_policy_identity_digest")
+                    and record.get("review_compatibility_declaration_id")
+                    == compatibility.get("review_compatibility_declaration_id")
+                ):
+                    disposition = record.get("disposition", "untriaged")
             bucket = {
                 "true-positive": "true_positive",
                 "false-positive": "false_positive",

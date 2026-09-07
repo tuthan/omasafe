@@ -61,6 +61,18 @@ pub const MAX_SHELL_PARSE_NODES: usize = 50_000;
 pub const MAX_SHELL_PARSE_CHILD_PROGRAMS: usize = 128;
 /// Aggregate source bytes retained for recursively parsed shell children.
 pub const MAX_SHELL_PARSE_SOURCE_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum Python source bytes eligible for syntax/dataflow analysis.
+pub const MAX_PYTHON_FLOW_SOURCE_BYTES: usize = 1024 * 1024;
+/// Maximum Python syntax nodes visited by the bounded frontend.
+pub const MAX_PYTHON_FLOW_NODES: usize = 50_000;
+/// Maximum Python statements visited by the local flow model.
+pub const MAX_PYTHON_FLOW_STATEMENTS: usize = 2_048;
+/// Maximum expression/assignment depth followed by the Python flow model.
+pub const MAX_PYTHON_FLOW_DEPTH: usize = 16;
+/// Maximum live Python bindings retained in one local scope.
+pub const MAX_PYTHON_FLOW_BINDINGS: usize = 1_024;
+/// Shared per-file Python parse/flow wall-clock budget.
+pub const PYTHON_FLOW_TIME_BUDGET: Duration = Duration::from_millis(50);
 
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const DRAIN_CHUNK_BYTES: usize = 64 * 1024;

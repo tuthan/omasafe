@@ -65,6 +65,239 @@ pub(in crate::detect) fn truncate_bytes(value: &str, cap: usize) -> String {
     format!("{}…", &value[..end])
 }
 
+/// Convert source-derived text into inert bounded display data. Machine
+/// identity fields remain separate; this helper is used only for excerpts,
+/// details, and evidence explanations.
+pub(in crate::detect) fn display_text(value: &str, cap: usize) -> String {
+    display_text_with_metadata(value, cap).0
+}
+
+pub(in crate::detect) fn display_text_with_metadata(
+    value: &str,
+    cap: usize,
+) -> (String, bool, bool, Vec<String>) {
+    let redacted = redact_known_secrets(value);
+    let escaped: String = redacted
+        .chars()
+        .map(|character| match character {
+            '\n' => "\\n".to_owned(),
+            '\r' => "\\r".to_owned(),
+            '\t' => "\\t".to_owned(),
+            character
+                if character.is_control()
+                    || matches!(
+                        character,
+                        '\u{2028}'
+                            | '\u{2029}'
+                            | '\u{061c}'
+                            | '\u{200e}'
+                            | '\u{200f}'
+                            | '\u{202a}'..='\u{202e}'
+                            | '\u{2066}'..='\u{2069}'
+                    ) =>
+            {
+                format!("\\u{{{:x}}}", character as u32)
+            }
+            character => character.to_string(),
+        })
+        .collect();
+    let truncated = escaped.len() > cap;
+    let classes = redaction_classes(value, &redacted);
+    (
+        truncate_bytes(&escaped, cap),
+        redacted != value,
+        truncated,
+        classes,
+    )
+}
+
+fn redaction_classes(original: &str, redacted: &str) -> Vec<String> {
+    if original == redacted {
+        return Vec::new();
+    }
+    let lower = original.to_ascii_lowercase();
+    let mut classes = Vec::new();
+    if [
+        "authorization:",
+        "proxy-authorization:",
+        "cookie:",
+        "set-cookie:",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        classes.push("header-secret".to_owned());
+    }
+    if lower.contains("://") && (lower.contains('@') || lower.contains('?') || lower.contains('#'))
+    {
+        classes.push("url-secret".to_owned());
+    }
+    if ["token", "password", "secret", "api_key", "apikey"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        classes.push("named-secret".to_owned());
+    }
+    if classes.is_empty() {
+        classes.push("source-secret".to_owned());
+    }
+    classes
+}
+
+fn redact_known_secrets(value: &str) -> String {
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for marker in [
+        "authorization:",
+        "proxy-authorization:",
+        "cookie:",
+        "set-cookie:",
+    ] {
+        let lower = value.to_ascii_lowercase();
+        let mut cursor = 0usize;
+        while let Some(found) = lower[cursor..].find(marker) {
+            let start = cursor + found + marker.len();
+            let end = value[start..]
+                .find(['\n', '\r', ','])
+                .map_or(value.len(), |offset| start + offset);
+            spans.push((start, end));
+            cursor = end;
+            if cursor >= value.len() {
+                break;
+            }
+        }
+    }
+    // URL userinfo, query values, and fragments are all credential-bearing
+    // contexts for display purposes. Keep the scheme/host/path shape but do
+    // not attempt to guess which parameter names are sensitive.
+    let mut cursor = 0usize;
+    while let Some(relative) = value[cursor..].find("://") {
+        let scheme_start = cursor + relative;
+        let authority_start = scheme_start + 3;
+        let url_end = value[authority_start..]
+            // A comma is valid query data. Treating it as a URL terminator
+            // leaks the suffix of values such as `?x=VISIBLE,PRIVATE_TAIL`.
+            .find([' ', '\n', '\r', '"', '\'', '\\'])
+            .map_or(value.len(), |offset| authority_start + offset);
+        let authority_end = value[authority_start..url_end]
+            .find(['/', '?', '#'])
+            .map_or(url_end, |offset| authority_start + offset);
+        if let Some(at) = value[authority_start..authority_end].rfind('@') {
+            let at = authority_start + at;
+            spans.push((authority_start, at));
+        }
+        if let Some(query) = value[authority_start..url_end].find('?') {
+            let query = authority_start + query;
+            let fragment = value[query..url_end]
+                .find('#')
+                .map_or(url_end, |offset| query + offset);
+            let mut index = query + 1;
+            while index < fragment {
+                let amp = value[index..fragment]
+                    .find('&')
+                    .map_or(fragment, |offset| index + offset);
+                if let Some(equal) = value[index..amp].find('=') {
+                    let equal = index + equal;
+                    spans.push((equal + 1, amp));
+                }
+                index = amp.saturating_add(1);
+            }
+            if fragment < url_end {
+                spans.push((fragment + 1, url_end));
+            }
+        } else if let Some(fragment) = value[authority_start..url_end].find('#') {
+            spans.push((authority_start + fragment + 1, url_end));
+        }
+        cursor = url_end.max(scheme_start + 3);
+        if cursor >= value.len() {
+            break;
+        }
+    }
+    // Explicit secret assignments are supported without an entropy heuristic.
+    let mut index = 0usize;
+    let lower = value.to_ascii_lowercase();
+    while index < value.len() {
+        let Some(found) = lower[index..].find(|character: char| {
+            character == 't' || character == 'p' || character == 's' || character == 'a'
+        }) else {
+            break;
+        };
+        let start = index + found;
+        let before_ok = start == 0 || !value.as_bytes()[start - 1].is_ascii_alphanumeric();
+        let end_name = value[start..]
+            .find(|character: char| {
+                character == '=' || character == ':' || character.is_whitespace()
+            })
+            .map_or(start, |offset| start + offset);
+        let name = lower[start..end_name].trim();
+        let secret_name = name.contains("token")
+            || name.contains("password")
+            || name.contains("secret")
+            || name.contains("api_key")
+            || name.contains("apikey");
+        if before_ok && secret_name {
+            let mut assignment = end_name;
+            while assignment < value.len()
+                && value[assignment..]
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_whitespace)
+            {
+                assignment += value[assignment..].chars().next().unwrap().len_utf8();
+            }
+            if value[assignment..].starts_with(['=', ':']) {
+                assignment += 1;
+                while assignment < value.len()
+                    && value[assignment..]
+                        .chars()
+                        .next()
+                        .is_some_and(char::is_whitespace)
+                {
+                    assignment += value[assignment..].chars().next().unwrap().len_utf8();
+                }
+                let value_start = assignment;
+                let quoted = value
+                    .as_bytes()
+                    .get(value_start)
+                    .is_some_and(|byte| *byte == b'\'' || *byte == b'"');
+                let value_end = match value.as_bytes().get(value_start) {
+                    Some(b'\'' | b'"') => {
+                        let quote = value.as_bytes()[value_start] as char;
+                        value[value_start + 1..]
+                            .find(quote)
+                            .map_or(value.len(), |offset| value_start + 1 + offset)
+                    }
+                    _ => value[value_start..]
+                        .find([',', ';', ' ', '\n', '\r'])
+                        .map_or(value.len(), |offset| value_start + offset),
+                };
+                spans.push((value_start + usize::from(quoted), value_end));
+            }
+        }
+        index = end_name.max(start + 1);
+    }
+    apply_redaction_spans(value, spans)
+}
+
+fn apply_redaction_spans(value: &str, mut spans: Vec<(usize, usize)>) -> String {
+    spans.retain(|(start, end)| start < end);
+    spans.sort_unstable();
+    let mut merged = Vec::with_capacity(spans.len());
+    for (start, end) in spans {
+        if let Some((_, previous_end)) = merged.last_mut()
+            && start <= *previous_end
+        {
+            *previous_end = (*previous_end).max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    let mut output = value.to_owned();
+    for (start, end) in merged.into_iter().rev() {
+        output.replace_range(start..end, "[REDACTED]");
+    }
+    output
+}
+
 /// Per-file detector output before cross-file anchoring.
 pub(in crate::detect) struct FileOutcome {
     pub(in crate::detect) result_parts: Vec<ResultParts>,
@@ -367,5 +600,70 @@ pub(in crate::detect) fn disclose_dataflow_limitation(outcome: &mut FileOutcome,
         .any(|existing| existing == &limitation)
     {
         outcome.limitations.push(limitation);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::display_text;
+
+    #[test]
+    fn redaction_rebuilds_from_original_spans() {
+        let rendered = display_text(
+            "https://longusername:longpassword@example.test/a?a=LONG_SECRET_A&b=LONG_SECRET_B",
+            4096,
+        );
+        assert!(!rendered.contains("longusername"));
+        assert!(!rendered.contains("longpassword"));
+        assert!(!rendered.contains("LONG_SECRET_A"));
+        assert!(!rendered.contains("LONG_SECRET_B"));
+    }
+
+    #[test]
+    fn url_fragments_are_redacted_without_a_query() {
+        let rendered = display_text("https://example.test/a#PRIVATE_FRAGMENT", 4096);
+        assert!(rendered.contains("#[REDACTED]"));
+        assert!(!rendered.contains("PRIVATE_FRAGMENT"));
+    }
+
+    #[test]
+    fn redaction_handles_unicode_and_repeated_headers() {
+        let rendered = display_text(
+            "Authorization: first\nX=é\nCookie: second\nhttps://example.test/a?x=秘密&y=visible",
+            4096,
+        );
+        assert_eq!(rendered.matches("[REDACTED]").count(), 4);
+        assert!(rendered.contains("é"));
+        assert!(!rendered.contains("秘密"));
+    }
+
+    #[test]
+    fn url_redaction_covers_comma_tails_and_multiple_userinfo_at_signs() {
+        let rendered = display_text(
+            "https://user:p@ss@example.test/a?x=VISIBLE,PRIVATE_TAIL#FRAGMENT_SECRET",
+            4096,
+        );
+        for secret in ["user", "p@ss", "VISIBLE", "PRIVATE_TAIL", "FRAGMENT_SECRET"] {
+            assert!(!rendered.contains(secret), "secret leaked: {secret}");
+        }
+    }
+
+    #[test]
+    fn spaced_and_quoted_named_secrets_are_redacted() {
+        let rendered = display_text(
+            "password = 'MY_PASSWORD' token : \"MY_TOKEN\" api_key=MY_KEY",
+            4096,
+        );
+        for secret in ["MY_PASSWORD", "MY_TOKEN", "MY_KEY"] {
+            assert!(!rendered.contains(secret), "secret leaked: {secret}");
+        }
+    }
+
+    #[test]
+    fn display_escapes_directional_and_line_controls() {
+        assert_eq!(
+            display_text("a\r\n\t\u{061c}\u{200e}\u{200f}\u{2028}\u{2029}b", 4096),
+            "a\\r\\n\\t\\u{61c}\\u{200e}\\u{200f}\\u{2028}\\u{2029}b"
+        );
     }
 }

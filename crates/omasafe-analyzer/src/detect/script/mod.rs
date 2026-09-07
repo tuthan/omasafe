@@ -3,6 +3,8 @@
 //! receives from here.
 
 pub(in crate::detect) mod python;
+#[cfg(feature = "python-parser")]
+mod python_flow;
 
 use self::python::python_reverse_shell;
 
@@ -214,9 +216,23 @@ pub(in crate::detect) fn analyze_script_source(source: &str, kind: PayloadKind) 
         confidence: Confidence::LexicalFallback,
         limitations: Vec::new(),
     };
+    if matches!(kind, PayloadKind::Python) {
+        outcome
+            .limitations
+            .push("python-reverse-shell-line-only".to_owned());
+    }
     // Set when the recursion budget for untrusted shell text runs out on any
     // line: the analysis degrades and discloses the shortfall.
     let mut budget_exhausted = false;
+
+    if matches!(kind, PayloadKind::Python) {
+        #[cfg(feature = "python-parser")]
+        python_flow::analyze(source, &mut outcome);
+        #[cfg(not(feature = "python-parser"))]
+        outcome
+            .limitations
+            .push("python-parser-disabled".to_owned());
+    }
 
     // Shell commands assemble into LOGICAL units across escaped newlines,
     // open pipelines, quotes, and groups (H3 review): `curl URL \` followed
@@ -317,6 +333,11 @@ fn analyze_staged_script_chain(source: &str, outcome: &mut FileOutcome) {
                 let Some(head) = commands.last().map(|command| command.head) else {
                     continue;
                 };
+                if guard == Some("||") {
+                    // A failure arm cannot consume the bytes that a prior
+                    // fetch would have produced on its success path.
+                    continue;
+                }
                 if matches!(head, "curl" | "wget")
                     && let Some(path) = fetch_output_path(segment)
                 {
@@ -329,11 +350,44 @@ fn analyze_staged_script_chain(source: &str, outcome: &mut FileOutcome) {
                     );
                     continue;
                 }
+                let mutations: Vec<String> = commands
+                    .iter()
+                    .filter(|command| {
+                        matches!(
+                            command.head,
+                            "rm" | "unlink" | "truncate" | "mv" | "cp" | "install"
+                        )
+                    })
+                    .flat_map(|command| command.args.iter().rev().take(1).copied())
+                    .map(str::to_owned)
+                    .collect();
+                for path in mutations {
+                    downloads.remove(&path);
+                }
+                if let Some(path) = redirected_output_path(segment) {
+                    downloads.remove(&path);
+                    continue;
+                }
                 if head == "chmod"
                     && let Some(path) = chmod_x_path(segment)
                     && let Some(download) = downloads.get_mut(&path)
                 {
                     download.chmod_x = true;
+                    continue;
+                }
+                if let Some(path) = interpreter_script_path(segment)
+                    && let Some(download) = downloads.get(&path).copied()
+                {
+                    outcome.result_parts.push(parts(
+                        SCRIPT_DOWNLOAD_EXECUTE_RULE,
+                        number,
+                        format!(
+                            "staged-download-execute:{path}:interpreter:fetched-line-{}",
+                            download.fetch_line
+                        ),
+                        Confidence::LexicalFallback,
+                    ));
+                    downloads.remove(&path);
                     continue;
                 }
                 let Some(path) = executed_path(segment) else {
@@ -356,6 +410,51 @@ fn analyze_staged_script_chain(source: &str, outcome: &mut FileOutcome) {
             }
         }
     }
+}
+
+fn redirected_output_path(segment: &[ShellToken]) -> Option<String> {
+    segment.windows(2).find_map(|pair| {
+        if matches!(&pair[0], ShellToken::Operator(op) if op == ">" || op == ">>") {
+            static_word(&pair[1])
+        } else {
+            None
+        }
+    })
+}
+
+/// Return a literal script operand for an interpreter in file/module mode.
+/// `sh -c BODY PATH` is intentionally not treated as reading PATH: PATH is a
+/// positional parameter when `-c` is active.
+fn interpreter_script_path(segment: &[ShellToken]) -> Option<String> {
+    let commands = segment_commands(segment);
+    let command = commands.last()?;
+    if !matches!(
+        command.head,
+        "sh" | "bash" | "dash" | "zsh" | "ksh" | "ash" | "python" | "python3"
+    ) {
+        return None;
+    }
+    let mut after_double_dash = false;
+    let mut index = 0usize;
+    while let Some(argument) = command.args.get(index) {
+        if *argument == "--" {
+            after_double_dash = true;
+            index += 1;
+            continue;
+        }
+        if !after_double_dash && *argument == "-c" {
+            return None;
+        }
+        if !after_double_dash && argument.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        if argument.contains('/') || argument.ends_with(".py") || argument.ends_with(".sh") {
+            return Some((*argument).to_owned());
+        }
+        index += 1;
+    }
+    None
 }
 
 /// Strip shell comments for the staged-chain pass without treating URL
@@ -525,21 +624,6 @@ fn analyze_script_unit(
             }
         }
     }
-    let python_fetch_to_exec = matches!(kind, PayloadKind::Python)
-        && (code.contains("urlopen") || code.contains("requests.get") || code.contains("urllib"))
-        && (code.contains("os.system")
-            || code.contains("subprocess")
-            || code.contains("exec(")
-            || code.contains("eval("));
-    if python_fetch_to_exec {
-        outcome.result_parts.push(parts(
-            download_rule,
-            number,
-            "download-execute",
-            Confidence::LexicalFallback,
-        ));
-    }
-
     // Egress attribution (H3): a fetch tool in command position is network
     // access from the plugin regardless of what happens to the response.
     // Quoted literals stay invisible, while a fetch inside a live command

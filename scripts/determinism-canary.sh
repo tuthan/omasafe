@@ -3,9 +3,10 @@
 # yield identical analysis output across repeated runs. Any divergence fails
 # the build with preserved reproduction inputs.
 #
-# The comparison covers the full `result.analysis` section (fingerprint,
-# normalized results, capabilities, edges, limitations) — not the report
-# envelope, which legitimately carries a generation timestamp.
+# The comparison covers the full `result.analysis` section plus the review
+# summary/profile metadata — not the report envelope, which legitimately
+# carries a generation timestamp. The analysis timestamp is normalized only
+# because it is a completion-time field, not because it is unimportant.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -18,36 +19,47 @@ cargo build --quiet --manifest-path "$root/Cargo.toml" --bin omasafe-cli
 bin="$target_dir/debug/omasafe-cli"
 
 run_report() {
-    local home="$1" out="$2"
+    local home="$1" out="$2" profile="$3"
     mkdir -p "$home"
     HOME="$home" \
     XDG_CONFIG_HOME="$home/config" \
     XDG_STATE_HOME="$home/state" \
     XDG_CACHE_HOME="$home/cache" \
-        "$bin" scan-plugin --path "$fixture" --format json >"$out"
+        "$bin" scan-plugin --path "$fixture" --format json --report-profile "$profile" >"$out"
 }
 
-for attempt in 1 2; do
-    run_report "$work/home-$attempt" "$work/report-$attempt.json"
+for profile in full review; do
+    for attempt in 1 2; do
+        run_report "$work/home-$profile-$attempt" "$work/report-$profile-$attempt.json" "$profile"
+    done
 done
 
-if ! python3 - "$work/report-1.json" "$work/report-2.json" <<'EOF'
+if ! python3 - "$work" <<'EOF'
 import json
+import pathlib
 import sys
 
-with open(sys.argv[1], encoding="utf-8") as handle:
-    first = json.load(handle)["result"]["analysis"]
-with open(sys.argv[2], encoding="utf-8") as handle:
-    second = json.load(handle)["result"]["analysis"]
-sys.exit(0 if first == second else 1)
+work = pathlib.Path(sys.argv[1])
+for profile in ("full", "review"):
+    with (work / f"report-{profile}-1.json").open(encoding="utf-8") as handle:
+        first = json.load(handle)["result"]
+    with (work / f"report-{profile}-2.json").open(encoding="utf-8") as handle:
+        second = json.load(handle)["result"]
+    for result in (first, second):
+        result["review_summary"]["analysis_produced_at"] = "<normalized>"
+    if any(first[key] != second[key] for key in ("analysis", "review_summary", "report_profile")):
+        sys.exit(1)
+sys.exit(0)
 EOF
 then
     repro="$root/determinism-canary-failure"
     mkdir -p "$repro"
     # Preserve everything needed to reproduce: both outputs, the exact
     # fixture tree, and the binary/build identity that produced them.
-    cp "$work/report-1.json" "$repro/report-1.json"
-    cp "$work/report-2.json" "$repro/report-2.json"
+    cp "$work/report-full-1.json" "$repro/report-full-1.json"
+    cp "$work/report-full-2.json" "$repro/report-full-2.json"
+    cp "$work/report-review-1.json" "$repro/report-review-1.json"
+    cp "$work/report-review-2.json" "$repro/report-review-2.json"
     rm -rf "${repro:?}/fixture"
     cp -r "$fixture" "$repro/fixture"
     {

@@ -15,7 +15,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from corpus_common import load_ledger, resolve_plugin_dir, sample_plugins  # noqa: E402
+from corpus_common import (  # noqa: E402
+    load_ledger,
+    load_occurrence_ledger,
+    resolve_plugin_dir,
+    sample_plugins,
+)
 from bounded_process import run_bounded  # noqa: E402
 
 ROOT = Path(__file__).parent.parent
@@ -216,6 +221,20 @@ def main():
         )
         ledger_path.write_text(good)
         check("valid ledger loads", load_ledger(ledger_path) != {})
+        occurrence = {
+            "schema_version": 2,
+            "plugin_id": "p",
+            "commit": "b" * 40,
+            "rule_id": "r",
+            "occurrence_id": "a" * 64,
+            "rule_semantic_identity_digest": "c" * 64,
+            "observed_policy_identity_digest": "d" * 64,
+            "review_compatibility_declaration_id": None,
+            "disposition": "true-positive",
+            "note": "reviewed occurrence",
+        }
+        ledger_path.write_text(json.dumps(occurrence) + "\n", encoding="utf-8")
+        check("v2 occurrence ledger loads", len(load_occurrence_ledger(ledger_path)) == 1)
         for bad in [
             '{"plugin_id":"p","commit":"short","rule_id":"r","disposition":"true-positive","note":"n"}',
             '{"plugin_id":"p","commit":"' + "b" * 40 + '","rule_id":"r","disposition":"maybe","note":"n"}',
