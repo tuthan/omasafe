@@ -481,7 +481,7 @@
   <section class="wrap hero">
     <div class="hero-grid">
       <div class="hero-copy">
-        <p class="eyebrow">OmaSafe v0.2.1 &middot; local trust layer</p>
+        <p class="eyebrow">OmaSafe v0.2.5 &middot; coverage truth</p>
         <h1>Know what your plugins can do.<em>We will catch everything.</em></h1>
         <p class="lede">
           A bounded, evidence-first CLI for Omarchy plugins. Track exact revisions,
@@ -512,8 +512,8 @@
   <section class="band band-sunk">
     <div class="wrap">
       <div class="sec-head">
-        <p class="eyebrow">What changed in v0.2.1</p>
-        <h2>From “what is installed?” to “what can it reach?”</h2>
+        <p class="eyebrow">What changed in v0.2.5</p>
+        <h2>From “what is installed?” to “what is actually covered?”</h2>
         <p>OmaSafe keeps the local trust layer small and makes the review surface legible: every result carries identity, evidence, and coverage.</p>
       </div>
       <div class="features reveal">
@@ -530,7 +530,7 @@
         <article class="feature">
           <span class="feature-kicker">03 / control</span>
           <h3>Keep the decision yours.</h3>
-          <p>Advisory and hardened policies, scoped suppressions, exact expiring overrides, and report-only scheduled scans.</p>
+          <p>Advisory and hardened policies, per-file opaque executable reviews, scoped suppressions, exact expiring overrides, and report-only scheduled scans.</p>
         </article>
       </div>
     </div>
@@ -582,10 +582,10 @@
         </div>
 
         <div class="stop stop-now reveal">
-          <b>v0.2.1</b>
-          <h3>Payload-aware review</h3>
-          <p>Bounded analysis, capability evidence, reviewed updates, and opt-in hardened controls.</p>
-          <span class="ticks-label">Current &middot; signed CLI</span>
+          <b>v0.2.5</b>
+          <h3>Coverage truth</h3>
+          <p>Explicit language and behavior coverage, opaque executable inventory, exact review bindings, and hardened lifecycle gates.</p>
+          <span class="ticks-label">Current development release</span>
         </div>
 
         <div class="stop reveal">
@@ -635,7 +635,7 @@
       <div class="sec-head">
         <p class="eyebrow">Getting started</p>
         <h2>Download the engine, then review what you trust</h2>
-        <p>Install the signed v0.2.1 CLI from GitHub, inspect a plugin's payload, and keep the optional Omarchy bar widget separate in the <a href="https://github.com/tuthan/omasafe-plugin">OmaSafe plugin repository</a>.</p>
+        <p>Install the signed v0.2.5 CLI from GitHub, inspect a plugin's payload, and keep the optional Omarchy bar widget separate in the <a href="https://github.com/tuthan/omasafe-plugin">OmaSafe plugin repository</a>.</p>
       </div>
       <div class="cta-row" style="margin-bottom: 28px;">
         <a class="btn btn-primary" href="https://github.com/tuthan/omasafe/releases/latest">Download the CLI release</a>
@@ -645,13 +645,13 @@
         <div class="term">
           <div class="term-head">verified install</div>
 <pre>curl --fail --proto <span class="p">'=https'</span> --tlsv1.2 --location \
-  https://raw.githubusercontent.com/tuthan/omasafe/v0.2.1/scripts/install-cli.sh \
+  https://raw.githubusercontent.com/tuthan/omasafe/v0.2.5/scripts/install-cli.sh \
   | bash -s -- <span class="p">--version</span> latest
 
 <span class="c"># exact release</span>
 curl --fail --proto <span class="p">'=https'</span> --tlsv1.2 --location \
-  https://raw.githubusercontent.com/tuthan/omasafe/v0.2.1/scripts/install-cli.sh \
-  | bash -s -- <span class="p">--version</span> v0.2.1</pre>
+  https://raw.githubusercontent.com/tuthan/omasafe/v0.2.5/scripts/install-cli.sh \
+  | bash -s -- <span class="p">--version</span> v0.2.5</pre>
         </div>
         <div class="term">
           <div class="term-head">analyze &amp; review</div>
@@ -671,7 +671,7 @@ omasafe-cli schedule install <span class="p">--policy</span> advisory</pre>
 <footer>
   <div class="wrap foot">
     <div>
-      io.github.tuthan.omasafe &middot; v0.2.1 &middot; MIT<br>
+      io.github.tuthan.omasafe &middot; v0.2.5 &middot; MIT<br>
       A trust and drift-review tool <em>for</em> Omarchy. Not an official Omarchy project.
     </div>
     <div class="foot-links">

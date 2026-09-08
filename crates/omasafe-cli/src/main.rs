@@ -19,8 +19,9 @@ use omasafe_marketplace::{
 use omasafe_plugin_trust::{
     DiffResult, SourceIdentity,
     baseline::{
-        EnforcementHistory, OverrideHistory, ReviewDecision, ScanState, TrustHistory, TrustRecord,
-        UpdateFlowRecord, lock as lock_state, lock_shared as lock_state_shared,
+        EnforcementHistory, ExecutableReviewHistory, ExecutableReviewRevocation, OverrideHistory,
+        ReviewDecision, ScanState, TrustHistory, TrustRecord, UpdateFlowRecord, lock as lock_state,
+        lock_shared as lock_state_shared,
     },
     collect, collect_one, git_diff, omarchy_bar_use_default, omarchy_plugin_disable,
     omarchy_plugin_enable, omarchy_plugin_update, query_shell, source_identity,
@@ -34,6 +35,10 @@ use omasafe_report::enforcement::{
     AuthorizationBasis, ENFORCEMENT_SUMMARY_SCHEMA_VERSION, EnforcementAuditEvent,
     EnforcementEvaluation, EnforcementMode, EnforcementOutcome, EnforcementPolicy,
     EnforcementSummary, EnforcementSummaryDecision, OVERRIDE_SCHEMA_VERSION, OverrideBinding,
+};
+use omasafe_report::executable_review::{
+    AssessmentOutcome, EXECUTABLE_REVIEW_POLICY_VERSION, EXECUTABLE_REVIEW_SCHEMA_VERSION,
+    ExecutableReviewBinding, OperatorDecision,
 };
 use omasafe_report::scan::{CachePersistence, ScanAlert, ScanResult};
 use sha2::{Digest, Sha256};
@@ -61,7 +66,7 @@ const SCHEDULE_SCHEMA_VERSION: &str = "omasafe.schedule.v1";
 const DEFAULT_SCAN_MEMORY_LIMIT_MB: u64 = 768;
 const SCHEDULE_PROCESS_BUDGET: Duration = Duration::from_secs(5);
 const SCHEDULE_PROCESS_OUTPUT_CAP: usize = 64 * 1024;
-const ANALYSIS_CACHE_SCHEMA_VERSION: &str = "omasafe.analysis-cache.v2";
+const ANALYSIS_CACHE_SCHEMA_VERSION: &str = "omasafe.analysis-cache.v3";
 const ANALYSIS_CACHE_MAX_BYTES: usize = 2 * 1024 * 1024;
 const ANALYSIS_CACHE_MAX_READ_BYTES: usize = ANALYSIS_CACHE_MAX_BYTES + 1;
 
@@ -190,6 +195,14 @@ fn run(args: Vec<String>) -> Result<i32, Box<dyn std::error::Error>> {
             override_list(rest)?;
             0
         }
+        [command, subcommand, action, id, rest @ ..]
+            if command == "plugins"
+                && subcommand == "executable-review"
+                && matches!(action.as_str(), "list" | "add" | "revoke") =>
+        {
+            executable_review(action, id, rest)?;
+            0
+        }
         [command, subcommand, id, rest @ ..] if command == "plugins" && subcommand == "review" => {
             review(id, rest)?;
             0
@@ -248,7 +261,7 @@ fn run(args: Vec<String>) -> Result<i32, Box<dyn std::error::Error>> {
         [command, rest @ ..] if command == "scan-plugin" => scan_plugin(rest)?,
         _ => {
             eprintln!(
-                "usage: omasafe-cli plugins ... | scan [--format text|json] [--notify] [--only-new] [--include-analysis] | scan-cache show [--profile installed-basic|installed-analysis] [--validate] [--format text|json] | marketplace refresh [--commit COMMIT|--latest] | rules list [--format text|json] | rules coverage [--format text|json] | rules explain RULE_ID [--format text|json] | plugins analyze PLUGIN_ID [--format text|json] [--refresh|--cached] [--fail-on SEVERITY] | plugins enable PLUGIN_ID [--policy advisory|hardened] [--format text|json] | plugins review-update PLUGIN_ID [--expected-commit SHA] [--yes] [--policy advisory|hardened] | plugins enforcement-status PLUGIN_ID [--format text|json] | plugins override create PLUGIN_ID --rule RULE_ID [--rule RULE_ID ...] --commit SHA --reason TEXT --expires TIMESTAMP | plugins override list [--format text|json] | scan-plugin (--path DIR|--git URL [--revision COMMIT]|--request TEXT|--marketplace PLUGIN_ID) [--plugin-id PLUGIN_ID] [--report-profile full|review] [--format text|json] [--fail-on SEVERITY] | schedule install [--policy advisory|hardened] | schedule uninstall | schedule status [--format text|json] | paths | provenance [--format text|json]"
+                "usage: omasafe-cli plugins ... | scan [--format text|json] [--notify] [--only-new] [--include-analysis] | scan-cache show [--profile installed-basic|installed-analysis] [--validate] [--format text|json] | marketplace refresh [--commit COMMIT|--latest] | rules list [--format text|json] | rules coverage [--format text|json] | rules explain RULE_ID [--format text|json] | plugins analyze PLUGIN_ID [--format text|json] [--refresh|--cached] [--fail-on SEVERITY] | plugins enable PLUGIN_ID [--policy advisory|hardened] [--format text|json] | plugins review-update PLUGIN_ID [--expected-commit SHA] [--yes] [--policy advisory|hardened] | plugins enforcement-status PLUGIN_ID [--format text|json] | plugins executable-review list ID [--format text|json] | plugins executable-review add ID --path PATH --sha256 DIGEST --method METHOD --assessment-outcome OUTCOME --decision DECISION --performed-at TIME --expires TIME --provider PROVIDER --reason REASON [--report-ref REF] [--expected-head COMMIT] [--expected-tree TREE] [--expected-digest DIGEST] --yes | plugins executable-review revoke ID --path PATH --sha256 DIGEST --reason REASON --yes | plugins override create PLUGIN_ID --rule RULE_ID [--rule RULE_ID ...] --commit SHA --reason TEXT --expires TIMESTAMP | plugins override list [--format text|json] | scan-plugin (--path DIR|--git URL [--revision COMMIT]|--request TEXT|--marketplace PLUGIN_ID) [--plugin-id PLUGIN_ID] [--report-profile full|review] [--format text|json] [--fail-on SEVERITY] | schedule install [--policy advisory|hardened] | schedule uninstall | schedule status [--format text|json] | paths | provenance [--format text|json]"
             );
             std::process::exit(2);
         }
@@ -1395,12 +1408,15 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
         })
         .map(|entry| entry.relative_path.clone())
         .collect();
+    let opaque_code_items = opaque_code_items(id, &candidate_inventory, Some(&candidate_identity));
     let enforcement_policy = EnforcementPolicy::new(policy_mode);
     let candidate_facts = EnforcementFacts {
         identity: candidate_identity.clone(),
         coverage_counts: coverage_count_map.clone(),
         coverage_limitations: enforcement_coverage.clone(),
         unsupported_executable_paths: unsupported_executable_paths.clone(),
+        opaque_code_items,
+        executable_reviews: load_executable_reviews(&paths, id)?,
         observed_rule_ids: finding_rule_ids.clone(),
         analyzer_policy_identity: omasafe_analyzer::policy_identity(),
     };
@@ -1430,6 +1446,8 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
         audit_event_id: format!("preview:{id}:{candidate}"),
         evaluated_at: now(),
         native_install_not_interposed: true,
+        opaque_code_items: candidate_facts.opaque_code_items.clone(),
+        executable_reviews: candidate_facts.executable_reviews.clone(),
     });
 
     // The preview is not the final lifecycle decision. Keep a second
@@ -1458,6 +1476,8 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
                 audit_event_id: format!("post:{id}:{candidate}:{phase}"),
                 evaluated_at: now(),
                 native_install_not_interposed: true,
+                opaque_code_items: candidate_facts.opaque_code_items.clone(),
+                executable_reviews: candidate_facts.executable_reviews.clone(),
             });
             persist_enforcement_decision(&paths, &decision)
         };
@@ -2130,11 +2150,121 @@ struct EnforcementFacts {
     coverage_counts: std::collections::BTreeMap<String, usize>,
     coverage_limitations: Vec<String>,
     unsupported_executable_paths: Vec<String>,
+    opaque_code_items: Vec<omasafe_report::enforcement::OpaqueCodeItem>,
+    executable_reviews: Vec<ExecutableReviewBinding>,
     observed_rule_ids: Vec<String>,
     analyzer_policy_identity: omasafe_report::analysis::PolicyIdentity,
 }
 
+fn executable_review_path(paths: &XdgPaths) -> PathBuf {
+    paths.state.join("executable-reviews.json")
+}
+
+fn coverage_review_status(
+    coverage: &omasafe_analyzer::PayloadCoverage,
+    bindings: &[ExecutableReviewBinding],
+    plugin_id: &str,
+    source_commit: Option<&str>,
+    source_tree: Option<&str>,
+    source_content_digest: Option<&str>,
+) -> &'static str {
+    let Some(digest) = coverage.exact_sha256.as_deref() else {
+        return "digest-unavailable";
+    };
+    if !coverage.opaque_review_required {
+        return "not-applicable";
+    }
+    let native_format = coverage
+        .native_format
+        .as_deref()
+        .unwrap_or("opaque-executable");
+    let Some(binding) = bindings.iter().rev().find(|binding| {
+        binding.relative_path == coverage.relative_path
+            && binding.exact_sha256 == digest
+            && binding.native_format == native_format
+    }) else {
+        return "unreviewed";
+    };
+    if binding.operator_decision != OperatorDecision::Accepted {
+        return "rejected";
+    }
+    if binding.assessment_outcome != AssessmentOutcome::NoKnownIssue {
+        return binding.assessment_outcome.as_str();
+    }
+    if !binding.authorizes_with_identity(
+        plugin_id,
+        &coverage.relative_path,
+        digest,
+        native_format,
+        source_commit,
+        source_tree,
+        source_content_digest,
+        &now(),
+    ) {
+        return if binding.expires_at <= now() {
+            "expired"
+        } else {
+            "invalid"
+        };
+    }
+    "accepted"
+}
+
+fn load_executable_reviews(
+    paths: &XdgPaths,
+    id: &str,
+) -> Result<Vec<ExecutableReviewBinding>, Box<dyn std::error::Error>> {
+    let path = executable_review_path(paths);
+    let _lock = lock_state_shared(&path)?;
+    let history = ExecutableReviewHistory::load_bounded(&path)?;
+    let revoked: BTreeSet<String> = history
+        .revocations
+        .iter()
+        .map(|revocation| revocation.audit_event_id.clone())
+        .collect();
+    Ok(history
+        .reviews
+        .into_iter()
+        .filter(|review| review.plugin_id == id && !revoked.contains(&review.audit_event_id))
+        .collect())
+}
+
+fn opaque_code_items(
+    id: &str,
+    inventory: &omasafe_analyzer::PayloadInventory,
+    identity: Option<&SourceIdentity>,
+) -> Vec<omasafe_report::enforcement::OpaqueCodeItem> {
+    inventory
+        .coverage
+        .iter()
+        .filter(|coverage| coverage.opaque_review_required)
+        .map(|coverage| omasafe_report::enforcement::OpaqueCodeItem {
+            plugin_id: id.to_owned(),
+            relative_path: coverage.relative_path.clone(),
+            native_format: coverage
+                .native_format
+                .clone()
+                .unwrap_or_else(|| "opaque-executable".to_owned()),
+            exact_sha256: coverage.exact_sha256.clone(),
+            digest_state: coverage.digest_state.clone(),
+            exposure: serde_json::to_value(coverage.code_exposure)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_else(|| "unknown".to_owned()),
+            content_class: serde_json::to_value(coverage.content_class)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_else(|| "unknown".to_owned()),
+            review_required: true,
+            source_commit: identity.and_then(|identity| identity.head.clone()),
+            source_tree: identity.and_then(|identity| identity.tree.clone()),
+            source_content_digest: identity.and_then(|identity| identity.content_digest.clone()),
+        })
+        .collect()
+}
+
 fn collect_enforcement_facts(
+    paths: &XdgPaths,
     id: &str,
     record: &omasafe_plugin_trust::PluginRecord,
 ) -> Result<EnforcementFacts, Box<dyn std::error::Error>> {
@@ -2175,6 +2305,8 @@ fn collect_enforcement_facts(
         })
         .map(|entry| entry.relative_path.clone())
         .collect();
+    let opaque_code_items = opaque_code_items(id, &inventory, Some(&identity));
+    let executable_reviews = load_executable_reviews(paths, id)?;
     let observed_rule_ids = artifacts
         .rendered_findings()
         .into_iter()
@@ -2194,6 +2326,8 @@ fn collect_enforcement_facts(
         coverage_counts,
         coverage_limitations,
         unsupported_executable_paths,
+        opaque_code_items,
+        executable_reviews,
         observed_rule_ids,
         analyzer_policy_identity: omasafe_analyzer::policy_identity(),
     })
@@ -2231,6 +2365,8 @@ fn evaluate_enable_decision(
         audit_event_id,
         evaluated_at: now(),
         native_install_not_interposed: true,
+        opaque_code_items: facts.opaque_code_items.clone(),
+        executable_reviews: facts.executable_reviews.clone(),
     })
 }
 
@@ -2336,7 +2472,7 @@ fn plugins_enable(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::E
         format!("refusing enable: installed repository audit failed: {failure}")
     })?;
 
-    let facts = collect_enforcement_facts(id, record)?;
+    let facts = collect_enforcement_facts(&paths, id, record)?;
     let policy = EnforcementPolicy::new(policy_mode);
     let (override_present, override_valid, override_binding) =
         resolve_override(&paths, id, &policy, &facts)?;
@@ -2424,7 +2560,7 @@ fn plugins_enable(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::E
         persist_enforcement_decision(&paths, &failed_decision)?;
         return Err("postcondition failed: plugin vanished from inventory after enable".into());
     };
-    let post_facts = collect_enforcement_facts(id, fresh_record).ok();
+    let post_facts = collect_enforcement_facts(&paths, id, fresh_record).ok();
     let identity_matches = post_facts.as_ref().is_some_and(|post| {
         post.identity.identity_material() == facts.identity.identity_material()
             && post.identity.file_digests == facts.identity.file_digests
@@ -5033,6 +5169,441 @@ fn enforcement_status(id: &str, args: &[String]) -> Result<(), Box<dyn std::erro
 }
 
 #[derive(Debug, serde::Serialize)]
+struct ExecutableReviewListEntry {
+    binding: ExecutableReviewBinding,
+    status: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ExecutableReviewListResult {
+    plugin_id: String,
+    reviews: Vec<ExecutableReviewListEntry>,
+}
+
+fn executable_review(
+    action: &str,
+    id: &str,
+    args: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        "list" => executable_review_list(id, args),
+        "add" => executable_review_add(id, args),
+        "revoke" => executable_review_revoke(id, args),
+        _ => unreachable!("action filtered by caller"),
+    }
+}
+
+fn executable_review_list(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let format = format_arg(args)?;
+    let paths = XdgPaths::discover()?;
+    paths.ensure()?;
+    let history_path = executable_review_path(&paths);
+    let _lock = lock_state_shared(&history_path)?;
+    let history = ExecutableReviewHistory::load_bounded(&history_path)?;
+    let current_time = now();
+    let revoked: BTreeSet<String> = history
+        .revocations
+        .iter()
+        .map(|revocation| revocation.audit_event_id.clone())
+        .collect();
+    let result = ExecutableReviewListResult {
+        plugin_id: id.to_owned(),
+        reviews: history
+            .reviews
+            .into_iter()
+            .filter(|binding| binding.plugin_id == id)
+            .map(|binding| {
+                let status = if revoked.contains(&binding.audit_event_id) {
+                    "revoked"
+                } else if binding.operator_decision != OperatorDecision::Accepted {
+                    "rejected"
+                } else if binding.assessment_outcome != AssessmentOutcome::NoKnownIssue {
+                    binding.assessment_outcome.as_str()
+                } else if binding.expires_at <= current_time {
+                    "expired"
+                } else {
+                    "active"
+                };
+                ExecutableReviewListEntry {
+                    binding,
+                    status: status.to_owned(),
+                }
+            })
+            .collect(),
+    };
+    drop(_lock);
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&Report::new(TOOL_VERSION, now(), result))?
+        );
+    } else if result.reviews.is_empty() {
+        println!("No executable reviews recorded for {}.", safe_text(id));
+    } else {
+        for entry in result.reviews {
+            println!(
+                "{} {} sha256={} expires={} ({})",
+                safe_text(&entry.binding.relative_path),
+                safe_text(&entry.binding.native_format),
+                safe_text(&entry.binding.exact_sha256),
+                safe_text(&entry.binding.expires_at),
+                entry.status
+            );
+        }
+    }
+    Ok(())
+}
+
+fn executable_review_add(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    require_interactive_review_terminal()?;
+    let mut path = None;
+    let mut exact_sha256 = None;
+    let mut method = None;
+    let mut outcome = None;
+    let mut decision = None;
+    let mut performed_at = None;
+    let mut expires_at = None;
+    let mut provider = None;
+    let mut provider_version = None;
+    let mut report_ref = None;
+    let mut report_digest = None;
+    let mut reason = None;
+    let mut source_commit = None;
+    let mut source_tree = None;
+    let mut source_content_digest = None;
+    let mut limitations = Vec::new();
+    let mut yes = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--path" => {
+                path = Some(next_value(args, index, "review path")?.to_owned());
+                index += 2;
+            }
+            "--sha256" => {
+                exact_sha256 = Some(next_value(args, index, "review SHA-256")?.to_owned());
+                index += 2;
+            }
+            "--method" => {
+                method = Some(next_value(args, index, "review method")?.parse()?);
+                index += 2;
+            }
+            "--assessment-outcome" => {
+                outcome = Some(next_value(args, index, "assessment outcome")?.parse()?);
+                index += 2;
+            }
+            "--decision" => {
+                decision = Some(next_value(args, index, "operator decision")?.parse()?);
+                index += 2;
+            }
+            "--performed-at" => {
+                performed_at = Some(next_value(args, index, "performed-at")?.to_owned());
+                index += 2;
+            }
+            "--expires" => {
+                expires_at = Some(next_value(args, index, "review expiry")?.to_owned());
+                index += 2;
+            }
+            "--provider" => {
+                provider = Some(next_value(args, index, "review provider")?.to_owned());
+                index += 2;
+            }
+            "--provider-version" => {
+                provider_version = Some(next_value(args, index, "provider version")?.to_owned());
+                index += 2;
+            }
+            "--report-ref" => {
+                report_ref = Some(next_value(args, index, "report reference")?.to_owned());
+                index += 2;
+            }
+            "--report-digest" => {
+                report_digest = Some(next_value(args, index, "report digest")?.to_owned());
+                index += 2;
+            }
+            "--reason" => {
+                reason = Some(next_value(args, index, "review reason")?.to_owned());
+                index += 2;
+            }
+            "--limitation" => {
+                limitations.push(next_value(args, index, "review limitation")?.to_owned());
+                index += 2;
+            }
+            "--expected-head" => {
+                source_commit = Some(next_value(args, index, "expected HEAD")?.to_owned());
+                index += 2;
+            }
+            "--expected-tree" => {
+                source_tree = Some(next_value(args, index, "expected tree")?.to_owned());
+                index += 2;
+            }
+            "--expected-digest" => {
+                source_content_digest =
+                    Some(next_value(args, index, "expected content digest")?.to_owned());
+                index += 2;
+            }
+            "--yes" => {
+                yes = true;
+                index += 1;
+            }
+            value => return Err(format!("unknown executable-review add argument: {value}").into()),
+        }
+    }
+    if !yes {
+        return Err(
+            "executable review add requires --yes as the current-turn human confirmation".into(),
+        );
+    }
+    let relative_path = path.ok_or("--path is required")?;
+    let supplied_digest = exact_sha256.ok_or("--sha256 is required")?;
+    if !is_sha256(&supplied_digest) {
+        return Err("--sha256 must be a full lowercase SHA-256".into());
+    }
+    let performed_at = performed_at.ok_or("--performed-at is required")?;
+    let expires_at = expires_at.ok_or("--expires is required")?;
+    let performed_seconds = parse_timestamp_seconds(&performed_at);
+    if performed_seconds.is_none() {
+        return Err("--performed-at must be an RFC3339 UTC timestamp or Unix seconds".into());
+    }
+    let expiry_seconds = parse_timestamp_seconds(&expires_at);
+    if expiry_seconds.is_none() || expiry_seconds <= Some(unix_now()) {
+        return Err("--expires must be a future RFC3339 UTC timestamp or Unix seconds".into());
+    }
+    let performed_at = format_timestamp(performed_seconds.expect("checked timestamp"));
+    let expires_at = format_timestamp(expiry_seconds.expect("checked timestamp"));
+    let report_ref = report_ref;
+    let report_digest = report_digest;
+    if report_ref.is_none() && report_digest.is_none() {
+        return Err("--report-ref or --report-digest is required".into());
+    }
+    let reason = reason.ok_or("--reason is required")?;
+    if let Some(commit) = source_commit.as_deref()
+        && !valid_commit(commit)
+    {
+        return Err("--expected-head must be a full hexadecimal commit SHA".into());
+    }
+    if let Some(tree) = source_tree.as_deref()
+        && !valid_commit(tree)
+    {
+        return Err("--expected-tree must be a full hexadecimal tree SHA".into());
+    }
+    if let Some(digest) = source_content_digest.as_deref()
+        && !is_sha256(digest)
+    {
+        return Err("--expected-digest must be a full lowercase SHA-256".into());
+    }
+    let (record, _) = current_identity(id)?;
+    let paths = XdgPaths::discover()?;
+    paths.ensure()?;
+    let facts = collect_enforcement_facts(&paths, id, &record)?;
+    if facts.identity.head.is_some() && source_commit.as_deref() != facts.identity.head.as_deref() {
+        return Err(
+            "--expected-head is required and must match the current plugin identity".into(),
+        );
+    }
+    if facts.identity.tree.is_some() && source_tree.as_deref() != facts.identity.tree.as_deref() {
+        return Err(
+            "--expected-tree is required and must match the current plugin identity".into(),
+        );
+    }
+    if facts.identity.content_digest.is_some()
+        && source_content_digest.as_deref() != facts.identity.content_digest.as_deref()
+    {
+        return Err(
+            "--expected-digest is required and must match the current plugin identity".into(),
+        );
+    }
+    let item = facts
+        .opaque_code_items
+        .iter()
+        .find(|item| item.relative_path == relative_path)
+        .ok_or_else(|| format!("path is not an inventoried opaque executable: {relative_path}"))?;
+    if item.exact_sha256.as_deref() != Some(supplied_digest.as_str()) {
+        return Err("--sha256 does not match the current exact inventory digest".into());
+    }
+    if let Some(expected) = source_commit.as_deref()
+        && facts.identity.head.as_deref() != Some(expected)
+    {
+        return Err("--expected-head does not match the current plugin identity".into());
+    }
+    if let Some(expected) = source_tree.as_deref()
+        && facts.identity.tree.as_deref() != Some(expected)
+    {
+        return Err("--expected-tree does not match the current plugin identity".into());
+    }
+    if let Some(expected) = source_content_digest.as_deref()
+        && facts.identity.content_digest.as_deref() != Some(expected)
+    {
+        return Err("--expected-digest does not match the current plugin identity".into());
+    }
+    let binding = ExecutableReviewBinding {
+        schema: EXECUTABLE_REVIEW_SCHEMA_VERSION.to_owned(),
+        plugin_id: id.to_owned(),
+        relative_path,
+        native_format: item.native_format.clone(),
+        exact_sha256: supplied_digest,
+        source_commit: facts.identity.head.clone(),
+        source_tree: facts.identity.tree.clone(),
+        source_content_digest: facts.identity.content_digest.clone(),
+        review_policy_version: EXECUTABLE_REVIEW_POLICY_VERSION.to_owned(),
+        assessment_method: method.ok_or("--method is required")?,
+        provider: provider.ok_or("--provider is required")?,
+        provider_version,
+        assessment_outcome: outcome.ok_or("--assessment-outcome is required")?,
+        performed_at,
+        report_ref,
+        report_digest,
+        limitations,
+        operator_decision: decision.ok_or("--decision is required")?,
+        reason,
+        decision_at: now(),
+        expires_at,
+        audit_event_id: format!(
+            "executable-review:add:{id}:{}:{}",
+            item.relative_path,
+            unix_now()
+        ),
+    };
+    binding
+        .validate()
+        .map_err(|error| format!("invalid executable review: {error}"))?;
+    let history_path = executable_review_path(&paths);
+    let _lock = lock_state(&history_path)?;
+    let mut history = ExecutableReviewHistory::load(&history_path)?;
+    history.record_review(binding.clone());
+    history.write_atomic_locked(&history_path)?;
+    drop(_lock);
+    persist_enforcement_audit_event(
+        &paths,
+        &EnforcementAuditEvent {
+            schema: omasafe_report::enforcement::ENFORCEMENT_AUDIT_SCHEMA_VERSION.to_owned(),
+            audit_event_id: binding.audit_event_id.clone(),
+            plugin_id: id.to_owned(),
+            operation: "executable-review-add".to_owned(),
+            attempted_at: binding.decision_at.clone(),
+            completed: true,
+            outcome: EnforcementOutcome::Allow,
+            authorization_basis: Some(AuthorizationBasis::Policy),
+            reason_codes: Vec::new(),
+            blocking_rule_ids: Vec::new(),
+        },
+    )?;
+    println!(
+        "Executable review recorded for {} at {}.",
+        safe_text(id),
+        safe_text(&binding.relative_path)
+    );
+    Ok(())
+}
+
+fn executable_review_revoke(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    require_interactive_review_terminal()?;
+    let mut path = None;
+    let mut digest = None;
+    let mut reason = None;
+    let mut yes = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--path" => {
+                path = Some(next_value(args, index, "review path")?.to_owned());
+                index += 2;
+            }
+            "--sha256" => {
+                digest = Some(next_value(args, index, "review SHA-256")?.to_owned());
+                index += 2;
+            }
+            "--reason" => {
+                reason = Some(next_value(args, index, "revoke reason")?.to_owned());
+                index += 2;
+            }
+            "--yes" => {
+                yes = true;
+                index += 1;
+            }
+            value => {
+                return Err(format!("unknown executable-review revoke argument: {value}").into());
+            }
+        }
+    }
+    if !yes {
+        return Err(
+            "executable review revoke requires --yes as the current-turn human confirmation".into(),
+        );
+    }
+    let relative_path = path.ok_or("--path is required")?;
+    let digest = digest.ok_or("--sha256 is required")?;
+    if !is_sha256(&digest) {
+        return Err("--sha256 must be a full lowercase SHA-256".into());
+    }
+    let reason = reason.ok_or("--reason is required")?;
+    if reason.trim().is_empty() || reason.len() > 1_024 {
+        return Err("--reason must be 1-1024 characters".into());
+    }
+    let paths = XdgPaths::discover()?;
+    paths.ensure()?;
+    let history_path = executable_review_path(&paths);
+    let _lock = lock_state(&history_path)?;
+    let mut history = ExecutableReviewHistory::load(&history_path)?;
+    let binding = history
+        .reviews
+        .iter()
+        .rev()
+        .find(|binding| {
+            binding.plugin_id == id
+                && binding.relative_path == relative_path
+                && binding.exact_sha256 == digest
+                && !history.is_revoked(&binding.audit_event_id)
+        })
+        .cloned()
+        .ok_or("no active executable review matches that plugin, path, and digest")?;
+    let revocation = ExecutableReviewRevocation {
+        audit_event_id: binding.audit_event_id.clone(),
+        plugin_id: id.to_owned(),
+        relative_path: relative_path.clone(),
+        revoked_at: now(),
+        reason,
+    };
+    history.revoke(revocation.clone());
+    history.write_atomic_locked(&history_path)?;
+    drop(_lock);
+    persist_enforcement_audit_event(
+        &paths,
+        &EnforcementAuditEvent {
+            schema: omasafe_report::enforcement::ENFORCEMENT_AUDIT_SCHEMA_VERSION.to_owned(),
+            audit_event_id: format!("executable-review:revoke:{}:{}", id, unix_now()),
+            plugin_id: id.to_owned(),
+            operation: "executable-review-revoke".to_owned(),
+            attempted_at: revocation.revoked_at.clone(),
+            completed: true,
+            outcome: EnforcementOutcome::Block,
+            authorization_basis: Some(AuthorizationBasis::Policy),
+            reason_codes: vec!["opaque-code-review-revoked".to_owned()],
+            blocking_rule_ids: Vec::new(),
+        },
+    )?;
+    println!(
+        "Executable review revoked for {} at {}.",
+        safe_text(id),
+        safe_text(&binding.relative_path)
+    );
+    Ok(())
+}
+
+fn require_interactive_review_terminal() -> Result<(), Box<dyn std::error::Error>> {
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return Err("executable review mutations require an interactive terminal".into());
+    }
+    Ok(())
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[derive(Debug, serde::Serialize)]
 struct OverrideCreateResult {
     status: String,
     binding: OverrideBinding,
@@ -5133,7 +5704,7 @@ fn override_create(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::
     }
     audit_installed_git_state(Path::new(&record.path), repository)
         .map_err(|failure| format!("installed repository audit failed: {failure}"))?;
-    let facts = collect_enforcement_facts(id, &record)?;
+    let facts = collect_enforcement_facts(&paths, id, &record)?;
     let policy = EnforcementPolicy::new(EnforcementMode::Hardened);
     let commit_identity = facts
         .identity
@@ -6086,6 +6657,9 @@ fn plugins_analyze(id: &str, args: &[String]) -> Result<i32, Box<dyn std::error:
         "id": id,
         "path": record.path,
         "classification": record.classification,
+        "head": record.head,
+        "tree": record.tree,
+        "content_digest": record.content_digest,
     });
     let source_identity = record
         .content_digest
@@ -6657,15 +7231,22 @@ fn read_bounded_analysis_cache(path: &Path) -> Option<Vec<u8>> {
 }
 
 fn suppression_cache_identity(paths: &XdgPaths) -> String {
-    let path = paths.config.join("suppressions.json");
-    match std::fs::read(&path) {
-        Ok(bytes) if bytes.len() <= ANALYSIS_CACHE_MAX_BYTES => {
-            format!("sha256:{:x}", Sha256::digest(bytes))
-        }
-        Ok(_) => "oversized".to_owned(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "missing".to_owned(),
-        Err(_) => "unreadable".to_owned(),
+    let mut identities = Vec::new();
+    for (label, path) in [
+        ("suppressions", paths.config.join("suppressions.json")),
+        ("executable-reviews", executable_review_path(paths)),
+    ] {
+        let identity = match std::fs::read(&path) {
+            Ok(bytes) if bytes.len() <= ANALYSIS_CACHE_MAX_BYTES => {
+                format!("sha256:{:x}", Sha256::digest(bytes))
+            }
+            Ok(_) => "oversized".to_owned(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => "missing".to_owned(),
+            Err(_) => "unreadable".to_owned(),
+        };
+        identities.push((label, identity));
     }
+    serde_json::to_string(&identities).unwrap_or_else(|_| "unavailable".to_owned())
 }
 
 fn read_analysis_cache(
@@ -7126,6 +7707,14 @@ fn emit_analysis_report(
     analysis.parsers = Some(omasafe_analyzer::parser_report_metadata());
     analysis.coverage_gaps = artifacts.coverage_gaps.clone();
 
+    let review_bindings = plugin_context
+        .and_then(|id| {
+            XdgPaths::discover()
+                .ok()
+                .and_then(|paths| load_executable_reviews(&paths, id).ok())
+        })
+        .unwrap_or_default();
+
     // --fail-on: findings are success; CI opts into a failure threshold.
     // Suppressed findings are de-enforced, so the threshold only sees
     // visible findings. Exit code 4 (documented separately from scan's 3).
@@ -7151,6 +7740,31 @@ fn emit_analysis_report(
         "unsupported": inventory.state_count(omasafe_analyzer::CoverageState::Unsupported),
         "unreferenced": inventory.state_count(omasafe_analyzer::CoverageState::Unreferenced),
     });
+    let code_exposure_rows: Vec<serde_json::Value> = inventory
+        .coverage
+        .iter()
+        .map(|coverage| {
+            serde_json::json!({
+                "relative_path": coverage.relative_path,
+                "exposure": coverage.code_exposure,
+                "content_class": coverage.content_class,
+                "native_format": coverage.native_format,
+                "exact_sha256": coverage.exact_sha256,
+                "digest_state": coverage.digest_state,
+                "opaque_review_required": coverage.opaque_review_required,
+                "review_status": coverage_review_status(
+                    coverage,
+                    &review_bindings,
+                    plugin_context.unwrap_or_default(),
+                    target.get("head").and_then(serde_json::Value::as_str),
+                    target.get("tree").and_then(serde_json::Value::as_str),
+                    target
+                        .get("content_digest")
+                        .and_then(serde_json::Value::as_str),
+                ),
+            })
+        })
+        .collect();
 
     let mut result = serde_json::json!({
         "target": target.clone(),
@@ -7172,6 +7786,8 @@ fn emit_analysis_report(
             "coverage_states": &states,
             "limitations": &inventory.limitations,
             "entries": &inventory.entries,
+            "coverage": &inventory.coverage,
+            "code_exposure": &code_exposure_rows,
         },
     });
     enrich_review_summary(
@@ -7206,6 +7822,7 @@ fn emit_analysis_report(
             "capabilities": {"total": analysis.capabilities.len(), "emitted": analysis.capabilities.len(), "omitted": 0},
             "invocation_edges": {"total": analysis.invocation_edges.len(), "emitted": analysis.invocation_edges.len(), "omitted": 0},
             "coverage_gaps": {"total": analysis.coverage_gaps.len(), "emitted": analysis.coverage_gaps.len(), "omitted": 0},
+            "code_exposure": {"total": code_exposure_rows.len(), "emitted": code_exposure_rows.len(), "omitted": 0},
             "evidence_observations": {"total": evidence_total, "emitted": evidence_emitted, "omitted": evidence_total.saturating_sub(evidence_emitted)},
         },
     });
@@ -7402,8 +8019,16 @@ fn apply_review_profile(
         .as_array()
         .map_or(0, Vec::len);
     result["payload_inventory"]["entries"] = serde_json::json!([]);
+    result["payload_inventory"]["coverage"] = serde_json::json!([]);
     result["payload_inventory"]["entries_omitted"] = serde_json::json!(payload_total);
     result["payload_inventory"]["profile"] = serde_json::json!("review");
+    let exposure_total = result["payload_inventory"]["code_exposure"]
+        .as_array()
+        .map_or(0, Vec::len);
+    let exposure_emitted = exposure_total.min(128);
+    if let Some(exposure) = result["payload_inventory"]["code_exposure"].as_array_mut() {
+        exposure.truncate(exposure_emitted);
+    }
 
     let mut omissions = serde_json::Map::new();
     omissions.insert(
@@ -7412,6 +8037,14 @@ fn apply_review_profile(
             "total": payload_total,
             "emitted": 0,
             "omitted": payload_total,
+        }),
+    );
+    omissions.insert(
+        "code_exposure".into(),
+        serde_json::json!({
+            "total": exposure_total,
+            "emitted": exposure_emitted,
+            "omitted": exposure_total.saturating_sub(exposure_emitted),
         }),
     );
     for (name, key) in [
@@ -7462,6 +8095,12 @@ fn apply_review_profile(
     loop {
         if serialized_report_size(result, generated_at)? <= REVIEW_SERIALIZED_BYTE_LIMIT {
             return Ok(());
+        }
+        if trim_payload_tail(result, "code_exposure") {
+            update_payload_omission_after_trim(result, "code_exposure");
+            note_review_omissions(result);
+            update_review_summary(result);
+            continue;
         }
         let mut trimmed = false;
         // Deterministic tail trimming order. Findings use the same priority
@@ -8111,6 +8750,39 @@ fn trim_analysis_tail(result: &mut serde_json::Value, key: &str) -> bool {
         array.truncate(array.len() / 2);
     }
     true
+}
+
+fn trim_payload_tail(result: &mut serde_json::Value, key: &str) -> bool {
+    let Some(array) = result["payload_inventory"][key].as_array_mut() else {
+        return false;
+    };
+    if array.is_empty() {
+        return false;
+    }
+    if array.len() == 1 {
+        array.pop();
+    } else {
+        array.truncate(array.len() / 2);
+    }
+    true
+}
+
+fn update_payload_omission_after_trim(result: &mut serde_json::Value, key: &str) {
+    let emitted = result["payload_inventory"][key]
+        .as_array()
+        .map_or(0, Vec::len) as u64;
+    let Some(omission) = result["report_profile"]["omissions"][key].as_object_mut() else {
+        return;
+    };
+    let total = omission
+        .get("total")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    omission.insert("emitted".into(), serde_json::json!(emitted));
+    omission.insert(
+        "omitted".into(),
+        serde_json::json!(total.saturating_sub(emitted)),
+    );
 }
 
 fn update_omission_after_trim(result: &mut serde_json::Value, key: &str) {

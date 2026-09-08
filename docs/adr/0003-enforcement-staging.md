@@ -57,3 +57,30 @@ the H7 blocking-family set is empty. Policy changes produce an enforcement
 identity delta, while analyzer changes continue to use the analyzer identity.
 The model is additive and can later be nested under `result.enforcement` in
 the existing `omasafe.report.v1` envelope.
+
+## Amendment: v0.2.5 opaque executable review
+
+Accepted for v0.2.5 · 2026-09-08
+
+An inventoried native executable, or an extensionless executable entry point,
+is an opaque code item rather than a behaviorally analyzed file. The analyzer
+records its format, bounded architecture metadata, exposure, and exact
+SHA-256 when available. It never executes, uploads, disassembles, or recursively
+extracts the item.
+
+`omasafe.executable-review.v1` records one external assessment for exactly one
+plugin path and exact digest, with optional source commit/tree/content identity,
+method, provider, bounded evidence reference, limitations, human operator
+decision, expiry, and audit event. Only an accepted `no-known-issue` record
+whose complete identity matches the current item can satisfy the opaque-code
+blocker. Revocation is append-only. An assessment is evidence, not a malware
+verdict, and cannot authorize another file or clear unrelated policy blockers.
+
+The enforcement wire schema is `omasafe.enforcement.v2`; old v1 decisions remain
+readable with absent v2 fields defaulting to the conservative compatibility
+path, but old executable approval bits never authorize a v0.2.5 opaque item.
+Advisory lifecycle operations proceed with a prominent review requirement;
+hardened enable and reviewed update operations fail closed until every required
+opaque item is current. Existing installed plugins are not automatically
+disabled, and native lifecycle calls outside OmaSafe remain outside this
+boundary.

@@ -8,7 +8,8 @@ use crate::detect::model::{
     lower_contains, occurrence, parts, strip_line_comment, unquoted_text,
 };
 use crate::detect::references::{
-    ReferenceCandidate, SinkPosition, apply_directory_import, is_path_shaped, record_sink_reference,
+    ReferenceCandidate, SinkPosition, apply_directory_import, is_path_shaped,
+    record_resolved_url_reference, record_sink_reference,
 };
 use crate::fingerprint::Confidence;
 use crate::rules::{Capability, Language};
@@ -466,14 +467,17 @@ fn join_line_literals(line: &str) -> String {
 
 /// Quoted string literals that look like paths become reference candidates.
 fn collect_quoted_references(line: &str, number: u32, references: &mut Vec<ReferenceCandidate>) {
+    let resolved_url_values = resolved_url_argument_values(line);
     for literal in line_literals(line) {
         // Decode escapes so context candidates match runtime spelling.
         let decoded = decode_js_escapes(literal);
-        if is_path_shaped(&decoded) {
+        if is_path_shaped(&decoded) && !resolved_url_values.iter().any(|value| value == &decoded) {
             references.push(ReferenceCandidate {
                 line: number,
                 value: decoded,
                 sink: None,
+                resolved_url: false,
+                confidence: Confidence::LexicalFallback,
             });
         }
     }
@@ -616,13 +620,62 @@ fn mark_binding_literals(
                 // align.
                 let property_word_end = body_start + segment_offset + inner_from;
                 if let Some((start, end)) = binding_value_span(line, property_word_end) {
-                    for literal in span_sink_literals(&line[start..end]) {
-                        record_sink_reference(&literal, sink, number, outcome);
+                    let value_span = &line[start..end];
+                    let resolved_url = is_resolved_url_expression(value_span);
+                    let resolved_literals = resolved_url_static_argument_values(value_span);
+                    if resolved_url && resolved_literals.is_empty() {
+                        outcome.result_parts.push(parts(
+                            "oma.qml.dynamic-reference",
+                            number,
+                            "dynamic-reference-sink:resolvedUrl:computed",
+                            Confidence::LexicalFallback,
+                        ));
+                    }
+                    for literal in if resolved_url {
+                        resolved_literals
+                    } else {
+                        span_sink_literals(value_span)
+                    } {
+                        if resolved_url {
+                            record_resolved_url_reference(&literal, sink, number, outcome);
+                        } else {
+                            record_sink_reference(&literal, sink, number, outcome);
+                        }
                     }
                 }
             }
         }
     }
+}
+
+fn is_resolved_url_expression(span: &str) -> bool {
+    let code = unquoted_text(span);
+    find_qt_global_calls(&code, "resolvedUrl").len() == 1 && code.trim_start().starts_with("Qt")
+}
+
+fn resolved_url_argument_values(line: &str) -> Vec<String> {
+    let code = unquoted_text(line);
+    find_qt_global_calls(&code, "resolvedUrl")
+        .into_iter()
+        .filter_map(|open| first_argument_span(line, open))
+        .flat_map(|(start, end)| span_sink_literals(&line[start..end]))
+        .collect()
+}
+
+fn resolved_url_static_argument_values(span: &str) -> Vec<String> {
+    let code = unquoted_text(span);
+    find_qt_global_calls(&code, "resolvedUrl")
+        .into_iter()
+        .filter_map(|open| first_argument_span(span, open))
+        .filter_map(|(start, end)| {
+            let argument = &span[start..end];
+            unquoted_text(argument)
+                .trim()
+                .is_empty()
+                .then(|| span_sink_literals(argument).into_iter().next())
+        })
+        .flatten()
+        .collect()
 }
 
 /// Byte index of the `{` that opens a `<object_word> {` object declaration,

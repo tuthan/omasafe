@@ -105,6 +105,8 @@ pub(in crate::detect) struct ReferenceCandidate {
     pub(in crate::detect) line: u32,
     pub(in crate::detect) value: String,
     pub(in crate::detect) sink: Option<SinkPosition>,
+    pub(in crate::detect) resolved_url: bool,
+    pub(in crate::detect) confidence: Confidence,
 }
 
 /// Centralized scheme parsing for reference classification (H2 review):
@@ -245,6 +247,32 @@ pub(in crate::detect) fn record_sink_reference(
             line,
             value: text.to_owned(),
             sink: Some(sink),
+            resolved_url: false,
+            confidence: outcome.confidence,
+        });
+    }
+}
+
+/// `Qt.resolvedUrl` is a precision-preserving base-resolution helper only for
+/// a constant first argument. The target is still resolved against the
+/// inventoried source path later; this function does not touch the filesystem.
+pub(in crate::detect) fn record_resolved_url_reference(
+    text: &str,
+    sink: SinkPosition,
+    line: u32,
+    outcome: &mut FileOutcome,
+) {
+    if let Some(finding) = load_sink_finding(text, sink, line, outcome.confidence) {
+        outcome.result_parts.push(finding);
+        return;
+    }
+    if text.len() <= 512 {
+        outcome.references.push(ReferenceCandidate {
+            line,
+            value: text.to_owned(),
+            sink: Some(sink),
+            resolved_url: true,
+            confidence: outcome.confidence,
         });
     }
 }

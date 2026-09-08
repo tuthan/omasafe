@@ -11,7 +11,8 @@ use crate::detect::qml::lexical::{
     argv_head_fetches, encoded_literal_length, find_shell_interpreter,
 };
 use crate::detect::references::{
-    ReferenceCandidate, SinkPosition, apply_directory_import, is_path_shaped, record_sink_reference,
+    ReferenceCandidate, SinkPosition, apply_directory_import, is_path_shaped,
+    record_resolved_url_reference, record_sink_reference,
 };
 use crate::fingerprint::Confidence;
 use crate::rules::{Capability, Language};
@@ -742,6 +743,14 @@ fn handle_reference_sink_value(
         }
         return;
     }
+    if matches!(
+        sink,
+        SinkPosition::LoaderSource | SinkPosition::FileViewPath
+    ) && let Some(text) = resolved_url_literal(source, inner)
+    {
+        record_resolved_url_reference(&text, sink, number_of(inner), outcome);
+        return;
+    }
     let flow = dataflow.classify(source, inner);
     match flow {
         FlowValue::Static(text) => record_sink_reference(&text, sink, number_of(inner), outcome),
@@ -779,6 +788,87 @@ fn handle_reference_sink_value(
     }
 }
 
+/// Return the first constant argument of the exact global `Qt.resolvedUrl`
+/// call. Member lookalikes and computed/template-substitution arguments are
+/// intentionally rejected so the lexical/AST paths retain their prior
+/// dynamic-reference behavior.
+fn resolved_url_literal(source: &str, node: tree_sitter::Node) -> Option<String> {
+    let call = if node.kind() == "call_expression" {
+        node
+    } else {
+        return None;
+    };
+    let callee = call.named_child(0)?;
+    if callee.kind() != "member_expression" {
+        return None;
+    }
+    let mut callee_cursor = callee.walk();
+    let mut named = callee.named_children(&mut callee_cursor);
+    let receiver = unwrap_transparent_parens(named.next()?);
+    let property = named.next()?;
+    if receiver.kind() != "identifier"
+        || node_text(source, receiver) != "Qt"
+        || node_text(source, property) != "resolvedUrl"
+    {
+        return None;
+    }
+    let arguments = call
+        .children(&mut call.walk())
+        .find(|child| child.kind() == "arguments")?;
+    let argument = arguments.named_child(0)?;
+    let text = match argument.kind() {
+        "string" => string_literal_content(source, argument),
+        "template_string"
+            if {
+                let mut argument_cursor = argument.walk();
+                argument.named_children(&mut argument_cursor).all(|child| {
+                    child.kind() != "template_substitution" && child.kind() != "substitution"
+                })
+            } =>
+        {
+            template_plain_content(source, argument)
+        }
+        _ => return None,
+    };
+    Some(text)
+}
+
+fn is_resolved_url_argument_node(source: &str, node: tree_sitter::Node) -> bool {
+    let Some(arguments) = node.parent() else {
+        return false;
+    };
+    if arguments.kind() != "arguments" || arguments.named_child(0) != Some(node) {
+        return false;
+    }
+    let Some(call) = arguments.parent() else {
+        return false;
+    };
+    is_resolved_url_call(source, call)
+}
+
+fn is_resolved_url_call(source: &str, call: tree_sitter::Node) -> bool {
+    if call.kind() != "call_expression" {
+        return false;
+    }
+    let Some(callee) = call.named_child(0) else {
+        return false;
+    };
+    if callee.kind() != "member_expression" {
+        return false;
+    }
+    let mut callee_cursor = callee.walk();
+    let mut named = callee.named_children(&mut callee_cursor);
+    let Some(receiver) = named.next().map(|node| unwrap_transparent_parens(node)) else {
+        return false;
+    };
+    let Some(property) = named.next() else {
+        return false;
+    };
+    receiver.kind() == "identifier"
+        && node_text(source, receiver) == "Qt"
+        && node_text(source, property) == "resolvedUrl"
+}
+
 fn sink_name(sink: SinkPosition) -> &'static str {
     match sink {
         SinkPosition::LoaderSource => "Loader.source",
@@ -802,11 +892,13 @@ fn collect_ast_references(
             "template_string" => template_plain_content(source, node),
             _ => String::new(),
         };
-        if is_path_shaped(&text) {
+        if is_path_shaped(&text) && !is_resolved_url_argument_node(source, node) {
             references.push(ReferenceCandidate {
                 line: number_of(node),
                 value: text,
                 sink: None,
+                resolved_url: false,
+                confidence: Confidence::AstBacked,
             });
         }
         let mut cursor = node.walk();

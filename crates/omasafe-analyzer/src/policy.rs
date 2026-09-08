@@ -613,8 +613,8 @@ mod tests {
             .find(|declaration| declaration.feature_projection == feature_projection())
             .cloned()
             .expect("current projection declaration");
-        let unaffected = "oma.qml.dynamic-reference";
-        let affected = "oma.qml.process-execution";
+        let unaffected = "oma.qml.process-execution";
+        let affected = "oma.qml.dynamic-reference";
         let unaffected_digest = rule_semantic_identity_digest(unaffected).unwrap();
         let affected_digest = rule_semantic_identity_digest(affected).unwrap();
 

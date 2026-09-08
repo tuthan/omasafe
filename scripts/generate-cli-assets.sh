@@ -121,6 +121,23 @@ Print the last persisted enforcement decision for a plugin. This is
 read-only; a missing decision is reported explicitly rather than treated as
 an allow.
 .TP
+.B plugins executable-review list PLUGIN_ID [--format text|json]
+List exact executable-review bindings for one plugin, including expiry and
+revocation status. This is read-only and never treats a listed assessment as a
+malware verdict.
+.TP
+.B plugins executable-review add PLUGIN_ID --path PATH --sha256 DIGEST
+    --method METHOD --assessment-outcome OUTCOME --decision DECISION
+    --performed-at TIME --expires TIME --provider PROVIDER --reason REASON --yes
+Record a bounded external assessment for one exact opaque executable. The
+current source identity and exact inventory digest are checked before the
+binding is committed. Mutations require an interactive terminal and --yes;
+the command never uploads bytes or runs a scanner.
+.TP
+.B plugins executable-review revoke PLUGIN_ID --path PATH --sha256 DIGEST
+    --reason REASON --yes
+Append an auditable revocation for one exact executable-review binding.
+.TP
 .B plugins override create PLUGIN_ID --rule RULE_ID [--rule RULE_ID ...]
     --commit SHA --reason TEXT --expires TIMESTAMP
 Interactively create an exact-identity, expiring hardened-policy override for
@@ -217,7 +234,7 @@ _omasafe_cli() {
     fi
     case "\${COMP_WORDS[1]}" in
         scan|provenance|plugins|marketplace|rules|scan-plugin)
-            COMPREPLY=(\$(compgen -W "--format --notify --only-new --include-analysis --refresh --cached --yes --expected-head --expected-tree --expected-digest --note --policy --action --scope --to --reason --rule --path --commit --expires --latest --git --revision --request --marketplace --plugin-id --report-profile --fail-on" -- "\${cur}"))
+            COMPREPLY=(\$(compgen -W "--format --notify --only-new --include-analysis --refresh --cached --yes --expected-head --expected-tree --expected-digest --note --policy --action --scope --to --reason --rule --path --commit --expires --latest --git --revision --request --marketplace --plugin-id --report-profile --fail-on --method --assessment-outcome --decision --performed-at --provider --provider-version --report-ref --report-digest --limitation" -- "\${cur}"))
             ;;
         paths|schedule)
             COMPREPLY=()
@@ -231,7 +248,7 @@ EOF
 write_asset docs/completions/_omasafe-cli "$(cat <<EOF
 #compdef omasafe-cli
 # zsh completion for omasafe-cli; generated from docs/cli-surface.txt
-_arguments '1:command:($top_level)' '*:option:(--format --notify --only-new --include-analysis --refresh --cached --yes --expected-head --expected-tree --expected-digest --note --policy --action --scope --to --reason --rule --path --commit --expires --latest --git --revision --request --marketplace --plugin-id --report-profile --fail-on)'
+_arguments '1:command:($top_level)' '*:option:(--format --notify --only-new --include-analysis --refresh --cached --yes --expected-head --expected-tree --expected-digest --note --policy --action --scope --to --reason --rule --path --commit --expires --latest --git --revision --request --marketplace --plugin-id --report-profile --fail-on --method --assessment-outcome --decision --performed-at --provider --provider-version --report-ref --report-digest --limitation)'
 EOF
 )"
 
@@ -265,6 +282,15 @@ complete -c omasafe-cli -l marketplace -r
 complete -c omasafe-cli -l plugin-id -r
 complete -c omasafe-cli -l report-profile -r -a "full review"
 complete -c omasafe-cli -l fail-on -r -a "info low medium high critical"
+complete -c omasafe-cli -l method -r -a "local-malware-scan remote-hash-reputation manual-binary-review reproducible-build-review signature-review"
+complete -c omasafe-cli -l assessment-outcome -r -a "no-known-issue issue-found inconclusive"
+complete -c omasafe-cli -l decision -r -a "accepted rejected"
+complete -c omasafe-cli -l performed-at -r
+complete -c omasafe-cli -l provider -r
+complete -c omasafe-cli -l provider-version -r
+complete -c omasafe-cli -l report-ref -r
+complete -c omasafe-cli -l report-digest -r
+complete -c omasafe-cli -l limitation -r
 EOF
 )"
 

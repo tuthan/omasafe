@@ -1,4 +1,4 @@
-.TH OMASAFE-CLI 1 "2026-09-07" "OmaSafe 0.2.4" "User Commands"
+.TH OMASAFE-CLI 1 "2026-09-08" "OmaSafe 0.2.5" "User Commands"
 .SH NAME
 omasafe-cli \- local trust, payload analysis, and drift review for Omarchy plugins
 .SH SYNOPSIS
@@ -74,6 +74,23 @@ before the plugin is re-enabled or trusted.
 Print the last persisted enforcement decision for a plugin. This is
 read-only; a missing decision is reported explicitly rather than treated as
 an allow.
+.TP
+.B plugins executable-review list PLUGIN_ID [--format text|json]
+List exact executable-review bindings for one plugin, including expiry and
+revocation status. This is read-only and never treats a listed assessment as a
+malware verdict.
+.TP
+.B plugins executable-review add PLUGIN_ID --path PATH --sha256 DIGEST
+    --method METHOD --assessment-outcome OUTCOME --decision DECISION
+    --performed-at TIME --expires TIME --provider PROVIDER --reason REASON --yes
+Record a bounded external assessment for one exact opaque executable. The
+current source identity and exact inventory digest are checked before the
+binding is committed. Mutations require an interactive terminal and --yes;
+the command never uploads bytes or runs a scanner.
+.TP
+.B plugins executable-review revoke PLUGIN_ID --path PATH --sha256 DIGEST
+    --reason REASON --yes
+Append an auditable revocation for one exact executable-review binding.
 .TP
 .B plugins override create PLUGIN_ID --rule RULE_ID [--rule RULE_ID ...]
     --commit SHA --reason TEXT --expires TIMESTAMP

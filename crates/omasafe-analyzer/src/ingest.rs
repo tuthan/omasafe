@@ -30,8 +30,8 @@ use omasafe_core::bounds::{
 use omasafe_core::git;
 
 use crate::payload::{
-    ContentDigester, CoverageState, PayloadEntry, PayloadInventory, PayloadKind,
-    classify_regular_file,
+    ContentDigester, CoverageState, LanguageHint, PayloadEntry, PayloadInventory, PayloadKind,
+    classify_regular_file, language_hint, native_architecture,
 };
 
 const SNIFF_WINDOW: usize = 64 * 1024;
@@ -113,6 +113,8 @@ struct Walker {
     files_seen: usize,
     total_bytes: u64,
     limitations: Vec<String>,
+    native_architectures: std::collections::BTreeMap<String, String>,
+    language_hints: std::collections::BTreeMap<String, LanguageHint>,
 }
 
 impl Walker {
@@ -124,6 +126,8 @@ impl Walker {
             files_seen: 0,
             total_bytes: 0,
             limitations: Vec::new(),
+            native_architectures: std::collections::BTreeMap::new(),
+            language_hints: std::collections::BTreeMap::new(),
         }
     }
 
@@ -151,8 +155,12 @@ impl Walker {
             total_files_seen: self.files_seen,
             total_bytes_ingested: self.total_bytes,
             limitations: self.limitations,
+            coverage: Vec::new(),
+            native_architectures: self.native_architectures,
+            language_hints: self.language_hints,
         };
         inventory.sort_entries();
+        inventory.refresh_coverage();
         inventory
     }
 
@@ -322,8 +330,11 @@ impl Walker {
             }
         }
         let (digest_hex, _) = digester.finish_hex();
+        let kind = classify_regular_file(relative, mode, &window);
+        self.remember_native_architecture(relative, &kind, &window);
+        self.remember_language_hint(relative, &window);
         PayloadEntry {
-            kind: classify_regular_file(relative, mode, &window),
+            kind,
             sha256_sampled: Some(digest_hex),
             sampled_digest: truncated,
             coverage_state: if truncated {
@@ -378,12 +389,28 @@ impl Walker {
         digester.update(&head);
         digester.update(&tail);
         let (digest_hex, _) = digester.finish_hex();
+        let kind = classify_regular_file(relative, mode, &head);
+        self.remember_native_architecture(relative, &kind, &head);
+        self.remember_language_hint(relative, &head);
         PayloadEntry {
-            kind: classify_regular_file(relative, mode, &head),
+            kind,
             sha256_sampled: Some(digest_hex),
             sampled_digest: true,
             coverage_state: CoverageState::Skipped,
             ..base_entry(relative, size, mode, executable)
+        }
+    }
+
+    fn remember_native_architecture(&mut self, relative: &str, kind: &PayloadKind, prefix: &[u8]) {
+        if let Some(architecture) = native_architecture(kind, prefix) {
+            self.native_architectures
+                .insert(relative.to_owned(), architecture);
+        }
+    }
+
+    fn remember_language_hint(&mut self, relative: &str, prefix: &[u8]) {
+        if let Some(hint) = language_hint(relative, prefix) {
+            self.language_hints.insert(relative.to_owned(), hint);
         }
     }
 }
@@ -833,8 +860,11 @@ pub fn ingest_pinned_tree_at_root(
                     digester.update(&content);
                     let (digest_hex, _) = digester.finish_hex();
                     let window_end = content.len().min(SNIFF_WINDOW);
+                    let kind = classify_regular_file(&relative, mode, &content[..window_end]);
+                    walker.remember_native_architecture(&relative, &kind, &content[..window_end]);
+                    walker.remember_language_hint(&relative, &content[..window_end]);
                     PayloadEntry {
-                        kind: classify_regular_file(&relative, mode, &content[..window_end]),
+                        kind,
                         sha256_sampled: Some(digest_hex),
                         sampled_digest: true,
                         coverage_state: CoverageState::Skipped,
@@ -866,8 +896,11 @@ pub fn ingest_pinned_tree_at_root(
                     digester.update(&content);
                     let (digest_hex, _) = digester.finish_hex();
                     let window_end = content.len().min(SNIFF_WINDOW);
+                    let kind = classify_regular_file(&relative, mode, &content[..window_end]);
+                    walker.remember_native_architecture(&relative, &kind, &content[..window_end]);
+                    walker.remember_language_hint(&relative, &content[..window_end]);
                     PayloadEntry {
-                        kind: classify_regular_file(&relative, mode, &content[..window_end]),
+                        kind,
                         sha256_sampled: Some(digest_hex),
                         sampled_digest: false,
                         coverage_state: CoverageState::Unsupported,
@@ -1192,5 +1225,56 @@ mod tests {
         assert_eq!(inventory.total_files_seen, 1);
         assert_eq!(inventory.entries.len(), 1);
         assert_eq!(inventory.entries[0].relative_path, "Main.qml");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ingestion_retains_open_shebang_hints_without_claiming_behavior_support() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let launcher = root.path().join("run");
+        fs::write(
+            &launcher,
+            "#!/usr/bin/env -S node --no-warnings\nconsole.log(1)\n",
+        )
+        .unwrap();
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(root.path().join("helper.rb"), "puts 'hello'\n").unwrap();
+
+        let inventory =
+            ingest_filesystem(root.path(), Limits::default(), TimeBudget::default()).unwrap();
+        let launcher_coverage = inventory
+            .coverage
+            .iter()
+            .find(|coverage| coverage.relative_path == "run")
+            .unwrap();
+        assert_eq!(
+            launcher_coverage.language_hint.as_ref().unwrap().language,
+            "javascript"
+        );
+        assert_eq!(
+            launcher_coverage.language_hint.as_ref().unwrap().source,
+            "shebang"
+        );
+        assert_eq!(
+            launcher_coverage.behavior_coverage,
+            crate::payload::BehaviorCoverage::Unsupported
+        );
+        assert!(launcher_coverage.opaque_review_required);
+
+        let ruby_coverage = inventory
+            .coverage
+            .iter()
+            .find(|coverage| coverage.relative_path == "helper.rb")
+            .unwrap();
+        assert_eq!(
+            ruby_coverage.language_hint.as_ref().unwrap().language,
+            "ruby"
+        );
+        assert_eq!(
+            ruby_coverage.behavior_coverage,
+            crate::payload::BehaviorCoverage::Unsupported
+        );
     }
 }

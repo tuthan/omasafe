@@ -4,7 +4,8 @@ Status: reviewed base sequence, 2026-08-20 · v0.2.1 implementation complete, 20
 v0.2.2 candidate-source scan revised draft, 2026-09-04 · v0.2.3 scan-cache implementation
 complete; clean-VM release gates pending, 2026-09-05 · v0.2.4 rule detection and
 review clarity implementation complete; release evidence and VM gates pending, 2026-09-07 ·
-v0.2.5 coverage truth and opaque executable review revised draft, 2026-09-08 ·
+v0.2.5 coverage truth and opaque executable review implementation complete; release
+evidence and environment-dependent gates pending, 2026-09-08 ·
 posture and AUR swapped to v0.3/v0.4, 2026-09-08
 
 This directory turns the product brainstorm into independently shippable releases. Each
@@ -31,7 +32,7 @@ export work directly after the v0.3 checks it consumes. The AUR scope itself is 
 | [v0.2.2](v0.2.2-candidate-source-scan.md) | Scan uninstalled GitHub and verified marketplace candidates from a pasted URL/install command without installing or executing them | v0.2.1 bounded analyzer/report/consumer contracts |
 | [v0.2.3](v0.2.3-scan-caching.md) | Persist the last successful normalized installed-scan snapshot in the CLI and hydrate it as explicitly cached/stale UI state | v0.2.2 scan/report contracts and v0.2.1 plugin/enforcement UI contracts |
 | [v0.2.4](v0.2.4-rule-detection-clarity.md) | Correct reproduced detection/labeling gaps and deliver bounded, explicit evidence and coverage reports for users and AI reviewers (implementation complete; release gates pending) | v0.2.3 analyzer/report/cache contracts |
-| [v0.2.5](v0.2.5-coverage-and-binary-review.md) | Make coverage explicit and require exact external review evidence for opaque executable code under hardened lifecycle policy | v0.2.4 analyzer/report/cache and ADR-0003 enforcement contracts |
+| [v0.2.5](v0.2.5-coverage-and-binary-review.md) | Make coverage explicit and require exact external review evidence for opaque executable code under hardened lifecycle policy (implementation complete; release evidence and environment-dependent gates pending) | v0.2.4 analyzer/report/cache and ADR-0003 enforcement contracts |
 | [v0.3](v0.3.md) | Detect machine-posture regressions and vulnerable/outdated packages, with host state visible to the user and reproducible for support | v0.1 state/notification; v0.2 report contract |
 | [v0.4](v0.4.md) | Review PKGBUILDs and AUR updates without executing build files | v0.1 identity/diff; v0.2 analyzer/report contracts |
 | [v0.5](v0.5.md) | Perform a narrow set of explicit remediations and export reports | v0.3 checks; audited polkit boundary |

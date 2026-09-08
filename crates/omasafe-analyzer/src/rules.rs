@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 
 /// Monotonic version of this catalog. Bump when rules are added, retired, or
 /// redefined; the policy identity changes with it.
-pub const RULE_CATALOG_VERSION: u32 = 8;
+pub const RULE_CATALOG_VERSION: u32 = 9;
 
 /// Monotonic version of the severity table. Severity or rule-meaning changes
 /// require a new version here.
@@ -287,6 +287,7 @@ pub fn rule_semantic_identity(id: &str) -> Option<RuleSemanticIdentity> {
             | "oma.qml.sensitive-data-egress"
             | "oma.script.sensitive-data-egress" => 2,
             "oma.python.download-execute" => 3,
+            "oma.qml.dynamic-reference" => 2,
             _ => 1,
         },
         severity: definition.default_severity,

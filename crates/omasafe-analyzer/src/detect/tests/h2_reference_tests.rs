@@ -147,6 +147,61 @@ Item {}
 }
 
 #[test]
+fn resolved_url_constant_resolves_only_to_an_inventoried_regular_file() {
+    let source = r#"Item {
+    Loader { source: Qt.resolvedUrl("./Helper.qml") }
+}
+"#;
+    let (artifacts, inventory) = run(
+        vec![
+            entry("Main.qml", PayloadKind::Qml, source.len()),
+            entry("Helper.qml", PayloadKind::Qml, 1),
+        ],
+        &[("Main.qml", source.as_bytes()), ("Helper.qml", b"\n")],
+    );
+    assert!(
+        artifacts
+            .edges
+            .iter()
+            .any(|edge| edge.from_path == "Main.qml" && edge.target_path == "Helper.qml"),
+        "{artifacts:?}"
+    );
+    assert!(
+        !artifacts
+            .rendered_findings()
+            .iter()
+            .any(|finding| finding.rule_id == DYNAMIC_REFERENCE_RULE),
+        "{artifacts:?}"
+    );
+    assert!(inventory.entries[1].invocation_target);
+}
+
+#[test]
+fn resolved_url_missing_constant_stays_a_dynamic_reference_finding() {
+    let source = r#"Item { Loader { source: Qt.resolvedUrl("./Missing.qml") } }
+"#;
+    let (artifacts, _) = one("Main.qml", PayloadKind::Qml, source);
+    let findings = artifacts.rendered_findings();
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].rule_id, DYNAMIC_REFERENCE_RULE);
+    assert!(findings[0].evidence.contains("resolved-url"));
+}
+
+#[test]
+fn resolved_url_computed_argument_retains_dynamic_reference_finding() {
+    let source = r#"Item { Loader { source: Qt.resolvedUrl(root.path + "/Helper.qml") } }
+"#;
+    let (artifacts, _) = one("Main.qml", PayloadKind::Qml, source);
+    assert!(
+        artifacts
+            .rendered_findings()
+            .iter()
+            .any(|finding| finding.rule_id == DYNAMIC_REFERENCE_RULE),
+        "{artifacts:?}"
+    );
+}
+
+#[test]
 fn out_of_tree_absolute_and_traversal_loads_are_medium_findings() {
     let source = r#"Item {
     Loader { source: "/tmp/staged.qml" }

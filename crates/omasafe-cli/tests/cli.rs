@@ -827,7 +827,7 @@ fn override_creation_requires_interactive_terminal_and_list_is_read_only() {
 
 #[test]
 #[cfg(unix)]
-fn exact_override_authorizes_hardened_enable_and_emits_audit_event() {
+fn legacy_override_does_not_authorize_opaque_executable() {
     use std::os::unix::fs::PermissionsExt;
 
     let update = UpdateFixture::new();
@@ -890,9 +890,9 @@ fn exact_override_authorizes_hardened_enable_and_emits_audit_event() {
         String::from_utf8_lossy(&stdout),
         String::from_utf8_lossy(&stderr)
     );
-    assert_eq!(code, Some(0), "{text}");
-    assert!(text.contains("io.example.cli: enabled"), "{text}");
-    assert!(update.fake.enabled());
+    assert_eq!(code, Some(1), "{text}");
+    assert!(text.contains("opaque-code-review-required"), "{text}");
+    assert!(!update.fake.enabled());
 
     let history: Value = serde_json::from_slice(
         &fs::read(
@@ -905,25 +905,17 @@ fn exact_override_authorizes_hardened_enable_and_emits_audit_event() {
         .unwrap(),
     )
     .unwrap();
+    let decision = history["decisions"].as_array().unwrap().last().unwrap();
+    assert_eq!(decision["outcome"], "block");
+    assert_eq!(decision["authorization_basis"], "policy");
     assert!(
-        history["audit_events"]
+        decision["reason_codes"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|event| {
-                event["operation"] == "enable"
-                    && event["completed"] == true
-                    && event["authorization_basis"] == "override"
-            })
+            .any(|reason| reason == "opaque-code-review-required")
     );
-    assert_eq!(
-        history["decisions"].as_array().unwrap().last().unwrap()["authorization_basis"],
-        "override"
-    );
-    let notification = fs::read_to_string(notification_log).unwrap();
-    assert!(notification.contains("--urgency=normal"), "{notification}");
-    assert!(notification.contains("io.example.cli"), "{notification}");
-    assert!(!notification.contains("manually reviewed opaque executable"));
+    assert!(!notification_log.exists());
 }
 
 #[test]
@@ -1076,7 +1068,7 @@ fn rules_list_text_is_deterministic() {
         .clone();
     assert_eq!(first, second);
     let rendered = String::from_utf8(first).unwrap();
-    assert!(rendered.contains("rule catalog v8"));
+    assert!(rendered.contains("rule catalog v9"));
     assert!(rendered.contains("oma.qml.session-lock"));
 }
 
@@ -1172,7 +1164,7 @@ fn analyze_reports_full_payload_inventory_end_to_end() {
     assert_eq!(report["result"]["target"]["source"], "installed-plugin");
     let analysis = &report["result"]["analysis"];
     assert_eq!(analysis["schema"], "omasafe.analysis.v1");
-    assert_eq!(analysis["policy_identity"]["rule_catalog_version"], 8);
+    assert_eq!(analysis["policy_identity"]["rule_catalog_version"], 9);
     let inventory = &report["result"]["payload_inventory"];
     let states = &inventory["coverage_states"];
     // S3+S4: analyzable files land in analyzed/unreferenced/partial; only
@@ -1181,7 +1173,8 @@ fn analyze_reports_full_payload_inventory_end_to_end() {
     let partial = states["partial"].as_u64().unwrap();
     assert!(unsupported + partial >= 3, "states: {states}");
     assert!(
-        states["analyzed"].as_u64().unwrap() >= 1,
+        states["analyzed"].as_u64().unwrap() + states["unreferenced"].as_u64().unwrap() + partial
+            >= 4,
         "states: {states}"
     );
     let entries = inventory["entries"].as_array().unwrap();
@@ -1195,7 +1188,7 @@ fn analyze_reports_full_payload_inventory_end_to_end() {
         .iter()
         .find(|entry| entry["relative_path"] == "payload")
         .expect("ELF payload inventoried");
-    assert_eq!(payload_entry["coverage_state"], "analyzed");
+    assert_eq!(payload_entry["coverage_state"], "unsupported");
 }
 
 #[test]
@@ -3791,7 +3784,7 @@ fn hardened_review_update_blocks_unanalyzable_executable_before_mutation() {
     );
     assert_eq!(code, Some(1), "{text}");
     assert!(text.contains("hardened policy blocked"), "{text}");
-    assert!(text.contains("unsupported-executable"), "{text}");
+    assert!(text.contains("opaque-code-review-required"), "{text}");
     assert!(!update.fake.log_contains("plugin update"));
     assert!(!update.fake.log_contains("plugin disable"));
     assert_eq!(
@@ -3821,7 +3814,7 @@ fn hardened_review_update_blocks_unanalyzable_executable_before_mutation() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|reason| reason == "unsupported-executable")
+            .any(|reason| reason == "opaque-code-review-required")
     );
 }
 
@@ -3890,7 +3883,7 @@ fn hardened_enable_blocks_unsupported_executable_before_native_enable() {
         text.contains("hardened policy blocked enable before mutation"),
         "{text}"
     );
-    assert!(text.contains("unsupported-executable"), "{text}");
+    assert!(text.contains("opaque-code-review-required"), "{text}");
     assert!(!update.fake.enabled());
     assert!(!update.fake.log_contains("plugin enable"));
 
@@ -3912,7 +3905,7 @@ fn hardened_enable_blocks_unsupported_executable_before_native_enable() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|reason| reason == "unsupported-executable")
+            .any(|reason| reason == "opaque-code-review-required")
     );
 }
 
@@ -5533,6 +5526,9 @@ fn live_scan_reports_enforcement_blocks_as_non_quiet() {
         audit_event_id: "test-audit".into(),
         evaluated_at: "2026-09-04T00:00:00Z".into(),
         native_install_not_interposed: true,
+        executable_review_policy_version: String::new(),
+        opaque_code_items: Vec::new(),
+        blockers: Vec::new(),
     };
     let mut history = omasafe_plugin_trust::baseline::EnforcementHistory::default();
     history.record_decision(decision);

@@ -12,6 +12,9 @@ plugins review PLUGIN_ID	--action acknowledge|exclude|rebaseline|restore|untrust
 plugins enable PLUGIN_ID	[--policy advisory|hardened] [--format text|json]
 plugins review-update PLUGIN_ID	[--expected-commit SHA] [--yes] [--policy advisory|hardened]
 plugins enforcement-status PLUGIN_ID	[--format text|json]
+plugins executable-review list PLUGIN_ID	[--format text|json]
+plugins executable-review add PLUGIN_ID	--path PATH --sha256 DIGEST --method METHOD --assessment-outcome OUTCOME --decision DECISION --performed-at TIME --expires TIME --provider PROVIDER --reason REASON [--provider-version VERSION] [--report-ref REF|--report-digest DIGEST] [--limitation TEXT] [--expected-head COMMIT] [--expected-tree TREE] [--expected-digest DIGEST] --yes
+plugins executable-review revoke PLUGIN_ID	--path PATH --sha256 DIGEST --reason REASON --yes
 plugins override create PLUGIN_ID	--rule RULE_ID [--rule RULE_ID ...] --commit SHA --reason TEXT --expires TIMESTAMP
 plugins override list	[--format text|json]
 plugins analyze PLUGIN_ID	[--format text|json] [--refresh|--cached] [--fail-on info|low|medium|high|critical]

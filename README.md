@@ -49,19 +49,19 @@ CLI commands.
 
 ## Status
 
-**v0.2.4 is the current development release** — the signed CLI now combines the v0.1 local
-trust layer with bounded payload analysis, capability and finding reports,
-reviewed updates, opt-in enforcement controls, scan-only review of exact
-GitHub/marketplace candidates, and CLI-owned cached installed-scan hydration.
+**v0.2.5 is the current development release** — the CLI now combines the v0.1 local
+trust layer with explicit payload coverage, opaque executable review bindings,
+bounded capability and finding reports, reviewed updates, opt-in enforcement
+controls, scan-only review of exact GitHub/marketplace candidates, and CLI-owned
+cached installed-scan hydration.
 v0.3 and later work remain on the
 [roadmap](docs/plans/README.md).
 
-The [v0.2.4 implementation plan](docs/plans/v0.2.4-rule-detection-clarity.md) and
-[report contract](docs/reference/v0.2.4-review-report-contract.md) define the
-implemented evidence, coverage, identity, and risk-reporting updates. The shipped
-CLI enables bounded Python syntax-flow analysis by default; constrained fallback
-builds explicitly report `python-parser-disabled` coverage and no longer emit the
-unsound same-line Python download-to-execution heuristic. See the
+The [v0.2.5 implementation plan](docs/plans/v0.2.5-coverage-and-binary-review.md)
+defines the coverage, identity, opaque-code review, and hardened-policy updates.
+The shipped CLI enables bounded Python syntax-flow analysis by default; constrained
+fallback builds explicitly report `python-parser-disabled` coverage and no longer
+emit the unsound same-line Python download-to-execution heuristic. See the
 [rule architecture review](docs/reviews/2026-09-06-rule-detection-clarity-review.md)
 for verified examples and residual limitations.
 
@@ -211,26 +211,26 @@ and removal lifecycles.
   ```sh
   # Download the pinned installer, review it, then run it locally
   curl --fail --proto '=https' --tlsv1.2 --location \
-    https://raw.githubusercontent.com/tuthan/omasafe/v0.2.1/scripts/install-cli.sh \
+    https://raw.githubusercontent.com/tuthan/omasafe/v0.2.5/scripts/install-cli.sh \
     --output install-cli.sh
   less install-cli.sh
   bash install-cli.sh --version latest
 
   # Or review and run it for an exact release
   curl --fail --proto '=https' --tlsv1.2 --location \
-    https://raw.githubusercontent.com/tuthan/omasafe/v0.2.1/scripts/install-cli.sh \
+    https://raw.githubusercontent.com/tuthan/omasafe/v0.2.5/scripts/install-cli.sh \
     --output install-cli.sh
   less install-cli.sh
-  bash install-cli.sh --version v0.2.1
+  bash install-cli.sh --version v0.2.5
   ```
 
   The URL is pinned to the release tag, so the installer you review is the exact
   one that produced that release's signed assets; reviewing it locally avoids
   piping a network response directly to the shell. `latest` selects the current
-  signed release, while `v0.2.1` selects an exact signed archive. When installing
+  signed release, while `v0.2.5` selects an exact signed archive. When installing
   an exact release, pin the URL to the same tag you pass to `--version`. From a
   repository checkout, run `./scripts/install-cli.sh --version latest` or
-  `./scripts/install-cli.sh --version v0.2.1`.
+  `./scripts/install-cli.sh --version v0.2.5`.
 
   Release signatures and detached verification instructions are in
   [`docs/release-signing.md`](docs/release-signing.md).
@@ -302,10 +302,11 @@ against a fresh VM snapshot per release.
 
 ## Scope
 
-v0.2.1 delivers installed inventory, marketplace correlation, source identity,
-trust baselines, diffs, bounded payload analysis, capability/findings reports,
-scoped suppressions, reviewed candidate updates, advisory/hardened lifecycle
-gates, exact expiring overrides, and report-only scheduled scans.
+v0.2.5 delivers installed inventory, marketplace correlation, source identity,
+trust baselines, diffs, explicit payload coverage, exact opaque executable review
+bindings, bounded capability/findings reports, scoped suppressions, reviewed
+candidate updates, advisory/hardened lifecycle gates, exact expiring overrides,
+and report-only scheduled scans.
 
 Analysis is deliberately conservative: QML/JavaScript uses bounded
 intra-file dataflow when the parser feature is enabled; shell and Python use

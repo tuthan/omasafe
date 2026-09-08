@@ -32,7 +32,9 @@ mkdir -p release-reports
 step "format"
 cargo fmt --all -- --check
 
-for features in "" "--no-default-features"; do
+# Keep all four existing parser projections release-tested: the shipped
+# qml-python build, each single-parser fallback, and lexical-only fallback.
+for features in "" "--no-default-features" "--no-default-features --features qml-parser" "--no-default-features --features python-parser"; do
   step "clippy ${features:-[default]}"
   # shellcheck disable=SC2086
   cargo clippy --workspace --all-targets $features -- -D warnings

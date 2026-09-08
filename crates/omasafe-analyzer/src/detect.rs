@@ -376,6 +376,8 @@ pub fn analyze_inventory(
         line: u32,
         value: String,
         sink: Option<SinkPosition>,
+        resolved_url: bool,
+        confidence: Confidence,
     }
     let mut pending_edges: Vec<PendingEdge> = Vec::new();
 
@@ -423,7 +425,7 @@ pub fn analyze_inventory(
                 }
                 .to_owned(),
                 language: payload_language(&entry.kind).to_owned(),
-                rule_ids: python_rule_ids(&entry.kind),
+                rule_ids: coverage_rule_ids(&entry.kind),
                 relative_path: Some(entry.relative_path.clone()),
                 line: None,
                 impact: if matches!(entry.kind, PayloadKind::Python) {
@@ -443,7 +445,7 @@ pub fn analyze_inventory(
             artifacts.coverage_gaps.push(CoverageGap {
                 reason: "content-unavailable".to_owned(),
                 language: payload_language(&entry.kind).to_owned(),
-                rule_ids: python_rule_ids(&entry.kind),
+                rule_ids: coverage_rule_ids(&entry.kind),
                 relative_path: Some(entry.relative_path.clone()),
                 line: None,
                 impact: "executable-or-load".to_owned(),
@@ -496,7 +498,7 @@ pub fn analyze_inventory(
             artifacts.coverage_gaps.push(CoverageGap {
                 reason: limitation.clone(),
                 language: payload_language(&entry_kind).to_owned(),
-                rule_ids: python_rule_ids(&entry_kind),
+                rule_ids: coverage_rule_ids(&entry_kind),
                 relative_path: Some(entry.relative_path.clone()),
                 line: None,
                 impact: if limitation.contains("parser") || limitation.contains("flow") {
@@ -527,6 +529,8 @@ pub fn analyze_inventory(
                 line: candidate.line,
                 value: candidate.value,
                 sink: candidate.sink,
+                resolved_url: candidate.resolved_url,
+                confidence: candidate.confidence,
             });
         }
 
@@ -575,6 +579,22 @@ pub fn analyze_inventory(
         let Some(target_index) =
             resolve_reference(inventory, &by_path, &edge.from_path, &edge.value)
         else {
+            if edge.resolved_url
+                && let Ok(result) = NormalizedResult::new(
+                    crate::detect::model::DYNAMIC_REFERENCE_RULE,
+                    &edge.from_path,
+                    Some(edge.line),
+                    None,
+                    format!(
+                        "dynamic-reference-sink:{}:resolved-url:{}",
+                        edge.sink.map(SinkPosition::label).unwrap_or("unknown"),
+                        edge.value.chars().take(120).collect::<String>()
+                    ),
+                    Some(edge.confidence),
+                )
+            {
+                artifacts.results.push(result);
+            }
             // Rejected references are disclosed only for verified sink
             // positions, with a typed reason (R-2). Non-sink path-shaped
             // strings stay inventory context, exactly as before.
@@ -654,9 +674,10 @@ pub fn analyze_inventory(
             capability.confidence = Some("inventory".to_owned());
             artifacts.capabilities.push(capability);
         }
-        // The native-format inventory detector has now processed this entry;
-        // Unsupported is reserved for payload kinds with no analyzer at all.
-        inventory.entries[index].coverage_state = CoverageState::Analyzed;
+        // Native bytes are inventoried and reachability is modeled, but no
+        // native-code analyzer ran. Keep the entry unsupported so hardened
+        // review cannot mistake a capability observation for code analysis.
+        inventory.entries[index].coverage_state = CoverageState::Unsupported;
     }
 
     artifacts.capabilities.sort_by(|a, b| {
@@ -682,6 +703,7 @@ pub fn analyze_inventory(
         ))
     });
     artifacts.coverage_gaps.dedup();
+    inventory.refresh_coverage();
 
     artifacts
 }
@@ -696,11 +718,17 @@ fn payload_language(kind: &PayloadKind) -> &'static str {
     }
 }
 
-fn python_rule_ids(kind: &PayloadKind) -> Vec<String> {
-    if matches!(kind, PayloadKind::Python) {
-        vec!["oma.python.download-execute".to_owned()]
-    } else {
-        Vec::new()
+fn coverage_rule_ids(kind: &PayloadKind) -> Vec<String> {
+    match kind {
+        // A Python coverage gap applies to every Python behavior family in
+        // the current catalog; assigning it only to download-execute would
+        // falsely suggest that the other families were fully covered.
+        PayloadKind::Python => vec![
+            "oma.python.download-execute".to_owned(),
+            "oma.python.privilege-escalation".to_owned(),
+            "oma.python.reverse-shell".to_owned(),
+        ],
+        _ => Vec::new(),
     }
 }
 

@@ -2919,6 +2919,55 @@ scripts/determinism-canary.sh                            # exit 0
 git diff --check                                         # clean
 ```
 
+## v0.2.5 — Coverage Truth and Opaque Executable Review (2026-09-08)
+
+Status: **implementation complete; release evidence and environment-dependent gates pending**
+
+Implemented:
+
+- Versioned payload coverage rows distinguish analyzed, partial, unsupported,
+  unreferenced, skipped, truncated, and digest-unavailable states. Classification
+  evidence, native format/architecture, open language hints, and language-gap
+  attribution are retained without adding closed enum variants.
+- Opaque executable payloads are inventoried as review-risk items even when they
+  are not referenced by analyzed script code. Exact SHA-256 availability is kept
+  separate from coverage completeness, and native `resolvedUrl`/literal reference
+  handling now preserves the static-versus-dynamic distinction.
+- Added append-only executable-review history with exact plugin/path/format/digest
+  matching, source identity binding, bounded external report metadata, expiry,
+  operator decision, and revocation audit events. Hardened enable and review-update
+  paths block every missing, stale, rejected, inconclusive, or mismatched opaque
+  item; legacy plugin-wide overrides cannot authorize opaque executable code.
+- Added `plugins executable-review list|add|revoke`, bounded full/review/summary
+  report projections, report arithmetic/omission disclosure, cache invalidation
+  for review-history changes, and regenerated man/completion assets.
+- Rolled the workspace and CLI version to 0.2.5, amended ADR-0003, updated the
+  release plan/site/signing instructions, and reconfirmed the four parser-projection
+  compatibility identities.
+
+Verification completed in this environment:
+
+```text
+cargo fmt --all -- --check
+cargo test --workspace
+cargo test --workspace --no-default-features
+cargo test --workspace --no-default-features --features qml-parser
+cargo test --workspace --no-default-features --features python-parser
+cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+cargo clippy --workspace --all-targets --no-default-features --features qml-parser -- -D warnings
+cargo clippy --workspace --all-targets --no-default-features --features python-parser -- -D warnings
+./scripts/generate-cli-assets.sh --check
+python3 scripts/check-analysis-semantics.py
+git diff --check
+```
+
+Release disposition: v0.2.4 was rolled forward into this 0.2.5 implementation;
+it was not released as a separate tag. Clean-VM lifecycle, package-manager,
+network-pinned corpus, native-validator parity, external scanner execution or
+upload, and GitHub/Sigstore signing gates remain environment-dependent and are
+not claimed by this local implementation record.
+
 ## v0.2.3 — CLI-owned installed-scan caching
 
 Status: **implementation complete; release gates pending clean-VM access**

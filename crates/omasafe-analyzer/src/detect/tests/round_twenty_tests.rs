@@ -74,7 +74,10 @@ fn unreferenced_elf_is_inventory_capability_context() {
             && capability.relative_path == "helper"
             && capability.line.is_none()
     }));
-    assert_eq!(inventory.entries[1].coverage_state, CoverageState::Analyzed);
+    assert_eq!(
+        inventory.entries[1].coverage_state,
+        CoverageState::Unsupported
+    );
 }
 
 #[test]

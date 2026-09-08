@@ -620,6 +620,8 @@ fn analyze_script_unit(
                     line: number,
                     value: path,
                     sink: Some(SinkPosition::ProcessCommand),
+                    resolved_url: false,
+                    confidence: outcome.confidence,
                 });
             }
         }

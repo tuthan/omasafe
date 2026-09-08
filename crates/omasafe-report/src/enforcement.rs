@@ -14,10 +14,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::analysis::PolicyIdentity;
+use crate::executable_review::{EXECUTABLE_REVIEW_POLICY_VERSION, ExecutableReviewBinding};
 
-pub const ENFORCEMENT_SCHEMA_VERSION: &str = "omasafe.enforcement.v1";
-pub const ENFORCEMENT_POLICY_SCHEMA_VERSION: &str = "omasafe.enforcement-policy.v1";
-pub const ENFORCEMENT_POLICY_VERSION: u32 = 1;
+pub const ENFORCEMENT_SCHEMA_VERSION: &str = "omasafe.enforcement.v2";
+pub const ENFORCEMENT_POLICY_SCHEMA_VERSION: &str = "omasafe.enforcement-policy.v2";
+pub const ENFORCEMENT_POLICY_VERSION: u32 = 2;
 pub const OVERRIDE_SCHEMA_VERSION: &str = "omasafe.override.v1";
 pub const ENFORCEMENT_AUDIT_SCHEMA_VERSION: &str = "omasafe.enforcement-audit.v1";
 pub const ENFORCEMENT_SUMMARY_SCHEMA_VERSION: &str = "omasafe.enforcement-summary.v1";
@@ -157,6 +158,38 @@ pub struct CoverageRequirements {
     pub require_installed_tree_postconditions: bool,
 }
 
+/// One opaque executable payload that is in scope for hardened review. The
+/// digest is optional because bounded or truncated ingestion must remain a
+/// visible blocker rather than being treated as an unknown clean file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpaqueCodeItem {
+    pub plugin_id: String,
+    pub relative_path: String,
+    pub native_format: String,
+    pub exact_sha256: Option<String>,
+    pub digest_state: String,
+    pub exposure: String,
+    pub content_class: String,
+    pub review_required: bool,
+    #[serde(default)]
+    pub source_commit: Option<String>,
+    #[serde(default)]
+    pub source_tree: Option<String>,
+    #[serde(default)]
+    pub source_content_digest: Option<String>,
+}
+
+/// Typed blocker detail for operator-facing reports. `code` is stable policy
+/// vocabulary; path and digest state identify the concrete reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnforcementBlocker {
+    pub code: String,
+    pub relative_path: Option<String>,
+    pub native_format: Option<String>,
+    pub digest_state: Option<String>,
+    pub exact_sha256: Option<String>,
+}
+
 impl Default for CoverageRequirements {
     fn default() -> Self {
         Self {
@@ -180,6 +213,7 @@ pub struct EnforcementPolicy {
     pub coverage_requirements: CoverageRequirements,
     pub installed_tree_postconditions: Vec<String>,
     pub override_schema: String,
+    pub executable_review_policy_version: String,
 }
 
 impl EnforcementPolicy {
@@ -200,6 +234,7 @@ impl EnforcementPolicy {
                 "installed-tree-coverage-matches-reviewed-candidate".to_owned(),
             ],
             override_schema: OVERRIDE_SCHEMA_VERSION.to_owned(),
+            executable_review_policy_version: EXECUTABLE_REVIEW_POLICY_VERSION.to_owned(),
         }
     }
 
@@ -243,6 +278,7 @@ impl EnforcementPolicy {
     /// authorize an allow while retaining all blocker codes and rule IDs.
     pub fn evaluate(&self, input: EnforcementEvaluation) -> EnforcementDecision {
         let mut reason_codes = Vec::new();
+        let mut blockers = Vec::new();
         let blocking_rule_ids = self.blocking_rule_ids(&input.observed_rule_ids);
 
         if self.mode == EnforcementMode::Hardened {
@@ -270,7 +306,48 @@ impl EnforcementPolicy {
             {
                 reason_codes.push("installed-tree-postcondition-failed".to_owned());
             }
-            if !input.unsupported_executable_paths.is_empty() && !input.executable_digest_approved {
+            if !input.opaque_code_items.is_empty() {
+                for item in input
+                    .opaque_code_items
+                    .iter()
+                    .filter(|item| item.review_required)
+                {
+                    let authorized = item.exact_sha256.as_deref().is_some_and(|digest| {
+                        input.executable_reviews.iter().any(|review| {
+                            review.authorizes_with_identity(
+                                &item.plugin_id,
+                                &item.relative_path,
+                                digest,
+                                &item.native_format,
+                                item.source_commit.as_deref(),
+                                item.source_tree.as_deref(),
+                                item.source_content_digest.as_deref(),
+                                &input.evaluated_at,
+                            )
+                        })
+                    });
+                    if !authorized {
+                        blockers.push(EnforcementBlocker {
+                            code: if item.exact_sha256.is_some() {
+                                "opaque-code-unreviewed".to_owned()
+                            } else {
+                                "opaque-code-digest-unavailable".to_owned()
+                            },
+                            relative_path: Some(item.relative_path.clone()),
+                            native_format: Some(item.native_format.clone()),
+                            digest_state: Some(item.digest_state.clone()),
+                            exact_sha256: item.exact_sha256.clone(),
+                        });
+                    }
+                }
+                if !blockers.is_empty() {
+                    reason_codes.push("opaque-code-review-required".to_owned());
+                }
+            } else if !input.unsupported_executable_paths.is_empty()
+                && !input.executable_digest_approved
+            {
+                // Compatibility path for v0.2 callers that have not yet
+                // materialized typed coverage rows.
                 reason_codes.push("unsupported-executable".to_owned());
             }
             if !blocking_rule_ids.is_empty() {
@@ -281,7 +358,12 @@ impl EnforcementPolicy {
         reason_codes.sort();
         reason_codes.dedup();
         let has_blockers = !reason_codes.is_empty();
-        let override_usable = input.override_present && input.override_valid && has_blockers;
+        // Plugin-wide overrides remain a separate legacy authority. They may
+        // not turn an opaque executable review requirement into a blanket
+        // approval; only the exact per-file binding above can clear it.
+        let opaque_code_blocked = !blockers.is_empty();
+        let override_usable =
+            input.override_present && input.override_valid && has_blockers && !opaque_code_blocked;
         if input.override_present && !input.override_valid {
             reason_codes.push("override-expired-or-mismatched".to_owned());
             reason_codes.sort();
@@ -320,6 +402,9 @@ impl EnforcementPolicy {
             audit_event_id: input.audit_event_id,
             evaluated_at: input.evaluated_at,
             native_install_not_interposed: input.native_install_not_interposed,
+            executable_review_policy_version: self.executable_review_policy_version.clone(),
+            opaque_code_items: input.opaque_code_items,
+            blockers,
         }
     }
 }
@@ -356,6 +441,11 @@ pub struct EnforcementEvaluation {
     pub audit_event_id: String,
     pub evaluated_at: String,
     pub native_install_not_interposed: bool,
+    /// Additive v0.2.5 replacement for the global executable approval bit.
+    #[serde(default)]
+    pub opaque_code_items: Vec<OpaqueCodeItem>,
+    #[serde(default)]
+    pub executable_reviews: Vec<ExecutableReviewBinding>,
 }
 
 /// Exact-identity, expiring authorization. This is auditable state, not a
@@ -403,6 +493,12 @@ pub struct EnforcementDecision {
     pub audit_event_id: String,
     pub evaluated_at: String,
     pub native_install_not_interposed: bool,
+    #[serde(default)]
+    pub executable_review_policy_version: String,
+    #[serde(default)]
+    pub opaque_code_items: Vec<OpaqueCodeItem>,
+    #[serde(default)]
+    pub blockers: Vec<EnforcementBlocker>,
 }
 
 /// Compact typed summary shared by installed scans and inventory. It carries
@@ -446,6 +542,10 @@ pub struct EnforcementAuditEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::executable_review::{
+        AssessmentMethod, AssessmentOutcome, EXECUTABLE_REVIEW_POLICY_VERSION,
+        EXECUTABLE_REVIEW_SCHEMA_VERSION, ExecutableReviewBinding, OperatorDecision,
+    };
 
     fn evaluation() -> EnforcementEvaluation {
         EnforcementEvaluation {
@@ -469,6 +569,8 @@ mod tests {
             audit_event_id: "audit-1".into(),
             evaluated_at: "2026-09-01T00:00:00Z".into(),
             native_install_not_interposed: true,
+            opaque_code_items: Vec::new(),
+            executable_reviews: Vec::new(),
         }
     }
 
@@ -647,6 +749,92 @@ mod tests {
                 .reason_codes
                 .contains(&"unsupported-executable".into())
         );
+    }
+
+    #[test]
+    fn opaque_review_is_exact_and_does_not_clear_unrelated_policy_blockers() {
+        let mut input = evaluation();
+        input.opaque_code_items = vec![OpaqueCodeItem {
+            plugin_id: input.plugin_id.clone(),
+            relative_path: "bin/helper".into(),
+            native_format: "elf".into(),
+            exact_sha256: Some("a".repeat(64)),
+            digest_state: "exact".into(),
+            exposure: "entry-point".into(),
+            content_class: "native-code".into(),
+            review_required: true,
+            source_commit: None,
+            source_tree: None,
+            source_content_digest: None,
+        }];
+        input.executable_reviews = vec![ExecutableReviewBinding {
+            schema: EXECUTABLE_REVIEW_SCHEMA_VERSION.into(),
+            plugin_id: input.plugin_id.clone(),
+            relative_path: "bin/helper".into(),
+            native_format: "elf".into(),
+            exact_sha256: "a".repeat(64),
+            source_commit: None,
+            source_tree: None,
+            source_content_digest: None,
+            review_policy_version: EXECUTABLE_REVIEW_POLICY_VERSION.into(),
+            assessment_method: AssessmentMethod::ManualBinaryReview,
+            provider: "maintainer".into(),
+            provider_version: None,
+            assessment_outcome: AssessmentOutcome::NoKnownIssue,
+            performed_at: "2026-09-01T00:00:00Z".into(),
+            report_ref: Some("ticket-1".into()),
+            report_digest: None,
+            limitations: Vec::new(),
+            operator_decision: OperatorDecision::Accepted,
+            reason: "reviewed exact bytes".into(),
+            decision_at: "2026-09-01T00:00:00Z".into(),
+            expires_at: "2099-01-01T00:00:00Z".into(),
+            audit_event_id: "review-1".into(),
+        }];
+        let policy = EnforcementPolicy::new(EnforcementMode::Hardened);
+        let allowed = policy.evaluate(input.clone());
+        assert_eq!(allowed.outcome, EnforcementOutcome::Allow);
+        assert!(allowed.blockers.is_empty());
+
+        input.opaque_code_items[0].exact_sha256 = Some("b".repeat(64));
+        let blocked = policy.evaluate(input);
+        assert_eq!(blocked.outcome, EnforcementOutcome::Block);
+        assert_eq!(
+            blocked.blockers[0].relative_path.as_deref(),
+            Some("bin/helper")
+        );
+        assert!(
+            blocked
+                .reason_codes
+                .contains(&"opaque-code-review-required".to_owned())
+        );
+    }
+
+    #[test]
+    fn legacy_override_cannot_clear_opaque_code_review_blocker() {
+        let mut input = evaluation();
+        input.opaque_code_items = vec![OpaqueCodeItem {
+            plugin_id: input.plugin_id.clone(),
+            relative_path: "bin/helper".into(),
+            native_format: "elf".into(),
+            exact_sha256: Some("a".repeat(64)),
+            digest_state: "exact".into(),
+            exposure: "entry-point".into(),
+            content_class: "native-code".into(),
+            review_required: true,
+            source_commit: None,
+            source_tree: None,
+            source_content_digest: None,
+        }];
+        input.override_present = true;
+        input.override_valid = true;
+        let decision = EnforcementPolicy::new(EnforcementMode::Hardened).evaluate(input);
+        assert_eq!(decision.outcome, EnforcementOutcome::Block);
+        assert_eq!(
+            decision.authorization_basis,
+            Some(AuthorizationBasis::Policy)
+        );
+        assert_eq!(decision.blockers[0].code, "opaque-code-unreviewed");
     }
 
     #[test]

@@ -326,7 +326,7 @@ pub(in crate::detect) const PROCESS_RULE: &str = "oma.qml.process-execution";
 pub(in crate::detect) const DETACHED_RULE: &str = "oma.qml.detached-execution";
 #[cfg_attr(not(test), allow(dead_code))]
 pub(in crate::detect) const NETWORK_RULE: &str = "oma.qml.network-access";
-#[cfg(feature = "qml-parser")]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(in crate::detect) const DYNAMIC_REFERENCE_RULE: &str = "oma.qml.dynamic-reference";
 #[cfg_attr(not(test), allow(dead_code))]
 pub(in crate::detect) const DYNAMIC_CODE_RULE: &str = "oma.qml.dynamic-code";

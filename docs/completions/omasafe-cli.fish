@@ -27,3 +27,12 @@ complete -c omasafe-cli -l marketplace -r
 complete -c omasafe-cli -l plugin-id -r
 complete -c omasafe-cli -l report-profile -r -a "full review"
 complete -c omasafe-cli -l fail-on -r -a "info low medium high critical"
+complete -c omasafe-cli -l method -r -a "local-malware-scan remote-hash-reputation manual-binary-review reproducible-build-review signature-review"
+complete -c omasafe-cli -l assessment-outcome -r -a "no-known-issue issue-found inconclusive"
+complete -c omasafe-cli -l decision -r -a "accepted rejected"
+complete -c omasafe-cli -l performed-at -r
+complete -c omasafe-cli -l provider -r
+complete -c omasafe-cli -l provider-version -r
+complete -c omasafe-cli -l report-ref -r
+complete -c omasafe-cli -l report-digest -r
+complete -c omasafe-cli -l limitation -r

@@ -7,7 +7,9 @@
 //! `Unsupported`; later slices move files to `Analyzed`/`Partial` as policy
 //! identity changes, never as plugin drift.
 
-use serde::Serialize;
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// What a file is, decided from its path, mode, and content prefix.
@@ -74,6 +76,88 @@ pub enum CoverageState {
     Unreferenced,
 }
 
+/// Whether the bytes and metadata needed for classification were collected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InventoryState {
+    Complete,
+    Incomplete,
+}
+
+/// Confidence and source for an open language hint. The language string is
+/// intentionally open: recognizing a language does not add an analyzer or a
+/// serialized enum variant that strict consumers must understand.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LanguageHint {
+    pub language: String,
+    pub confidence: String,
+    pub source: String,
+}
+
+/// Syntax coverage is separate from language recognition and behavior
+/// coverage. In particular, a recognized Node or Ruby script remains
+/// unsupported behavior in this release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SyntaxCoverage {
+    Parser,
+    LexicalFallback,
+    Unsupported,
+    Unavailable,
+    Bounded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BehaviorCoverage {
+    Modeled,
+    Partial,
+    Unsupported,
+    Unavailable,
+    Bounded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodeExposure {
+    EntryPoint,
+    KnownExecuteOrLoad,
+    PossibleOrDynamic,
+    ExplicitlyUnreferenced,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContentClass {
+    NativeCode,
+    InterpretedCode,
+    ArchiveOrContainer,
+    BytecodeOrWasm,
+    OrdinaryData,
+    Unknown,
+}
+
+/// Additive per-entry v0.2.5 coverage model. It lives beside the legacy
+/// `PayloadEntry` so Rust callers that construct the v0.2 inventory remain
+/// source-compatible while report consumers gain orthogonal state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PayloadCoverage {
+    pub relative_path: String,
+    pub inventory_state: InventoryState,
+    pub language_hint: Option<LanguageHint>,
+    pub syntax_coverage: SyntaxCoverage,
+    pub behavior_coverage: BehaviorCoverage,
+    pub code_exposure: CodeExposure,
+    pub content_class: ContentClass,
+    pub exact_sha256: Option<String>,
+    pub digest_state: String,
+    pub native_format: Option<String>,
+    pub architecture: Option<String>,
+    pub classification_evidence: Vec<String>,
+    pub opaque_review_required: bool,
+}
+
 impl CoverageState {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -122,6 +206,20 @@ pub struct PayloadInventory {
     pub total_files_seen: usize,
     pub total_bytes_ingested: u64,
     pub limitations: Vec<String>,
+    /// Orthogonal v0.2.5 coverage records, keyed by `relative_path` in
+    /// deterministic order. Empty means a legacy producer supplied only the
+    /// v0.2 inventory; callers can materialize it with `refresh_coverage`.
+    #[serde(default)]
+    pub coverage: Vec<PayloadCoverage>,
+    /// Native architecture facts are retained separately from the legacy
+    /// entry shape so older Rust producers can still construct entries.
+    #[serde(default)]
+    pub native_architectures: BTreeMap<String, String>,
+    /// Open language hints retained from the bounded classification prefix.
+    /// These preserve Node/Ruby/etc. recognition without adding closed
+    /// `PayloadKind` variants or claiming behavior support.
+    #[serde(default)]
+    pub language_hints: BTreeMap<String, LanguageHint>,
 }
 
 impl PayloadInventory {
@@ -138,6 +236,27 @@ impl PayloadInventory {
                 .cmp(&b.relative_path)
                 .then_with(|| format!("{:?}", a.kind).cmp(&format!("{:?}", b.kind)))
         });
+    }
+
+    /// Materialize additive coverage records from the legacy inventory fields.
+    /// Reference state is read after analysis so known execute/load edges are
+    /// represented without changing the old enum values.
+    pub fn refresh_coverage(&mut self) {
+        self.coverage = self
+            .entries
+            .iter()
+            .map(|entry| {
+                payload_coverage_with_metadata(
+                    entry,
+                    self.native_architectures
+                        .get(&entry.relative_path)
+                        .map(String::as_str),
+                    self.language_hints.get(&entry.relative_path),
+                )
+            })
+            .collect();
+        self.coverage
+            .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     }
 }
 
@@ -190,6 +309,325 @@ pub fn classify_regular_file(path: &str, mode: u32, content_prefix: &[u8]) -> Pa
     PayloadKind::TextFile
 }
 
+/// Return the direct interpreter basename from a shebang without executing
+/// `env`. Supports direct paths, `/usr/bin/env`, `/bin/env`, `env -S`, and the
+/// conventional `--` separator. Options before the interpreter are skipped.
+pub fn shebang_interpreter(content_prefix: &[u8]) -> Option<String> {
+    let rest = content_prefix.strip_prefix(b"#!")?;
+    let line_end = rest
+        .iter()
+        .position(|byte| *byte == b'\n' || *byte == b'\r')
+        .unwrap_or(rest.len());
+    let line = std::str::from_utf8(&rest[..line_end]).ok()?;
+    let mut words = line.split_whitespace();
+    let first = words.next()?;
+    let first_basename = first.rsplit('/').next().unwrap_or(first);
+    if first_basename != "env" {
+        return Some(first.to_owned());
+    }
+    let mut word = words.next()?;
+    if word == "-S" || word == "--split-string" {
+        word = words.next()?;
+    }
+    while word.starts_with('-') && word != "--" {
+        word = words.next()?;
+    }
+    if word == "--" {
+        word = words.next()?;
+    }
+    Some(word.to_owned())
+}
+
+/// Open language recognition is deliberately independent from the closed
+/// `PayloadKind` enum. `source` is the evidence used to make the hint.
+pub fn language_hint(path: &str, content_prefix: &[u8]) -> Option<LanguageHint> {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let lower = name.to_ascii_lowercase();
+    let extension_hint = lower.rsplit_once('.').and_then(|(_, extension)| {
+        let language = match extension {
+            "qml" => "qml",
+            "js" | "mjs" | "cjs" => "javascript",
+            "ts" | "mts" | "cts" => "typescript",
+            "py" | "pyw" => "python",
+            "sh" | "bash" | "zsh" | "dash" | "ksh" | "ash" => "shell",
+            "fish" => "fish",
+            "rb" => "ruby",
+            "pl" | "pm" => "perl",
+            "lua" => "lua",
+            "php" => "php",
+            "ps1" => "powershell",
+            _ => return None,
+        };
+        Some(LanguageHint {
+            language: language.to_owned(),
+            confidence: "exact".to_owned(),
+            source: "extension".to_owned(),
+        })
+    });
+    let shebang_hint = shebang_interpreter(content_prefix).and_then(|interpreter| {
+        let basename = interpreter.rsplit('/').next().unwrap_or(&interpreter);
+        let language = match basename {
+            "sh" | "bash" | "zsh" | "dash" | "ksh" | "ash" => "shell",
+            "fish" => "fish",
+            "python" | "python2" | "python3" => "python",
+            "node" | "nodejs" | "deno" | "bun" => "javascript",
+            "ruby" => "ruby",
+            "perl" => "perl",
+            "lua" => "lua",
+            "php" => "php",
+            "pwsh" | "powershell" => "powershell",
+            _ => return None,
+        };
+        Some(LanguageHint {
+            language: language.to_owned(),
+            confidence: "exact".to_owned(),
+            source: "shebang".to_owned(),
+        })
+    });
+    match (extension_hint, shebang_hint) {
+        (Some(extension), Some(shebang)) if extension.language != shebang.language => {
+            Some(LanguageHint {
+                language: format!("{}|{}", extension.language, shebang.language),
+                confidence: "conflict".to_owned(),
+                source: "extension-and-shebang".to_owned(),
+            })
+        }
+        (Some(extension), _) => Some(extension),
+        (_, Some(shebang)) => Some(shebang),
+        _ => None,
+    }
+}
+
+/// Derive the additive v0.2.5 coverage row for one legacy inventory entry.
+pub fn payload_coverage(entry: &PayloadEntry) -> PayloadCoverage {
+    payload_coverage_with_metadata(entry, None, None)
+}
+
+fn payload_coverage_with_metadata(
+    entry: &PayloadEntry,
+    architecture: Option<&str>,
+    language_hint_override: Option<&LanguageHint>,
+) -> PayloadCoverage {
+    let native = native_format_for_kind(&entry.kind);
+    let interpreted = matches!(
+        entry.kind,
+        PayloadKind::Qml | PayloadKind::JavaScript | PayloadKind::Shell | PayloadKind::Python
+    );
+    let hint = if native.is_some() {
+        None
+    } else if let Some(hint) = language_hint_override {
+        Some(hint.clone())
+    } else if interpreted
+        || matches!(
+            entry.kind,
+            PayloadKind::ExtensionlessExecutable | PayloadKind::TextFile
+        )
+    {
+        // The inventory entry does not retain its sniff window. Known closed
+        // kinds still have a useful deterministic hint.
+        Some(LanguageHint {
+            language: match entry.kind {
+                PayloadKind::Qml => "qml",
+                PayloadKind::JavaScript => "javascript",
+                PayloadKind::Shell => "shell",
+                PayloadKind::Python => "python",
+                _ => "unknown",
+            }
+            .to_owned(),
+            confidence: "exact".to_owned(),
+            source: "classification".to_owned(),
+        })
+    } else {
+        None
+    };
+    let content_class = if native.is_some() {
+        ContentClass::NativeCode
+    } else if interpreted || matches!(entry.kind, PayloadKind::ExtensionlessExecutable) {
+        ContentClass::InterpretedCode
+    } else if matches!(entry.kind, PayloadKind::DataBinary) {
+        ContentClass::OrdinaryData
+    } else {
+        ContentClass::Unknown
+    };
+    let (syntax_coverage, behavior_coverage) = match entry.kind {
+        PayloadKind::Qml | PayloadKind::JavaScript => (
+            if cfg!(feature = "qml-parser") {
+                SyntaxCoverage::Parser
+            } else {
+                SyntaxCoverage::LexicalFallback
+            },
+            BehaviorCoverage::Bounded,
+        ),
+        PayloadKind::Python => (
+            if cfg!(feature = "python-parser") {
+                SyntaxCoverage::Parser
+            } else {
+                SyntaxCoverage::LexicalFallback
+            },
+            BehaviorCoverage::Partial,
+        ),
+        PayloadKind::Shell => (SyntaxCoverage::Bounded, BehaviorCoverage::Partial),
+        PayloadKind::ElfBinary | PayloadKind::MachOBinary | PayloadKind::PeBinary => {
+            (SyntaxCoverage::Bounded, BehaviorCoverage::Unsupported)
+        }
+        PayloadKind::Symlink | PayloadKind::Directory | PayloadKind::Special => {
+            (SyntaxCoverage::Unavailable, BehaviorCoverage::Unavailable)
+        }
+        _ => (SyntaxCoverage::Unsupported, BehaviorCoverage::Unsupported),
+    };
+    let code_exposure = if entry.invocation_target {
+        CodeExposure::KnownExecuteOrLoad
+    } else if entry.executable || matches!(entry.kind, PayloadKind::ExtensionlessExecutable) {
+        CodeExposure::EntryPoint
+    } else if native.is_some() {
+        CodeExposure::ExplicitlyUnreferenced
+    } else if interpreted {
+        CodeExposure::PossibleOrDynamic
+    } else {
+        CodeExposure::Unknown
+    };
+    let exact = (!entry.sampled_digest)
+        .then(|| entry.sha256_sampled.clone())
+        .flatten();
+    let mut classification_evidence = Vec::new();
+    if let Some(format) = native {
+        classification_evidence.push(format!("native-magic:{format}"));
+    } else if let Some(hint) = &hint {
+        classification_evidence.push(format!("{}:{}", hint.source, hint.language));
+    } else if entry.kind == PayloadKind::DataBinary {
+        classification_evidence.push("nul-byte-sniff".to_owned());
+    } else if entry.kind == PayloadKind::ExtensionlessExecutable || entry.executable {
+        classification_evidence.push("execute-bit".to_owned());
+    } else {
+        classification_evidence.push("fallback-text".to_owned());
+    }
+    if entry.sampled_digest {
+        classification_evidence.push("bounded-sample".to_owned());
+    }
+    PayloadCoverage {
+        relative_path: entry.relative_path.clone(),
+        inventory_state: if entry.coverage_state == CoverageState::Truncated
+            || (entry.sha256_sampled.is_none()
+                && !matches!(
+                    entry.kind,
+                    PayloadKind::Symlink | PayloadKind::Directory | PayloadKind::Special
+                )) {
+            InventoryState::Incomplete
+        } else {
+            InventoryState::Complete
+        },
+        language_hint: hint,
+        syntax_coverage,
+        behavior_coverage,
+        code_exposure,
+        content_class,
+        exact_sha256: exact,
+        digest_state: if entry.sampled_digest {
+            "unavailable-sampled".to_owned()
+        } else if entry.sha256_sampled.is_some() {
+            "exact".to_owned()
+        } else {
+            "unavailable".to_owned()
+        },
+        native_format: native.map(str::to_owned),
+        architecture: architecture.map(str::to_owned),
+        classification_evidence,
+        opaque_review_required: native.is_some()
+            || (matches!(entry.kind, PayloadKind::ExtensionlessExecutable)
+                && (entry.executable || entry.invocation_target)),
+    }
+}
+
+/// Bounded native-format architecture parsing. It reads only headers already
+/// retained for classification and returns `unknown` for short/malformed
+/// metadata; no loader or decoder is invoked.
+pub fn native_architecture(kind: &PayloadKind, prefix: &[u8]) -> Option<String> {
+    match kind {
+        PayloadKind::ElfBinary => {
+            let class = match prefix.get(4) {
+                Some(1) => "32",
+                Some(2) => "64",
+                _ => return Some("unknown".to_owned()),
+            };
+            let little = match prefix.get(5) {
+                Some(1) => true,
+                Some(2) => false,
+                _ => return Some("unknown".to_owned()),
+            };
+            let machine = read_u16(prefix.get(18..20)?, little);
+            let name = match machine {
+                3 => "x86",
+                40 => "arm",
+                62 => "x86-64",
+                183 => "aarch64",
+                243 => "riscv",
+                _ => "unknown",
+            };
+            Some(format!(
+                "{name}-{class}-{}",
+                if little { "le" } else { "be" }
+            ))
+        }
+        PayloadKind::MachOBinary => {
+            let little = matches!(
+                prefix.get(0..4),
+                Some([0xcf, 0xfa, 0xed, 0xfe]) | Some([0xce, 0xfa, 0xed, 0xfe])
+            );
+            let cpu = read_u32(prefix.get(4..8)?, little);
+            Some(
+                match cpu {
+                    7 => "x86-32",
+                    0x0100_0007 => "x86-64",
+                    12 => "arm",
+                    0x0100_000c => "aarch64",
+                    _ => "unknown",
+                }
+                .to_owned(),
+            )
+        }
+        PayloadKind::PeBinary => {
+            let offset = u32::from_le_bytes(prefix.get(0x3c..0x40)?.try_into().ok()?) as usize;
+            let machine = u16::from_le_bytes(prefix.get(offset + 4..offset + 6)?.try_into().ok()?);
+            Some(
+                match machine {
+                    0x014c => "x86",
+                    0x8664 => "x86-64",
+                    0x01c0 | 0x01c4 => "arm",
+                    0xaa64 => "aarch64",
+                    _ => "unknown",
+                }
+                .to_owned(),
+            )
+        }
+        _ => None,
+    }
+}
+
+fn read_u16(bytes: &[u8], little: bool) -> u16 {
+    if little {
+        u16::from_le_bytes(bytes.try_into().unwrap_or([0, 0]))
+    } else {
+        u16::from_be_bytes(bytes.try_into().unwrap_or([0, 0]))
+    }
+}
+
+fn read_u32(bytes: &[u8], little: bool) -> u32 {
+    if little {
+        u32::from_le_bytes(bytes.try_into().unwrap_or([0, 0, 0, 0]))
+    } else {
+        u32::from_be_bytes(bytes.try_into().unwrap_or([0, 0, 0, 0]))
+    }
+}
+
+pub fn native_format_for_kind(kind: &PayloadKind) -> Option<&'static str> {
+    match kind {
+        PayloadKind::ElfBinary => Some("elf"),
+        PayloadKind::MachOBinary => Some("macho"),
+        PayloadKind::PeBinary => Some("pe"),
+        _ => None,
+    }
+}
+
 fn kind_by_extension(name: &str) -> Option<PayloadKind> {
     let lower = name.to_ascii_lowercase();
     let extension = lower.rsplit_once('.').map(|(_, ext)| ext)?;
@@ -207,19 +645,6 @@ fn is_executable(mode: u32) -> bool {
 }
 
 /// Returns the interpreter path from a `#!` first line, if present.
-fn shebang_interpreter(prefix: &[u8]) -> Option<String> {
-    let rest = prefix.strip_prefix(b"#!")?;
-    let line_end = rest
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .unwrap_or(rest.len());
-    let line = std::str::from_utf8(&rest[..line_end]).ok()?;
-    // `env(1)` indirection resolves to its argument; anything else is used as-is.
-    let line = line.trim_start_matches("/usr/bin/env ");
-    let interpreter = line.split_whitespace().next()?;
-    Some(interpreter.to_owned())
-}
-
 /// Native executable-format magics. The Mach-O fat magic `0xcafebabe` is
 /// deliberately not detected because it collides with Java class files, and
 /// PE detection requires the `PE\0\0` signature at the `e_lfanew` offset —
@@ -333,6 +758,14 @@ mod tests {
             PayloadKind::TextFile,
             "shebang must be at offset zero"
         );
+        assert_eq!(
+            shebang_interpreter(b"#!/usr/bin/env -S python3 -u\n"),
+            Some("python3".to_owned())
+        );
+        assert_eq!(
+            shebang_interpreter(b"#!/bin/env -- python3\n"),
+            Some("python3".to_owned())
+        );
     }
 
     #[test]
@@ -369,6 +802,24 @@ mod tests {
             PayloadKind::DataBinary,
             "cafebabe stays ambiguous, not Mach-O"
         );
+    }
+
+    #[test]
+    fn native_architecture_is_bounded_and_format_specific() {
+        let mut elf = vec![0u8; 20];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+        assert_eq!(
+            native_architecture(&PayloadKind::ElfBinary, &elf),
+            Some("x86-64-64-le".to_owned())
+        );
+        assert_eq!(
+            native_architecture(&PayloadKind::ElfBinary, b"\x7fELF"),
+            Some("unknown".to_owned())
+        );
+        assert_eq!(native_architecture(&PayloadKind::TextFile, b""), None);
     }
 
     #[test]
@@ -410,5 +861,13 @@ mod tests {
             PayloadKind::ExtensionlessExecutable.as_str(),
             "extensionless-executable"
         );
+    }
+
+    #[test]
+    fn language_hints_preserve_extension_and_shebang_conflicts() {
+        let hint = language_hint("tool.py", b"#!/usr/bin/env ruby\nputs 1\n").unwrap();
+        assert_eq!(hint.language, "python|ruby");
+        assert_eq!(hint.confidence, "conflict");
+        assert_eq!(hint.source, "extension-and-shebang");
     }
 }

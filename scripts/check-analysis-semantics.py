@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the checked-in v0.2.4 review-compatibility declarations."""
+"""Validate the checked-in v0.2.5 review-compatibility declarations."""
 
 from __future__ import annotations
 

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::SourceIdentity;
 use omasafe_report::enforcement::{EnforcementAuditEvent, EnforcementDecision, OverrideBinding};
+use omasafe_report::executable_review::ExecutableReviewBinding;
 
 pub const HISTORY_SCHEMA_VERSION: u64 = 1;
 pub const MAX_VALIDATION_STATE_BYTES: usize = 512 * 1024;
@@ -153,6 +154,115 @@ pub struct EnforcementHistory {
 }
 
 pub const OVERRIDE_HISTORY_SCHEMA_VERSION: u64 = 1;
+
+pub const EXECUTABLE_REVIEW_HISTORY_SCHEMA_VERSION: u64 = 1;
+
+/// Durable executable-review evidence. Bindings are append-only; revocations
+/// are separate records so an operator action never erases the original
+/// assessment or its audit identity.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExecutableReviewHistory {
+    pub schema_version: u64,
+    #[serde(default)]
+    pub reviews: Vec<ExecutableReviewBinding>,
+    #[serde(default)]
+    pub revocations: Vec<ExecutableReviewRevocation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutableReviewRevocation {
+    pub audit_event_id: String,
+    pub plugin_id: String,
+    pub relative_path: String,
+    pub revoked_at: String,
+    pub reason: String,
+}
+
+impl Default for ExecutableReviewHistory {
+    fn default() -> Self {
+        Self {
+            schema_version: EXECUTABLE_REVIEW_HISTORY_SCHEMA_VERSION,
+            reviews: Vec::new(),
+            revocations: Vec::new(),
+        }
+    }
+}
+
+impl ExecutableReviewHistory {
+    pub fn load(path: &Path) -> Result<Self, Error> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let history: Self =
+            serde_json::from_slice(&fs::read(path)?).map_err(|source| Error::EnforcementJson {
+                path: path.display().to_string(),
+                source,
+            })?;
+        if history.schema_version != EXECUTABLE_REVIEW_HISTORY_SCHEMA_VERSION {
+            return Err(Error::Schema {
+                kind: "executable review history",
+                version: history.schema_version,
+                expected: EXECUTABLE_REVIEW_HISTORY_SCHEMA_VERSION,
+            });
+        }
+        Ok(history)
+    }
+
+    pub fn load_bounded(path: &Path) -> Result<Self, Error> {
+        let bytes = read_bounded_bytes(path, MAX_VALIDATION_STATE_BYTES)?.unwrap_or_else(|| {
+            serde_json::to_vec(&Self::default())
+                .expect("default executable review history serializes")
+        });
+        let history: Self =
+            serde_json::from_slice(&bytes).map_err(|source| Error::EnforcementJson {
+                path: path.display().to_string(),
+                source,
+            })?;
+        if history.schema_version != EXECUTABLE_REVIEW_HISTORY_SCHEMA_VERSION {
+            return Err(Error::Schema {
+                kind: "executable review history",
+                version: history.schema_version,
+                expected: EXECUTABLE_REVIEW_HISTORY_SCHEMA_VERSION,
+            });
+        }
+        Ok(history)
+    }
+
+    pub fn record_review(&mut self, review: ExecutableReviewBinding) {
+        self.schema_version = EXECUTABLE_REVIEW_HISTORY_SCHEMA_VERSION;
+        self.reviews.push(review);
+    }
+
+    pub fn revoke(&mut self, revocation: ExecutableReviewRevocation) {
+        self.schema_version = EXECUTABLE_REVIEW_HISTORY_SCHEMA_VERSION;
+        if !self
+            .revocations
+            .iter()
+            .any(|existing| existing.audit_event_id == revocation.audit_event_id)
+        {
+            self.revocations.push(revocation);
+        }
+    }
+
+    pub fn is_revoked(&self, audit_event_id: &str) -> bool {
+        self.revocations
+            .iter()
+            .any(|revocation| revocation.audit_event_id == audit_event_id)
+    }
+
+    pub fn write_atomic(&self, path: &Path) -> Result<(), Error> {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        let _lock = acquire_lock(path)?;
+        self.write_atomic_locked(path)
+    }
+
+    pub fn write_atomic_locked(&self, path: &Path) -> Result<(), Error> {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        durable_replace(path, &serde_json::to_vec_pretty(self)?)
+    }
+}
 
 /// Durable, private override records. Records are append-only so a later
 /// expiry or policy change never erases the operator's authorization history.
@@ -755,6 +865,8 @@ mod tests {
                 audit_event_id: "audit-enforcement-1".into(),
                 evaluated_at: "2026-09-01T00:00:00Z".into(),
                 native_install_not_interposed: true,
+                opaque_code_items: Vec::new(),
+                executable_reviews: Vec::new(),
             });
         let mut history = EnforcementHistory::default();
         history.record_decision(decision.clone());
