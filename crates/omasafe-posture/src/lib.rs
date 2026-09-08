@@ -157,6 +157,7 @@ pub struct CommandOutput {
     pub status: Option<i32>,
     pub stdout: Vec<u8>,
     pub truncated: bool,
+    pub stderr_nonempty: bool,
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -178,35 +179,31 @@ pub trait CommandAdapter {
         args: &[&str],
         budget: Duration,
     ) -> Result<CommandOutput, RunnerError>;
+    fn execute_with_env(
+        &self,
+        tool: &str,
+        args: &[&str],
+        budget: Duration,
+        env: &[(&str, &str)],
+    ) -> Result<CommandOutput, RunnerError> {
+        let _ = env;
+        self.execute(tool, args, budget)
+    }
     fn describe(&self, tool: &str) -> ToolObservation;
 }
 
 #[derive(Debug, Clone)]
-pub struct SystemCommandAdapter {
-    tool_dir: Option<PathBuf>,
-}
+pub struct SystemCommandAdapter {}
 
 impl SystemCommandAdapter {
     pub fn from_environment() -> Self {
-        let tool_dir = env::var_os("OMASAFE_POSTURE_TOOL_DIR")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute());
-        Self { tool_dir }
-    }
-
-    pub fn with_tool_dir(path: impl Into<PathBuf>) -> Self {
-        Self {
-            tool_dir: Some(path.into()),
-        }
+        // Production scans resolve only from fixed, root-owned system paths.
+        // FixtureCommandAdapter is the test boundary; inherited environment
+        // variables must not be able to shadow posture tools.
+        Self {}
     }
 
     fn resolve(&self, tool: &str) -> Option<PathBuf> {
-        if let Some(dir) = &self.tool_dir {
-            let candidate = dir.join(tool);
-            if executable_file(&candidate) && safe_path_chain(&candidate) {
-                return Some(candidate);
-            }
-        }
         for root in ["/usr/bin", "/usr/sbin", "/bin", "/sbin"] {
             let candidate = Path::new(root).join(tool);
             if executable_file(&candidate) && safe_path_chain(&candidate) {
@@ -230,6 +227,16 @@ impl CommandAdapter for SystemCommandAdapter {
         args: &[&str],
         budget: Duration,
     ) -> Result<CommandOutput, RunnerError> {
+        self.execute_with_env(tool, args, budget, &[])
+    }
+
+    fn execute_with_env(
+        &self,
+        tool: &str,
+        args: &[&str],
+        budget: Duration,
+        extra_env: &[(&str, &str)],
+    ) -> Result<CommandOutput, RunnerError> {
         let path = self
             .resolve(tool)
             .ok_or_else(|| RunnerError::Unavailable(tool.to_owned()))?;
@@ -241,6 +248,9 @@ impl CommandAdapter for SystemCommandAdapter {
         command.env("PATH", "/usr/bin:/usr/sbin:/bin:/sbin");
         command.env("GIT_CONFIG_NOSYSTEM", "1");
         command.env("GIT_TERMINAL_PROMPT", "0");
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
         command.current_dir("/");
         let output = run_bounded(&mut command, budget)
             .map_err(|error| RunnerError::Io(error.to_string()))?
@@ -252,6 +262,7 @@ impl CommandAdapter for SystemCommandAdapter {
             status: output.status.code(),
             stdout: output.stdout,
             truncated: output.truncated,
+            stderr_nonempty: !output.stderr.is_empty(),
         })
     }
 
@@ -399,13 +410,14 @@ pub fn scan_with_adapter<A: CommandAdapter>(adapter: &A) -> PostureReport {
     let names: BTreeSet<&str> = check_catalog().iter().map(|(id, _)| *id).collect();
     let mut checks = Vec::new();
     checks.push(check_context(&host));
-    let repository_check =
-        checkupdates(adapter, "updates.repository", "Repository package updates");
+    let (repository_check, repository_inventory) =
+        checkupdates_with_inventory(adapter, "updates.repository", "Repository package updates");
     checks.push(repository_check.clone());
     checks.push(check_omarchy_updates(
         adapter,
         raw_omarchy_path.as_deref(),
         &repository_check,
+        &repository_inventory,
     ));
     checks.push(arch_audit(adapter));
     checks.push(root_luks(adapter));
@@ -677,7 +689,7 @@ fn discover_host<A: CommandAdapter>(adapter: &A) -> (HostProfile, Option<PathBuf
                 .execute("pacman", &["-Q", "omarchy"], Duration::from_secs(2))
                 .ok()
                 .and_then(|output| {
-                    safe_lines(&output.stdout)
+                    parse_lines(&output.stdout)
                         .into_iter()
                         .find_map(|line| line.strip_prefix("omarchy ").map(str::to_owned))
                 })
@@ -720,33 +732,66 @@ fn check_context(host: &HostProfile) -> CheckResult {
     )
 }
 
-fn checkupdates<A: CommandAdapter>(adapter: &A, id: &str, title: &str) -> CheckResult {
+fn checkupdates_with_inventory<A: CommandAdapter>(
+    adapter: &A,
+    id: &str,
+    title: &str,
+) -> (CheckResult, Vec<String>) {
     let tool = adapter.describe("checkupdates");
-    let output = match adapter.execute("checkupdates", &["--nocolor"], Duration::from_secs(30)) {
+    let (tmpdir, dbpath) = match private_checkupdates_database() {
+        Ok(paths) => paths,
+        Err(error) => {
+            return (
+                incomplete(
+                    id,
+                    title,
+                    tool,
+                    format!("private checkupdates database was unavailable: {error}"),
+                    "Retry after the OmaSafe temporary directory is writable.",
+                ),
+                Vec::new(),
+            );
+        }
+    };
+    let tmpdir_text = tmpdir.to_string_lossy().to_string();
+    let output = match adapter.execute_with_env(
+        "checkupdates",
+        &["--nocolor"],
+        Duration::from_secs(30),
+        &[("TMPDIR", tmpdir_text.as_str())],
+    ) {
         Ok(output) => output,
         Err(error) => {
-            return incomplete(
-                id,
-                title,
-                tool,
-                format_runner_error(error),
-                "Install pacman-contrib and retry the posture scan.",
+            let _ = fs::remove_dir_all(&tmpdir);
+            return (
+                incomplete(
+                    id,
+                    title,
+                    tool,
+                    format_runner_error(error),
+                    "Install pacman-contrib and retry the posture scan.",
+                ),
+                Vec::new(),
             );
         }
     };
     if output.truncated {
-        return incomplete(
-            id,
-            title,
-            tool,
-            "checkupdates output was truncated".to_owned(),
-            "Retry the scan after resolving the command-output limit.",
+        let _ = fs::remove_dir_all(&tmpdir);
+        return (
+            incomplete(
+                id,
+                title,
+                tool,
+                "checkupdates output was truncated".to_owned(),
+                "Retry the scan after resolving the command-output limit.",
+            ),
+            Vec::new(),
         );
     }
     match output.status {
         Some(0) => {
-            let lines = safe_lines(&output.stdout);
-            if lines.is_empty() {
+            let lines = parse_lines(&output.stdout);
+            let check = if lines.is_empty() {
                 incomplete(
                     id,
                     title,
@@ -759,21 +804,28 @@ fn checkupdates<A: CommandAdapter>(adapter: &A, id: &str, title: &str) -> CheckR
                     id,
                     title,
                     CheckState::Regression,
-                    lines,
+                    lines.clone(),
                     Vec::new(),
                     Some("Run `omarchy update` after reviewing the pending packages.".to_owned()),
                     Some(tool),
                 )
-            }
+            };
+            let _ = fs::remove_dir_all(&tmpdir);
+            (check, lines)
         }
-        Some(2) => {
-            // `checkupdates` uses a private sync database, but its exit status
-            // alone cannot prove that the internal package query completed.
-            // A separate read-only pacman query is required before reporting
-            // that the repository is current.
-            match adapter.execute("pacman", &["-Qu"], Duration::from_secs(10)) {
-                Ok(query) if query.status == Some(0) && !query.truncated => {
-                    let lines = safe_lines(&query.stdout);
+        Some(1 | 2) if !(output.status == Some(1) && output.stderr_nonempty) => {
+            // checkupdates uses exit 1 or 2 for its no-update/ambiguous branch
+            // across pacman-contrib releases. Validate the same private DB that
+            // checkupdates populated; never query the user's live system DB.
+            let dbpath_text = dbpath.to_string_lossy().to_string();
+            let query = adapter.execute(
+                "pacman",
+                &["-Qu", "--dbpath", dbpath_text.as_str()],
+                Duration::from_secs(10),
+            );
+            let check = match query {
+                Ok(query) if !query.truncated && query.status == Some(0) => {
+                    let lines = parse_lines(&query.stdout);
                     if lines.is_empty() {
                         result(
                             id,
@@ -805,39 +857,66 @@ fn checkupdates<A: CommandAdapter>(adapter: &A, id: &str, title: &str) -> CheckR
                         )
                     }
                 }
+                Ok(query) if !query.truncated && query.status == Some(1) && query.stdout.is_empty() =>
+                    result(
+                        id,
+                        title,
+                        CheckState::Pass,
+                        vec!["the private package database reported no updates".to_owned()],
+                        vec![
+                            "checkupdates returned its no-update status; pacman -Qu exit 1 with empty output was validated as current"
+                                .to_owned(),
+                        ],
+                        Some("Keep the supported Omarchy update workflow available.".to_owned()),
+                        Some(tool),
+                    ),
                 Ok(_) => incomplete(
                     id,
                     title,
                     tool,
-                    "checkupdates returned its ambiguous no-update status, but the independent package query did not complete",
-                    "Retry when the package database and query tools are available.",
+                    "checkupdates returned its no-update status, but the independent package query did not complete",
+                    "Retry when the private package database and query tools are available.",
                 ),
                 Err(error) => incomplete(
                     id,
                     title,
                     tool,
                     format!(
-                        "checkupdates returned its ambiguous no-update status, but the independent package query was unavailable: {}",
+                        "checkupdates returned its no-update status, but the independent package query was unavailable: {}",
                         format_runner_error(error)
                     ),
-                    "Retry when the package database and query tools are available.",
+                    "Retry when the private package database and query tools are available.",
                 ),
-            }
+            };
+            let _ = fs::remove_dir_all(&tmpdir);
+            (check, Vec::new())
         }
-        Some(code) => incomplete(
-            id,
-            title,
-            tool,
-            format!("checkupdates failed with exit status {code}"),
-            "Retry the scan and inspect package-manager availability.",
-        ),
-        None => incomplete(
-            id,
-            title,
-            tool,
-            "checkupdates did not return an exit status",
-            "Retry the scan.",
-        ),
+        Some(code) => {
+            let _ = fs::remove_dir_all(&tmpdir);
+            (
+                incomplete(
+                    id,
+                    title,
+                    tool,
+                    format!("checkupdates failed with exit status {code}"),
+                    "Retry the scan and inspect package-manager availability.",
+                ),
+                Vec::new(),
+            )
+        }
+        None => {
+            let _ = fs::remove_dir_all(&tmpdir);
+            (
+                incomplete(
+                    id,
+                    title,
+                    tool,
+                    "checkupdates did not return an exit status",
+                    "Retry the scan.",
+                ),
+                Vec::new(),
+            )
+        }
     }
 }
 
@@ -845,11 +924,11 @@ fn check_omarchy_updates<A: CommandAdapter>(
     adapter: &A,
     raw_omarchy_path: Option<&Path>,
     repository: &CheckResult,
+    repository_inventory: &[String],
 ) -> CheckResult {
     if raw_omarchy_path == Some(Path::new("/usr/share/omarchy")) {
         if repository.state == CheckState::Regression {
-            let updates = repository
-                .evidence
+            let updates = repository_inventory
                 .iter()
                 .filter(|line| {
                     let package = line.split_whitespace().next().unwrap_or_default();
@@ -909,12 +988,16 @@ fn check_omarchy_updates<A: CommandAdapter>(
 
 fn development_checkout<A: CommandAdapter>(adapter: &A, checkout: &Path) -> CheckResult {
     let tool = adapter.describe("git");
-    let git_dir = checkout.join(".git");
-    let config_path = if git_dir.is_dir() {
-        git_dir.join("config")
-    } else {
-        checkout.join(".git")
+    let Some(git_dir) = resolve_git_dir(checkout) else {
+        return incomplete(
+            "updates.omarchy",
+            "Omarchy update availability",
+            tool,
+            "development checkout Git directory was unavailable",
+            "Retry after the checkout has readable Git metadata.",
+        );
     };
+    let config_path = git_dir.join("config");
     let config = match read_text_capped(&config_path, MAX_METADATA_BYTES) {
         Ok(config) => config,
         Err(_) => {
@@ -1145,16 +1228,41 @@ fn read_checkout_head(checkout: &Path, git_dir: &Path) -> Option<String> {
     let head = read_text_capped(&git_dir.join("HEAD"), MAX_METADATA_BYTES).ok()?;
     let head = head.trim();
     if let Some(reference) = head.strip_prefix("ref: ") {
-        return read_text_capped(&git_dir.join(reference), MAX_METADATA_BYTES)
-            .ok()
-            .map(|value| value.trim().to_owned());
+        if let Ok(value) = read_text_capped(&git_dir.join(reference), MAX_METADATA_BYTES) {
+            let value = value.trim();
+            if is_hex_commit(value) {
+                return Some(value.to_owned());
+            }
+        }
+        let packed = read_text_capped(&git_dir.join("packed-refs"), MAX_METADATA_BYTES).ok()?;
+        return packed.lines().find_map(|line| {
+            let mut fields = line.split_whitespace();
+            let commit = fields.next()?;
+            let packed_ref = fields.next()?;
+            (packed_ref == reference && is_hex_commit(commit)).then(|| commit.to_owned())
+        });
     }
-    if head.len() == 40 && is_hex_commit(head) {
+    if is_hex_commit(head) {
         Some(head.to_owned())
     } else {
         let _ = checkout;
         None
     }
+}
+
+fn resolve_git_dir(checkout: &Path) -> Option<PathBuf> {
+    let entry = checkout.join(".git");
+    if entry.is_dir() {
+        return Some(entry);
+    }
+    let pointer = read_text_capped(&entry, MAX_METADATA_BYTES).ok()?;
+    let value = pointer.trim().strip_prefix("gitdir:")?.trim();
+    let path = PathBuf::from(value);
+    Some(if path.is_absolute() {
+        path
+    } else {
+        checkout.join(path)
+    })
 }
 
 fn isolated_git_cache(url: &str) -> io::Result<PathBuf> {
@@ -1188,7 +1296,7 @@ fn isolated_git_cache(url: &str) -> io::Result<PathBuf> {
 }
 
 fn is_hex_commit(value: &str) -> bool {
-    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn arch_audit<A: CommandAdapter>(adapter: &A) -> CheckResult {
@@ -1214,7 +1322,7 @@ fn arch_audit<A: CommandAdapter>(adapter: &A) -> CheckResult {
             "Refresh official vulnerability data and retry.",
         );
     }
-    let lines = safe_lines(&output.stdout);
+    let lines = parse_lines(&output.stdout);
     if lines.is_empty() {
         result(
             "vulnerabilities.arch_audit",
@@ -1315,29 +1423,29 @@ fn root_luks<A: CommandAdapter>(adapter: &A) -> CheckResult {
 fn firewall_configuration<A: CommandAdapter>(adapter: &A) -> CheckResult {
     let nft = adapter.describe("nft");
     let ufw = adapter.describe("ufw");
-    let nft_out = adapter.execute("nft", &["-s", "list", "ruleset"], Duration::from_secs(3));
-    let ufw_out = adapter.execute("ufw", &["show", "raw"], Duration::from_secs(3));
-    let nft_ok = nft_out
-        .as_ref()
-        .is_ok_and(|output| output.status == Some(0));
-    let ufw_ok = ufw_out
-        .as_ref()
-        .is_ok_and(|output| output.status == Some(0));
-    if !nft_ok && !ufw_ok {
+    let nft_config = read_text_capped(Path::new("/etc/nftables.conf"), MAX_METADATA_BYTES).ok();
+    let ufw_config = [
+        "/etc/ufw/ufw.conf",
+        "/etc/ufw/user.rules",
+        "/etc/ufw/before.rules",
+    ]
+    .iter()
+    .find_map(|path| read_text_capped(Path::new(path), MAX_METADATA_BYTES).ok());
+    if nft_config.is_none() && ufw_config.is_none() {
         return incomplete(
             "firewall.configuration",
             "Firewall configuration",
-            nft,
-            "Neither nftables nor ufw configuration was readable",
-            "Install or configure a supported firewall frontend.",
+            if nft.available { nft } else { ufw },
+            "No readable nftables or ufw configuration file was found",
+            "Review /etc/nftables.conf or /etc/ufw/ with the supported firewall tools.",
         );
     }
     let mut evidence = Vec::new();
-    if nft_ok {
-        evidence.push("nftables configuration is readable".to_owned());
+    if nft_config.is_some() {
+        evidence.push("/etc/nftables.conf is readable".to_owned());
     }
-    if ufw_ok {
-        evidence.push("ufw configuration is readable".to_owned());
+    if ufw_config.is_some() {
+        evidence.push("an /etc/ufw configuration file is readable".to_owned());
     }
     result(
         "firewall.configuration",
@@ -1346,7 +1454,7 @@ fn firewall_configuration<A: CommandAdapter>(adapter: &A) -> CheckResult {
         evidence,
         Vec::new(),
         Some("Review the active firewall configuration if listeners change.".to_owned()),
-        Some(if nft_ok { nft } else { ufw }),
+        Some(if nft_config.is_some() { nft } else { ufw }),
     )
 }
 
@@ -1396,15 +1504,34 @@ fn firewall_service<A: CommandAdapter>(adapter: &A) -> CheckResult {
 fn firewall_effective<A: CommandAdapter>(adapter: &A) -> CheckResult {
     let tool = adapter.describe("nft");
     match adapter.execute("nft", &["list", "ruleset"], Duration::from_secs(3)) {
-        Ok(output) if output.status == Some(0) => result(
-            "firewall.effective",
-            "Effective firewall policy",
-            CheckState::Pass,
-            vec!["The runtime nftables policy was readable".to_owned()],
-            Vec::new(),
-            Some("Recheck after firewall changes.".to_owned()),
-            Some(tool),
-        ),
+        Ok(output) if output.status == Some(0) => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let has_base_chain = nft_has_base_chain(&text);
+            if has_base_chain {
+                result(
+                    "firewall.effective",
+                    "Effective firewall policy",
+                    CheckState::Pass,
+                    vec![
+                        "The runtime nftables policy has a readable base chain and default policy"
+                            .to_owned(),
+                    ],
+                    Vec::new(),
+                    Some("Recheck after firewall changes.".to_owned()),
+                    Some(tool),
+                )
+            } else {
+                result(
+                    "firewall.effective",
+                    "Effective firewall policy",
+                    CheckState::Attention,
+                    vec!["The runtime nftables ruleset was readable but no base chain/default policy was observed".to_owned()],
+                    vec!["An empty or non-filtering ruleset does not establish an effective firewall policy".to_owned()],
+                    Some("Review nftables base chains and default policies before relying on firewall coverage.".to_owned()),
+                    Some(tool),
+                )
+            }
+        }
         Ok(_) => incomplete(
             "firewall.effective",
             "Effective firewall policy",
@@ -1436,7 +1563,7 @@ fn listeners<A: CommandAdapter>(adapter: &A) -> CheckResult {
             );
         }
     };
-    let lines = safe_lines(&output.stdout);
+    let lines = parse_lines(&output.stdout);
     if output.status != Some(0) {
         return incomplete(
             "network.listeners",
@@ -1450,7 +1577,7 @@ fn listeners<A: CommandAdapter>(adapter: &A) -> CheckResult {
     let mut attribution_missing = false;
     for line in lines.iter().take(16) {
         let fields: Vec<&str> = line.split_whitespace().collect();
-        if let Some(local) = fields.get(3) {
+        if let Some(local) = fields.get(4) {
             evidence.push(format!("listening: {}", sanitize_socket(local)));
         }
         if !line.contains("users:(") {
@@ -1458,7 +1585,7 @@ fn listeners<A: CommandAdapter>(adapter: &A) -> CheckResult {
         }
     }
     if evidence.is_empty() {
-        evidence.push("No TCP listeners were reported".to_owned());
+        evidence.push("No listening TCP or UDP sockets were reported".to_owned());
     }
     let mut limitations = Vec::new();
     if attribution_missing {
@@ -1485,7 +1612,7 @@ fn kernel_restart<A: CommandAdapter>(adapter: &A, host: &HostProfile) -> CheckRe
         }
     };
     let current = host.kernel.clone().unwrap_or_default();
-    let installed = safe_lines(&output.stdout)
+    let installed = parse_lines(&output.stdout)
         .into_iter()
         .filter(|line| {
             line.starts_with("linux ")
@@ -1563,7 +1690,7 @@ fn foreign_packages<A: CommandAdapter>(adapter: &A) -> CheckResult {
             "Retry the package inventory.",
         );
     }
-    let lines = safe_lines(&output.stdout);
+    let lines = parse_lines(&output.stdout);
     result(
         "packages.foreign",
         "Foreign package inventory",
@@ -1694,10 +1821,55 @@ fn path_integrity() -> CheckResult {
 
 fn secure_boot<A: CommandAdapter>(adapter: &A) -> CheckResult {
     let tool = adapter.describe("bootctl");
-    match adapter.execute("bootctl", &["is-secure-boot-enabled"], Duration::from_secs(2)) {
-        Ok(output) if output.status == Some(0) => result("boot.secure_boot", "Secure Boot state", CheckState::Informational, vec!["Secure Boot is enabled".to_owned()], Vec::new(), Some("Secure Boot state is reported for context and is not graded.".to_owned()), Some(tool)),
-        Ok(_) => result("boot.secure_boot", "Secure Boot state", CheckState::Informational, vec!["Secure Boot is disabled or unavailable; this is informational on a normal Omarchy installation".to_owned()], Vec::new(), Some("Secure Boot state is reported for context and is not graded.".to_owned()), Some(tool)),
-        Err(_) => result("boot.secure_boot", "Secure Boot state", CheckState::NotApplicable, vec!["bootctl is unavailable".to_owned()], vec!["optional firmware evidence was not available".to_owned()], Some("Use bootctl or firmware state when diagnosing boot policy.".to_owned()), Some(tool)),
+    match adapter.execute("bootctl", &["status", "--no-pager"], Duration::from_secs(2)) {
+        Ok(output) if output.status == Some(0) => {
+            let status = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':')
+                        .filter(|(key, _)| key.trim() == "Secure Boot")
+                        .map(|(_, value)| value.trim().to_ascii_lowercase())
+                });
+            let Some(status) = status else {
+                return incomplete(
+                    "boot.secure_boot",
+                    "Secure Boot state",
+                    tool,
+                    "bootctl status did not include a Secure Boot field",
+                    "Retry with firmware status metadata available.",
+                );
+            };
+            let state = if status.contains("enabled") {
+                "Secure Boot is enabled"
+            } else if status.contains("disabled") {
+                "Secure Boot is disabled"
+            } else {
+                "Secure Boot state is unsupported or unavailable"
+            };
+            result(
+                "boot.secure_boot",
+                "Secure Boot state",
+                CheckState::Informational,
+                vec![state.to_owned()],
+                Vec::new(),
+                Some("Secure Boot state is reported for context and is not graded.".to_owned()),
+                Some(tool),
+            )
+        }
+        Ok(_) => incomplete(
+            "boot.secure_boot",
+            "Secure Boot state",
+            tool,
+            "bootctl status was unavailable",
+            "Retry with firmware status metadata available.",
+        ),
+        Err(_) => incomplete(
+            "boot.secure_boot",
+            "Secure Boot state",
+            tool,
+            "bootctl was unavailable",
+            "Use bootctl or firmware state when diagnosing boot policy.",
+        ),
     }
 }
 
@@ -1844,22 +2016,33 @@ pub fn hook_stamp_path() -> PathBuf {
 }
 
 pub fn hook_install_path() -> PathBuf {
-    env::var_os("XDG_CONFIG_HOME")
+    env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
-        .unwrap_or_else(|| {
-            env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
-                .join(".config")
-        })
-        .join("omarchy/hooks/post-update.d")
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".config/omarchy/hooks/post-update.d")
         .join(POST_UPDATE_HOOK_NAME)
+}
+
+fn require_omarchy_hook_tree() -> io::Result<()> {
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
+    let root = home.join(".config/omarchy");
+    if !root.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Omarchy hook tree is absent at {}", root.display()),
+        ));
+    }
+    Ok(())
 }
 
 /// Installs only the OmaSafe hook file. It does not invoke Omarchy hooks or
 /// update commands; the Omarchy hook dispatcher discovers this exact file.
 pub fn install_post_update_hook() -> Result<PathBuf, PostureError> {
+    require_omarchy_hook_tree()?;
     let path = hook_install_path();
     let stamp = production_stamp_path();
     let parent = path
@@ -2057,11 +2240,36 @@ fn bound_strings(values: Vec<String>) -> Vec<String> {
 }
 
 fn safe_lines(bytes: &[u8]) -> Vec<String> {
+    parse_lines(bytes)
+        .into_iter()
+        .take(MAX_EVIDENCE_ITEMS)
+        .collect()
+}
+
+fn parse_lines(bytes: &[u8]) -> Vec<String> {
     String::from_utf8_lossy(bytes)
         .lines()
         .filter_map(sanitized_text)
-        .take(MAX_EVIDENCE_ITEMS)
         .collect()
+}
+
+fn private_checkupdates_database() -> io::Result<(PathBuf, PathBuf)> {
+    let root = env::temp_dir().join(format!(
+        "omasafe-checkupdates-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default()
+    ));
+    fs::create_dir_all(&root)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+    }
+    let uid = unsafe { libc::geteuid() };
+    Ok((root.clone(), root.join(format!("checkup-db-{uid}"))))
 }
 
 fn read_text_capped(path: &Path, max_bytes: usize) -> io::Result<String> {
@@ -2115,9 +2323,36 @@ fn redact_path(value: &str) -> String {
 fn sanitize_socket(value: &str) -> String {
     value
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '.' | '[' | ']' | '/' | '%'))
+        .filter(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, ':' | '.' | '[' | ']' | '/' | '%' | '*' | '-')
+        })
         .take(128)
         .collect()
+}
+
+fn nft_has_base_chain(text: &str) -> bool {
+    let mut in_chain = false;
+    let mut has_hook = false;
+    let mut has_policy = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.starts_with("chain ") {
+            in_chain = true;
+            has_hook = false;
+            has_policy = false;
+        }
+        if in_chain {
+            has_hook |= line.contains("hook ");
+            has_policy |= line.contains("policy ");
+            if has_hook && has_policy {
+                return true;
+            }
+            if line == "}" {
+                in_chain = false;
+            }
+        }
+    }
+    false
 }
 
 fn json_root_has_crypt(value: &serde_json::Value) -> Option<bool> {
@@ -2165,8 +2400,10 @@ fn executable_file(path: &Path) -> bool {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        meta.permissions().mode() & 0o111 != 0
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        meta.uid() == 0
+            && meta.permissions().mode() & 0o022 == 0
+            && meta.permissions().mode() & 0o111 != 0
     }
     #[cfg(not(unix))]
     {
@@ -2182,8 +2419,8 @@ fn safe_path_chain(path: &Path) -> bool {
         };
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            if meta.permissions().mode() & 0o002 != 0 {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            if meta.uid() != 0 || meta.permissions().mode() & 0o022 != 0 {
                 return false;
             }
         }
@@ -2201,6 +2438,14 @@ mod tests {
             status: Some(status),
             stdout: text.as_bytes().to_vec(),
             truncated: false,
+            stderr_nonempty: false,
+        }
+    }
+
+    fn output_with_stderr(status: i32, text: &str) -> CommandOutput {
+        CommandOutput {
+            stderr_nonempty: true,
+            ..output(status, text)
         }
     }
 
@@ -2214,14 +2459,14 @@ mod tests {
             .find(|check| check.id == "updates.repository")
             .unwrap();
         assert_eq!(check.state, CheckState::Incomplete);
-        assert!(check.limitations[0].contains("ambiguous"));
+        assert!(check.limitations[0].contains("independent package query"));
     }
 
     #[test]
     fn exit_two_requires_and_uses_independent_package_query() {
         let adapter = FixtureCommandAdapter::default()
             .response("checkupdates", output(2, ""))
-            .response_args("pacman", &["-Qu"], output(0, ""));
+            .response("pacman", output(0, ""));
         let report = scan_with_adapter(&adapter);
         let check = report
             .checks
@@ -2236,7 +2481,7 @@ mod tests {
     fn independent_package_query_can_surface_updates_after_exit_two() {
         let adapter = FixtureCommandAdapter::default()
             .response("checkupdates", output(2, ""))
-            .response_args("pacman", &["-Qu"], output(0, "openssl 3.0.0-1"));
+            .response("pacman", output(0, "openssl 3.0.0-1"));
         let report = scan_with_adapter(&adapter);
         let check = report
             .checks
@@ -2250,6 +2495,134 @@ mod tests {
                 .iter()
                 .any(|line| line.starts_with("openssl"))
         );
+    }
+
+    #[test]
+    fn complete_update_inventory_drives_omarchy_filter_beyond_evidence_cap() {
+        let mut packages = (0..40)
+            .map(|index| format!("package-{index} 1.0.0-1"))
+            .collect::<Vec<_>>();
+        packages.push("omarchy 4.0.0-1".to_owned());
+        let adapter = FixtureCommandAdapter::default()
+            .response("checkupdates", output(0, &packages.join("\n")));
+        let (repository, inventory) =
+            checkupdates_with_inventory(&adapter, "updates.repository", "Repository updates");
+        assert_eq!(inventory.len(), 41);
+        assert_eq!(repository.evidence.len(), MAX_EVIDENCE_ITEMS);
+        let omarchy = check_omarchy_updates(
+            &adapter,
+            Some(Path::new("/usr/share/omarchy")),
+            &repository,
+            &inventory,
+        );
+        assert_eq!(omarchy.state, CheckState::Regression);
+        assert!(omarchy.evidence.iter().any(|line| line.contains("omarchy")));
+    }
+
+    #[test]
+    fn checkupdates_exit_one_empty_output_is_validated_empty() {
+        let adapter = FixtureCommandAdapter::default()
+            .response("checkupdates", output(1, ""))
+            .response("pacman", output(1, ""));
+        let report = scan_with_adapter(&adapter);
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.id == "updates.repository")
+            .unwrap();
+        assert_eq!(check.state, CheckState::Pass);
+    }
+
+    #[test]
+    fn checkupdates_exit_one_with_stderr_is_not_treated_as_empty() {
+        let adapter =
+            FixtureCommandAdapter::default().response("checkupdates", output_with_stderr(1, ""));
+        let report = scan_with_adapter(&adapter);
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.id == "updates.repository")
+            .unwrap();
+        assert_eq!(check.state, CheckState::Incomplete);
+    }
+
+    #[test]
+    fn listeners_retain_local_address_and_wildcard_port() {
+        let adapter = FixtureCommandAdapter::default().response(
+            "ss",
+            output(
+                0,
+                "udp UNCONN 0 0 172.17.0.1:53 0.0.0.0:* users:((\"dns\",pid=1,fd=2))",
+            ),
+        );
+        let check = listeners(&adapter);
+        assert!(
+            check
+                .evidence
+                .iter()
+                .any(|line| line.contains("172.17.0.1:53"))
+        );
+        assert!(!check.evidence.iter().any(|line| line.ends_with(" 0")));
+    }
+
+    #[test]
+    fn secure_boot_reads_bootctl_status_field() {
+        let adapter = FixtureCommandAdapter::default().response(
+            "bootctl",
+            output(0, "Systemd Boot Loader:\nSecure Boot: enabled\n"),
+        );
+        let check = secure_boot(&adapter);
+        assert!(check.evidence.iter().any(|line| line.contains("enabled")));
+    }
+
+    #[test]
+    fn empty_effective_ruleset_is_not_a_pass() {
+        let adapter = FixtureCommandAdapter::default().response("nft", output(0, ""));
+        let check = firewall_effective(&adapter);
+        assert_eq!(check.state, CheckState::Attention);
+    }
+
+    #[test]
+    fn multiline_nft_base_chain_is_a_readable_policy() {
+        let adapter = FixtureCommandAdapter::default().response(
+            "nft",
+            output(
+                0,
+                "table inet filter {\n chain input {\n  type filter hook input priority filter;\n  policy drop;\n }\n}",
+            ),
+        );
+        let check = firewall_effective(&adapter);
+        assert_eq!(check.state, CheckState::Pass);
+    }
+
+    #[test]
+    fn checkout_head_reads_packed_refs_and_worktree_git_pointers() {
+        let root = env::temp_dir().join(format!(
+            "omasafe-posture-git-fixture-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let git_dir = root.join("gitdir/worktrees/fixture");
+        fs::create_dir_all(&git_dir).unwrap();
+        fs::write(
+            root.join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .unwrap();
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(
+            git_dir.join("packed-refs"),
+            "# pack-refs with: peeled fully-peeled\n0123456789012345678901234567890123456789 refs/heads/main\n",
+        )
+        .unwrap();
+        let resolved = resolve_git_dir(&root).unwrap();
+        assert_eq!(
+            read_checkout_head(&root, &resolved).as_deref(),
+            Some("0123456789012345678901234567890123456789")
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -2921,7 +2921,7 @@ git diff --check                                         # clean
 
 ## v0.3 M1–M7 — Host posture foundation and visibility
 
-Status: **implemented**
+Status: **M1–M4 implemented; M5 partial; M6–M7 outstanding**
 
 Added the host-scoped `omasafe-posture` crate and CLI surface. Posture reports
 use `omasafe.posture.v1` with stable check IDs, explicit pass/regression/
@@ -2945,9 +2945,17 @@ gap remains visible without a recurring desktop alert; a later loss notifies
 once, unchanged failures stay quiet, recovery closes the episode, and a later
 loss can notify again. `posture scan`, `posture export`, and `posture hook
 install|self-test|status` expose the report, Markdown preview, and support
-evidence paths. `schedule install` now runs the existing plugin scan and the
-daily posture scan under the same read-only service sandbox, plus a separate
-weekly posture digest timer.
+evidence paths. `schedule install` runs the existing plugin scan and the daily
+posture scan under the same read-only service sandbox, plus a separate weekly
+posture digest timer.
+
+The current M5 slice is limited to stable check IDs, coverage episodes, and
+managed daily/weekly scheduling. Persistence baselines and acknowledge/exclude
+reuse, whole-scan failure notifications, a time-windowed digest, provenance
+context in support export, and benchmark evidence remain outstanding. The
+plugin repository now has a Posture tab and the portable skill consumes the
+`omasafe.posture.v1` contract, but that sibling coordination is recorded as
+integration work rather than proof that M5–M7 acceptance is complete.
 
 Verification:
 

@@ -4473,7 +4473,7 @@ fn schedule_install(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         ""
     };
     let service = format!(
-        "[Unit]\nDescription=OmaSafe {} plugin drift scan\n\n[Service]\nType=oneshot\nSuccessExitStatus=3\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nProtectHome=read-only\nReadWritePaths=\"{}\" \"{}\"\nExecStart=\"{}\" scan --notify --only-new{}\nExecStart=\"{}\" posture scan --notify\n",
+        "[Unit]\nDescription=OmaSafe {} plugin drift scan\n\n[Service]\nType=oneshot\nSuccessExitStatus=3\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nProtectHome=read-only\nReadWritePaths=\"{}\" \"{}\"\nExecStart=-\"{}\" scan --notify --only-new{}\nExecStart=\"{}\" posture scan --notify\n",
         policy_mode.as_str(),
         state_path,
         cache_path,
