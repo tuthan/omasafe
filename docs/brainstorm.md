@@ -271,8 +271,8 @@ Principles:
 |-------|-------|
 | [v0.1](plans/v0.1.md) | Local plugin trust: installed inventory, catalog correlation, commit/tree identity, diff, baseline, and drift alerts |
 | [v0.2](plans/v0.2.md) | Payload-aware capability analyzer, QML-to-payload edges, shared-shell sensitive APIs, and reviewed update workflow |
-| [v0.3](plans/v0.3.md) | AUR/PKGBUILD static analyzer and update review without executing build files |
-| [v0.4](plans/v0.4.md) | Posture regressions, reliable `checkupdates` states, optional arch-audit, and actionable notifications |
+| [v0.3](plans/v0.3.md) | Posture regressions, reliable `checkupdates` states, optional arch-audit, and actionable notifications |
+| [v0.4](plans/v0.4.md) | AUR/PKGBUILD static analyzer and update review without executing build files |
 | [v0.5](plans/v0.5.md) | Narrow polkit remediation helper, first hardening installer, report export, and advanced drift detection |
 | [Later](plans/later.md) | Secrets sweep, panic workflow, ClamAV, VirusTotal hash lookups, AIDE, and experimental integrations |
 

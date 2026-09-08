@@ -3,7 +3,9 @@
 Status: reviewed base sequence, 2026-08-20 · v0.2.1 implementation complete, 2026-09-02 ·
 v0.2.2 candidate-source scan revised draft, 2026-09-04 · v0.2.3 scan-cache implementation
 complete; clean-VM release gates pending, 2026-09-05 · v0.2.4 rule detection and
-review clarity implementation complete; release evidence and VM gates pending, 2026-09-07
+review clarity implementation complete; release evidence and VM gates pending, 2026-09-07 ·
+v0.2.5 coverage truth and opaque executable review revised draft, 2026-09-08 ·
+posture and AUR swapped to v0.3/v0.4, 2026-09-08
 
 This directory turns the product brainstorm into independently shippable releases. Each
 version must deliver a useful vertical slice; unfinished future architecture must not
@@ -11,6 +13,15 @@ leak into the current release. These plans are the source of truth for scope and
 [`brainstorm.md`](../brainstorm.md) is the frozen thesis and decision record.
 
 ## Release Map
+
+The [v0.2.5 coverage and opaque executable review plan](v0.2.5-coverage-and-binary-review.md)
+(2026-09-08) is limited to coverage/reporting correctness, binary review evidence,
+policy/migration, and consumer compatibility. Language analyzers remain follow-on work.
+
+Machine posture and AUR review swapped positions on 2026-09-08: posture is now v0.3 and
+AUR/PKGBUILD review is v0.4. The two were independent siblings — both depended only on
+v0.1 and v0.2 — so the swap moves no dependency, and it places v0.5's remediation and
+export work directly after the v0.3 checks it consumes. The AUR scope itself is unchanged.
 
 | Version | Outcome | Depends on |
 |---------|---------|------------|
@@ -20,9 +31,10 @@ leak into the current release. These plans are the source of truth for scope and
 | [v0.2.2](v0.2.2-candidate-source-scan.md) | Scan uninstalled GitHub and verified marketplace candidates from a pasted URL/install command without installing or executing them | v0.2.1 bounded analyzer/report/consumer contracts |
 | [v0.2.3](v0.2.3-scan-caching.md) | Persist the last successful normalized installed-scan snapshot in the CLI and hydrate it as explicitly cached/stale UI state | v0.2.2 scan/report contracts and v0.2.1 plugin/enforcement UI contracts |
 | [v0.2.4](v0.2.4-rule-detection-clarity.md) | Correct reproduced detection/labeling gaps and deliver bounded, explicit evidence and coverage reports for users and AI reviewers (implementation complete; release gates pending) | v0.2.3 analyzer/report/cache contracts |
-| [v0.3](v0.3.md) | Review PKGBUILDs and AUR updates without executing build files | v0.1 identity/diff; v0.2 analyzer/report contracts |
-| [v0.4](v0.4.md) | Detect machine-posture regressions and vulnerable/outdated packages | v0.1 state/notification; v0.2 report contract |
-| [v0.5](v0.5.md) | Perform a narrow set of explicit remediations and export reports | v0.4 checks; audited polkit boundary |
+| [v0.2.5](v0.2.5-coverage-and-binary-review.md) | Make coverage explicit and require exact external review evidence for opaque executable code under hardened lifecycle policy | v0.2.4 analyzer/report/cache and ADR-0003 enforcement contracts |
+| [v0.3](v0.3.md) | Detect machine-posture regressions and vulnerable/outdated packages, with host state visible to the user and reproducible for support | v0.1 state/notification; v0.2 report contract |
+| [v0.4](v0.4.md) | Review PKGBUILDs and AUR updates without executing build files | v0.1 identity/diff; v0.2 analyzer/report contracts |
+| [v0.5](v0.5.md) | Perform a narrow set of explicit remediations and export reports | v0.3 checks; audited polkit boundary |
 | [Later](later.md) | Hold deliberately deferred experiments and optional integrations | Validated demand |
 
 ## Proposed Technical Baseline
@@ -177,8 +189,9 @@ A release is done only when:
 ## Planning and Ownership
 
 - Release owner: Hung Vo unless reassigned in the individual plan.
-- Sizes are coarse risk/effort signals, not duration promises: v0.1 L, v0.2 XL, v0.3 L,
-  v0.4 L, v0.5 XL.
+- Sizes are coarse risk/effort signals, not duration promises: v0.1 L, v0.2 XL, v0.3 XL,
+  v0.4 L, v0.5 XL. v0.3 rose to XL when host-scoped schema, visibility, and support-evidence
+  scope was added on 2026-09-08.
 - Calendar dates are assigned only after v0.1 M0 establishes environment and delivery
   capacity.
 - M0 records the maintainer's sustainable hours-per-week capacity; sequencing gates and
