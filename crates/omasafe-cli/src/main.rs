@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
@@ -26,6 +27,7 @@ use omasafe_plugin_trust::{
     collect, collect_one, git_diff, omarchy_bar_use_default, omarchy_plugin_disable,
     omarchy_plugin_enable, omarchy_plugin_update, query_shell, source_identity,
 };
+use omasafe_posture::{self, PostureReport};
 use omasafe_report::Report;
 use omasafe_report::acquisition::{
     AcquisitionInputKind, AcquisitionSection, CacheFact, CacheResult,
@@ -221,6 +223,14 @@ fn run(args: Vec<String>) -> Result<i32, Box<dyn std::error::Error>> {
                 0
             }
         }
+        [command] if command == "posture" => {
+            posture(&[])?;
+            0
+        }
+        [command, rest @ ..] if command == "posture" => {
+            posture(rest)?;
+            0
+        }
         [command, subcommand, rest @ ..] if command == "scan-cache" && subcommand == "show" => {
             scan_cache_show(rest)?;
             0
@@ -261,7 +271,7 @@ fn run(args: Vec<String>) -> Result<i32, Box<dyn std::error::Error>> {
         [command, rest @ ..] if command == "scan-plugin" => scan_plugin(rest)?,
         _ => {
             eprintln!(
-                "usage: omasafe-cli plugins ... | scan [--format text|json] [--notify] [--only-new] [--include-analysis] | scan-cache show [--profile installed-basic|installed-analysis] [--validate] [--format text|json] | marketplace refresh [--commit COMMIT|--latest] | rules list [--format text|json] | rules coverage [--format text|json] | rules explain RULE_ID [--format text|json] | plugins analyze PLUGIN_ID [--format text|json] [--refresh|--cached] [--fail-on SEVERITY] | plugins enable PLUGIN_ID [--policy advisory|hardened] [--format text|json] | plugins review-update PLUGIN_ID [--expected-commit SHA] [--yes] [--policy advisory|hardened] | plugins enforcement-status PLUGIN_ID [--format text|json] | plugins executable-review list ID [--format text|json] | plugins executable-review add ID --path PATH --sha256 DIGEST --method METHOD --assessment-outcome OUTCOME --decision DECISION --performed-at TIME --expires TIME --provider PROVIDER --reason REASON [--report-ref REF] [--expected-head COMMIT] [--expected-tree TREE] [--expected-digest DIGEST] --yes | plugins executable-review revoke ID --path PATH --sha256 DIGEST --reason REASON --yes | plugins override create PLUGIN_ID --rule RULE_ID [--rule RULE_ID ...] --commit SHA --reason TEXT --expires TIMESTAMP | plugins override list [--format text|json] | scan-plugin (--path DIR|--git URL [--revision COMMIT]|--request TEXT|--marketplace PLUGIN_ID) [--plugin-id PLUGIN_ID] [--report-profile full|review] [--format text|json] [--fail-on SEVERITY] | schedule install [--policy advisory|hardened] | schedule uninstall | schedule status [--format text|json] | paths | provenance [--format text|json]"
+                "usage: omasafe-cli plugins ... | scan [--format text|json] [--notify] [--only-new] [--include-analysis] | posture scan|export|digest [--format text|json|markdown] [--notify] | scan-cache show [--profile installed-basic|installed-analysis] [--validate] [--format text|json] | marketplace refresh [--commit COMMIT|--latest] | rules list [--format text|json] | rules coverage [--format text|json] | rules explain RULE_ID [--format text|json] | plugins analyze PLUGIN_ID [--format text|json] [--refresh|--cached] [--fail-on SEVERITY] | plugins enable PLUGIN_ID [--policy advisory|hardened] [--format text|json] | plugins review-update PLUGIN_ID [--expected-commit SHA] [--yes] [--policy advisory|hardened] | plugins enforcement-status PLUGIN_ID [--format text|json] | plugins executable-review list ID [--format text|json] | plugins executable-review add ID --path PATH --sha256 DIGEST --method METHOD --assessment-outcome OUTCOME --decision DECISION --performed-at TIME --expires TIME --provider PROVIDER --reason REASON [--report-ref REF] [--expected-head COMMIT] [--expected-tree TREE] [--expected-digest DIGEST] --yes | plugins executable-review revoke ID --path PATH --sha256 DIGEST --reason REASON --yes | plugins override create PLUGIN_ID --rule RULE_ID [--rule RULE_ID ...] --commit SHA --reason TEXT --expires TIMESTAMP | plugins override list [--format text|json] | scan-plugin (--path DIR|--git URL [--revision COMMIT]|--request TEXT|--marketplace PLUGIN_ID) [--plugin-id PLUGIN_ID] [--report-profile full|review] [--format text|json] [--fail-on SEVERITY] | schedule install [--policy advisory|hardened] | schedule uninstall | schedule status [--format text|json] | paths | provenance [--format text|json]"
             );
             std::process::exit(2);
         }
@@ -4463,21 +4473,32 @@ fn schedule_install(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         ""
     };
     let service = format!(
-        "[Unit]\nDescription=OmaSafe {} plugin drift scan\n\n[Service]\nType=oneshot\nSuccessExitStatus=3\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nProtectHome=read-only\nReadWritePaths=\"{}\" \"{}\"\nExecStart=\"{}\" scan --notify --only-new{}\n",
+        "[Unit]\nDescription=OmaSafe {} plugin drift scan\n\n[Service]\nType=oneshot\nSuccessExitStatus=3\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nProtectHome=read-only\nReadWritePaths=\"{}\" \"{}\"\nExecStart=\"{}\" scan --notify --only-new{}\nExecStart=\"{}\" posture scan --notify\n",
         policy_mode.as_str(),
         state_path,
         cache_path,
         executable,
-        analysis_flag
+        analysis_flag,
+        executable
     );
     let service_path = unit_dir.join("omasafe-scan.service");
     let timer_path = unit_dir.join("omasafe-scan.timer");
+    let digest_service_path = unit_dir.join("omasafe-posture-digest.service");
+    let digest_timer_path = unit_dir.join("omasafe-posture-digest.timer");
     let timer = b"[Unit]\nDescription=Daily OmaSafe plugin drift scan\n\n[Timer]\nOnCalendar=daily\nRandomizedDelaySec=15m\nPersistent=true\nUnit=omasafe-scan.service\n\n[Install]\nWantedBy=timers.target\n";
+    let digest_service = format!(
+        "[Unit]\nDescription=Weekly OmaSafe posture digest\n\n[Service]\nType=oneshot\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nProtectHome=read-only\nReadWritePaths=\"{}\" \"{}\"\nExecStart=\"{}\" posture digest --format markdown\n",
+        state_path, cache_path, executable
+    );
+    let digest_timer = b"[Unit]\nDescription=Weekly OmaSafe posture digest\n\n[Timer]\nOnCalendar=weekly\nRandomizedDelaySec=1h\nPersistent=true\nUnit=omasafe-posture-digest.service\n\n[Install]\nWantedBy=timers.target\n";
     write_if_changed(&service_path, service.as_bytes())?;
     write_if_changed(&timer_path, timer)?;
+    write_if_changed(&digest_service_path, digest_service.as_bytes())?;
+    write_if_changed(&digest_timer_path, digest_timer)?;
     for args in [
         vec!["--user", "daemon-reload"],
         vec!["--user", "enable", "--now", "omasafe-scan.timer"],
+        vec!["--user", "enable", "--now", "omasafe-posture-digest.timer"],
     ] {
         run_bounded_systemctl(&args)
             .map_err(|error| format!("systemd user timer installation failed: {error}"))?;
@@ -4489,6 +4510,12 @@ fn schedule_install(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         service_unit: "omasafe-scan.service".to_owned(),
         timer_unit: "omasafe-scan.timer".to_owned(),
         unit_identity: schedule_unit_identity(service.as_bytes(), timer),
+        digest_service_unit: Some("omasafe-posture-digest.service".to_owned()),
+        digest_timer_unit: Some("omasafe-posture-digest.timer".to_owned()),
+        digest_unit_identity: Some(schedule_unit_identity(
+            digest_service.as_bytes(),
+            digest_timer,
+        )),
         installed_at: now(),
     };
     write_schedule_metadata(&xdg.state.join("schedule.json"), &metadata)?;
@@ -4510,9 +4537,17 @@ fn schedule_uninstall(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
     let unit_dir = schedule_unit_dir()?;
     let service_path = unit_dir.join("omasafe-scan.service");
     let timer_path = unit_dir.join("omasafe-scan.timer");
+    let digest_service_path = unit_dir.join("omasafe-posture-digest.service");
+    let digest_timer_path = unit_dir.join("omasafe-posture-digest.timer");
     let service_bytes = std::fs::read(&service_path).ok();
     let timer_bytes = std::fs::read(&timer_path).ok();
-    if service_bytes.is_none() && timer_bytes.is_none() {
+    let digest_service_bytes = std::fs::read(&digest_service_path).ok();
+    let digest_timer_bytes = std::fs::read(&digest_timer_path).ok();
+    if service_bytes.is_none()
+        && timer_bytes.is_none()
+        && digest_service_bytes.is_none()
+        && digest_timer_bytes.is_none()
+    {
         println!("Scheduled scan is not installed.");
         return Ok(());
     }
@@ -4521,6 +4556,9 @@ fn schedule_uninstall(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
             "refusing to remove an incomplete scheduled scan; inspect the user systemd units"
                 .into(),
         );
+    }
+    if digest_service_bytes.is_some() != digest_timer_bytes.is_some() {
+        return Err("refusing to remove an incomplete posture digest schedule; inspect the user systemd units".into());
     }
     let (metadata, metadata_error) = read_schedule_metadata(&paths.state.join("schedule.json"));
     let metadata = metadata.ok_or_else(|| {
@@ -4541,13 +4579,25 @@ fn schedule_uninstall(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
                 .into(),
         );
     }
+    if let (Some(service), Some(timer)) = (&digest_service_bytes, &digest_timer_bytes)
+        && metadata.digest_unit_identity.as_deref()
+            != Some(schedule_unit_identity(service, timer).as_str())
+    {
+        return Err("refusing to remove a modified posture digest schedule".into());
+    }
 
     run_bounded_systemctl(&["--user", "disable", "--now", "omasafe-scan.timer"])
         .map_err(|error| format!("systemd user timer disable failed: {error}"))?;
     run_bounded_systemctl(&["--user", "daemon-reload"])
         .map_err(|error| format!("systemd user daemon-reload failed: {error}"))?;
+    if digest_service_bytes.is_some() {
+        run_bounded_systemctl(&["--user", "disable", "--now", "omasafe-posture-digest.timer"])
+            .map_err(|error| format!("systemd posture digest timer disable failed: {error}"))?;
+    }
     remove_schedule_file(&service_path)?;
     remove_schedule_file(&timer_path)?;
+    remove_schedule_file(&digest_service_path)?;
+    remove_schedule_file(&digest_timer_path)?;
     remove_schedule_file(&paths.state.join("schedule.json"))?;
     println!("Disabled and removed the OmaSafe scheduled scan.");
     Ok(())
@@ -4561,6 +4611,12 @@ struct ScheduleMetadata {
     service_unit: String,
     timer_unit: String,
     unit_identity: String,
+    #[serde(default)]
+    digest_service_unit: Option<String>,
+    #[serde(default)]
+    digest_timer_unit: Option<String>,
+    #[serde(default)]
+    digest_unit_identity: Option<String>,
     installed_at: String,
 }
 
@@ -4591,6 +4647,8 @@ struct ScheduleStatusResult {
     installed_at: Option<String>,
     service_unit: String,
     timer_unit: String,
+    digest_installed: bool,
+    digest_unit_identity: Option<String>,
     last_known_execution: Option<ScheduleExecution>,
     metadata_error: Option<String>,
 }
@@ -4777,20 +4835,42 @@ fn schedule_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let unit_dir = schedule_unit_dir()?;
     let service_path = unit_dir.join("omasafe-scan.service");
     let timer_path = unit_dir.join("omasafe-scan.timer");
+    let digest_service_path = unit_dir.join("omasafe-posture-digest.service");
+    let digest_timer_path = unit_dir.join("omasafe-posture-digest.timer");
     let service_bytes = std::fs::read(&service_path).ok();
     let timer_bytes = std::fs::read(&timer_path).ok();
     let installed = service_bytes.is_some() && timer_bytes.is_some();
+    let digest_service_bytes = std::fs::read(&digest_service_path).ok();
+    let digest_timer_bytes = std::fs::read(&digest_timer_path).ok();
+    let digest_installed = digest_service_bytes.is_some() && digest_timer_bytes.is_some();
+    let digest_unit_identity = match (&digest_service_bytes, &digest_timer_bytes) {
+        (Some(service), Some(timer)) => Some(schedule_unit_identity(service, timer)),
+        _ => None,
+    };
     let unit_identity = match (&service_bytes, &timer_bytes) {
         (Some(service), Some(timer)) => Some(schedule_unit_identity(service, timer)),
         _ => None,
     };
     let metadata_path = paths.state.join("schedule.json");
     let (metadata, metadata_error) = read_schedule_metadata(&metadata_path);
+    let digest_consistent = match (
+        &digest_service_bytes,
+        &digest_timer_bytes,
+        metadata.as_ref(),
+    ) {
+        (None, None, _) => true,
+        (Some(service), Some(timer), Some(metadata)) => {
+            metadata.digest_unit_identity.as_deref()
+                == Some(schedule_unit_identity(service, timer).as_str())
+        }
+        _ => false,
+    };
     let metadata_consistent = metadata.as_ref().is_some_and(|metadata| {
         installed
             && unit_identity.as_deref() == Some(metadata.unit_identity.as_str())
             && metadata.service_unit == "omasafe-scan.service"
             && metadata.timer_unit == "omasafe-scan.timer"
+            && digest_consistent
     });
     let result = ScheduleStatusResult {
         schema: SCHEDULE_SCHEMA_VERSION,
@@ -4803,6 +4883,8 @@ fn schedule_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         installed_at: metadata_consistent.then(|| metadata.as_ref().unwrap().installed_at.clone()),
         service_unit: "omasafe-scan.service".to_owned(),
         timer_unit: "omasafe-scan.timer".to_owned(),
+        digest_installed,
+        digest_unit_identity,
         last_known_execution: installed.then(schedule_execution),
         metadata_error,
     };
@@ -4833,6 +4915,14 @@ fn schedule_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 Some(true) => "report-only scan",
                 Some(false) => "enforcement may mutate state",
                 None => "unavailable",
+            }
+        );
+        println!(
+            "Posture digest: {}",
+            if result.digest_installed {
+                "weekly timer installed"
+            } else {
+                "weekly timer unavailable"
             }
         );
         println!(
@@ -8876,6 +8966,204 @@ fn print_paths() -> Result<(), Box<dyn std::error::Error>> {
         paths.cache.display()
     );
     Ok(())
+}
+
+/// Runs the host-scoped posture engine. Posture state is deliberately stored
+/// beside (and separately from) plugin trust state; a posture report can be
+/// exported without exposing plugin identities or raw command output.
+fn posture(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let action = args.first().map(String::as_str).unwrap_or("scan");
+    if action != "scan" && action != "export" && action != "digest" {
+        if action == "hook" {
+            let hook_action = args.get(1).map(String::as_str).unwrap_or("status");
+            if args.len() > 2 {
+                return Err(
+                    "posture hook accepts install, uninstall, self-test, or status without extra arguments"
+                        .into(),
+                );
+            }
+            let paths = XdgPaths::discover()?;
+            paths.ensure_scan_roots()?;
+            match hook_action {
+                "install" => {
+                    let path = omasafe_posture::install_post_update_hook()?;
+                    println!("installed OmaSafe post-update hook at {}", path.display());
+                }
+                "self-test" => println!("{}", omasafe_posture::self_test_post_update_hook()?),
+                "uninstall" => println!(
+                    "{}",
+                    if omasafe_posture::uninstall_post_update_hook()? {
+                        "removed OmaSafe post-update hook"
+                    } else {
+                        "OmaSafe post-update hook was not installed"
+                    }
+                ),
+                "status" => {
+                    let path = omasafe_posture::hook_install_path();
+                    println!("hook: {}", path.display());
+                    println!("installed: {}", path.is_file());
+                    println!("stamp: {}", omasafe_posture::hook_stamp_path().display());
+                }
+                value => return Err(format!("unknown posture hook action: {value}").into()),
+            }
+            return Ok(());
+        }
+        return Err(
+            format!("unknown posture action: {action}; expected scan, export, or digest").into(),
+        );
+    }
+    let mut format = if action == "digest" {
+        "markdown"
+    } else {
+        "text"
+    };
+    let mut notify = false;
+    let mut index = if !args.is_empty() { 1 } else { 0 };
+    while index < args.len() {
+        match args[index].as_str() {
+            "--format" => {
+                format = next_value(args, index, "posture format")?;
+                index += 2;
+            }
+            "--notify" => {
+                notify = true;
+                index += 1;
+            }
+            value => return Err(format!("unknown posture argument: {value}").into()),
+        }
+    }
+    if !matches!(format, "text" | "json" | "markdown") {
+        return Err(format!("unsupported posture format: {format}").into());
+    }
+
+    let paths = XdgPaths::discover()?;
+    paths.ensure_scan_roots()?;
+    let report_path = paths.state.join("posture-report.json");
+    if (action == "export" || action == "digest") && !report_path.is_file() {
+        match format {
+            "json" => println!(
+                "{{\"schema\":\"omasafe.posture.v1\",\"status\":\"not_yet_run\",\"checks\":[],\"coverage\":{{\"complete\":0,\"incomplete\":0,\"errors\":0,\"not_applicable\":0,\"limitations\":[\"no posture scan has completed\"]}}}}"
+            ),
+            "markdown" => println!(
+                "# OmaSafe posture report\n\nStatus: **not yet run**. Run `omasafe-cli posture scan` to collect the first report."
+            ),
+            "text" => println!(
+                "OmaSafe posture: not yet run\nRun `omasafe-cli posture scan` to collect the first report."
+            ),
+            _ => unreachable!(),
+        }
+        return Ok(());
+    }
+    let report = if action == "scan" {
+        let report = omasafe_posture::scan();
+        let state_path = omasafe_posture::state_path(&paths);
+        let mut state = omasafe_posture::load_state(&state_path)?;
+        let notifications = omasafe_posture::update_state(&mut state, &report);
+        state.last_report_path = Some(report_path.display().to_string());
+        write_posture_json(&report_path, &report)?;
+        omasafe_posture::store_state(&state_path, &state)?;
+        if notify {
+            deliver_posture_notifications(&notifications);
+        }
+        report
+    } else {
+        if fs::metadata(&report_path)
+            .ok()
+            .is_some_and(|metadata| metadata.len() > omasafe_posture::MAX_REPORT_BYTES as u64)
+        {
+            return Err("posture report exceeds the retention limit".into());
+        }
+        let bytes = fs::read(&report_path).map_err(|error| {
+            format!(
+                "posture report is unavailable at {}: {error}",
+                report_path.display()
+            )
+        })?;
+        serde_json::from_slice::<PostureReport>(&bytes)?
+    };
+
+    match format {
+        "json" => {
+            let mut value = serde_json::to_value(&report)?;
+            value["result_age_seconds"] = serde_json::json!(posture_age_seconds(&report));
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        }
+        "markdown" => {
+            print!("{}", omasafe_posture::render_markdown(&report));
+            println!("Result age: `{}` seconds", posture_age_seconds(&report));
+        }
+        "text" => {
+            println!("OmaSafe posture ({})", report.generated_at);
+            println!("schema: {}", report.schema);
+            println!("host: {} {}", report.host.os, report.host.arch);
+            for check in &report.checks {
+                let state = serde_json::to_value(check.state)?
+                    .as_str()
+                    .unwrap_or("unknown")
+                    .to_owned();
+                let evidence = check
+                    .evidence
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("no evidence");
+                println!("{:<32} {:<16} {}", check.id, state, evidence);
+                if check.state.is_non_passing() {
+                    if let Some(limitation) = check.limitations.first() {
+                        println!("  coverage: {}", limitation);
+                    }
+                    if let Some(next_step) = &check.next_step {
+                        println!("  next: {}", next_step);
+                    }
+                }
+            }
+            println!(
+                "coverage: {} complete, {} incomplete, {} error, {} not_applicable",
+                report.coverage.complete,
+                report.coverage.incomplete,
+                report.coverage.errors,
+                report.coverage.not_applicable
+            );
+            println!("result age: {} seconds", posture_age_seconds(&report));
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
+fn posture_age_seconds(report: &PostureReport) -> u64 {
+    let observed = report.generated_at.parse::<u64>().unwrap_or(0);
+    let current = omasafe_posture::now().parse::<u64>().unwrap_or(observed);
+    current.saturating_sub(observed)
+}
+
+fn write_posture_json(
+    path: &Path,
+    report: &PostureReport,
+) -> Result<(), Box<dyn std::error::Error>> {
+    omasafe_posture::store_report(path, report)?;
+    Ok(())
+}
+
+fn deliver_posture_notifications(notifications: &[omasafe_posture::PostureNotification]) {
+    if notifications.is_empty() {
+        return;
+    }
+    let Some(path) = ["/usr/bin/notify-send", "/bin/notify-send"]
+        .iter()
+        .map(Path::new)
+        .find(|path| path.is_file())
+    else {
+        return;
+    };
+    for notification in notifications {
+        let mut command = Command::new(path);
+        command.args(["OmaSafe posture", &notification.message]);
+        command.env_clear();
+        command.env("LANG", "C");
+        command.env("LC_ALL", "C");
+        command.env("PATH", "/usr/bin:/bin");
+        let _ = omasafe_core::bounds::run_bounded(&mut command, Duration::from_secs(2));
+    }
 }
 
 fn home() -> Result<PathBuf, Box<dyn std::error::Error>> {

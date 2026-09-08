@@ -56,8 +56,10 @@ OmaSafe inventories installed Omarchy plugins, compares them with trusted
 baselines, analyzes shipped payloads and capabilities, and reports source drift
 and evidence-backed findings. The CLI also provides opt-in advisory or hardened
 lifecycle gates for reviewed updates and enables the optional Omarchy bar-widget
-plugin to consume versioned JSON reports. OmaSafe never declares a plugin safe
-or malicious.
+plugin to consume versioned JSON reports. The host-scoped posture family reports
+updates, vulnerabilities, encryption, firewall/listener coverage, kernel state,
+package inventory, and selected persistence surfaces without a universal score.
+OmaSafe never declares a plugin safe or malicious.
 .SH COMMANDS
 .TP
 .B paths
@@ -72,6 +74,20 @@ Inventory plugins and report new or outstanding findings. Exit status 3 means
 actionable findings remain. \fB--include-analysis\fR opts in to per-plugin
 analysis events (new capabilities, finding regressions, analyzer-policy
 updates, fingerprint instability); default scans stay quiet.
+.TP
+.B posture scan|export|digest [--format text|json|markdown] [--notify]
+Run or export the host-scoped \fBomasafe.posture.v1\fR report. Every check
+preserves its state, bounded evidence, tool dependency, coverage limitation, and
+read-only next step. \fBexport\fR and \fBdigest\fR never run host commands; before
+the first scan they report an explicit not-yet-run state.
+.TP
+.B posture hook install|uninstall|self-test|status
+Install or inspect the exact OmaSafe \fBpost-update\fR hook. The hook writes a
+private atomic observation stamp. \fBself-test\fR runs the installed script only
+against an isolated test stamp and verifies that production history did not
+move; a stamp records reaching that update stage, not successful completion of
+the entire Omarchy update. \fBuninstall\fR refuses to remove a file whose bytes
+are not the OmaSafe-owned script.
 .TP
 .B scan-cache show [--profile installed-basic|installed-analysis] [--validate]
 Read the CLI-owned normalized installed-scan snapshot. The default response is
@@ -181,7 +197,8 @@ Fetch and verify a pinned marketplace snapshot.
 .TP
 .B schedule install [--policy advisory|hardened]
 Install the user-level scheduled scan unit. Advisory keeps the lightweight
-drift scan; hardened explicitly includes analysis and never changes an
+drift scan and adds the daily host posture scan plus a separate weekly posture
+digest timer; hardened explicitly includes analysis and never changes an
 existing timer policy silently.
 .TP
 .B schedule uninstall

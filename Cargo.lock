@@ -255,6 +255,7 @@ dependencies = [
  "omasafe-core",
  "omasafe-marketplace",
  "omasafe-plugin-trust",
+ "omasafe-posture",
  "omasafe-report",
  "predicates",
  "serde",
@@ -293,6 +294,18 @@ dependencies = [
  "libc",
  "omasafe-core",
  "omasafe-report",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
+name = "omasafe-posture"
+version = "0.2.5"
+dependencies = [
+ "libc",
+ "omasafe-core",
  "serde",
  "serde_json",
  "sha2",

@@ -4,7 +4,7 @@ _omasafe_cli() {
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]:-}"
-    local commands="marketplace paths plugins provenance rules scan scan-cache scan-plugin schedule"
+    local commands="marketplace paths plugins posture provenance rules scan scan-cache scan-plugin schedule"
     if [[ "${COMP_CWORD}" -eq 1 ]]; then
         COMPREPLY=($(compgen -W "${commands}" -- "${cur}"))
         return

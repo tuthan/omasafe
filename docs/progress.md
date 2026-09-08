@@ -2919,6 +2919,44 @@ scripts/determinism-canary.sh                            # exit 0
 git diff --check                                         # clean
 ```
 
+## v0.3 M1–M7 — Host posture foundation and visibility
+
+Status: **implemented**
+
+Added the host-scoped `omasafe-posture` crate and CLI surface. Posture reports
+use `omasafe.posture.v1` with stable check IDs, explicit pass/regression/
+attention/informational/incomplete/not-applicable/error states, bounded
+evidence, tool inventory, coverage explanations, and read-only next steps.
+Posture tools resolve only from fixed absolute directories under a cleared
+environment; stderr is discarded and missing, denied, timed-out, truncated, or
+malformed command results stay incomplete.
+
+The shipped checks cover Arch/Omarchy context, repository and packaged or
+development-checkout updates, optional `arch-audit` advisories, root LUKS
+ancestry, firewall configuration/service/effective policy, listeners, kernel
+metadata, foreign packages, keyring, selected persistence, PATH shadowing,
+Secure Boot context, SSH applicability, integrity-profile state, and the
+OmaSafe-observed post-update hook timestamp. Development checkouts read only
+bounded local Git metadata and validate a credential-free HTTPS upstream before
+the controlled isolated-cache fetch and object comparison.
+
+`posture-state.json` records stable per-check coverage episodes. A first-run
+gap remains visible without a recurring desktop alert; a later loss notifies
+once, unchanged failures stay quiet, recovery closes the episode, and a later
+loss can notify again. `posture scan`, `posture export`, and `posture hook
+install|self-test|status` expose the report, Markdown preview, and support
+evidence paths. `schedule install` now runs the existing plugin scan and the
+daily posture scan under the same read-only service sandbox, plus a separate
+weekly posture digest timer.
+
+Verification:
+
+```text
+cargo fmt --all -- --check
+cargo test --workspace
+git diff --check
+```
+
 ## v0.2.5 — Coverage Truth and Opaque Executable Review (2026-09-08)
 
 Status: **implementation complete; release evidence and environment-dependent gates pending**

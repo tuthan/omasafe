@@ -54,8 +54,9 @@ trust layer with explicit payload coverage, opaque executable review bindings,
 bounded capability and finding reports, reviewed updates, opt-in enforcement
 controls, scan-only review of exact GitHub/marketplace candidates, and CLI-owned
 cached installed-scan hydration.
-v0.3 and later work remain on the
-[roadmap](docs/plans/README.md).
+The v0.3 posture foundation is implemented in this development tree: host-scoped
+reports, explicit coverage states, update awareness, bounded support export, and
+daily/weekly visibility are available through `omasafe-cli posture`.
 
 The [v0.2.5 implementation plan](docs/plans/v0.2.5-coverage-and-binary-review.md)
 defines the coverage, identity, opaque-code review, and hardened-policy updates.
@@ -152,6 +153,13 @@ omasafe-cli plugins override list --format json
 # Post-change drift scan across all plugins (optionally include analysis and notify only new alerts)
 omasafe-cli scan --format json --include-analysis --notify --only-new
 
+# Host-scoped posture scan and support export
+omasafe-cli posture scan --format json --notify
+omasafe-cli posture export --format markdown
+omasafe-cli posture digest
+omasafe-cli posture hook install
+omasafe-cli posture hook self-test
+
 # Inspect the CLI-owned installed-scan snapshot (validation is bounded/read-only)
 omasafe-cli scan-cache show --profile installed-analysis --format json
 omasafe-cli scan-cache show --profile installed-analysis --validate --format json
@@ -187,12 +195,16 @@ only when source identity, analyzer policy, and suppression configuration match;
 stale or oversized entries are ignored. Deleting either directory does not delete
 trust baselines, review decisions, enforcement history, or notification state.
 
-The scheduled scan is an opt-in daily systemd user timer. Advisory runs the
-lightweight report-only drift scan; hardened also includes analysis. Exit 0 means
-no actionable findings, exit 3 means findings were reported, and exit 1 means the
-scheduled scan failed. `schedule status` reports the next trigger and last outcome;
-`schedule uninstall` disables and removes only units whose OmaSafe ownership
-metadata still matches.
+The scheduled scan is an opt-in daily systemd user timer. It runs the existing
+plugin drift scan and the host posture scan under the same bounded, report-only
+sandbox, and installs a separate weekly posture-digest timer. Advisory runs the
+lightweight drift scan; hardened also includes plugin analysis. Posture keeps
+`incomplete` coverage visible in its own report and state file rather than
+treating it as a successful observation. Exit 0 means no actionable plugin
+findings, exit 3 means plugin findings were reported, and exit 1 means the
+scheduled service failed. `schedule status` reports the next trigger and last
+outcome; `schedule uninstall` disables and removes only units whose OmaSafe
+ownership metadata still matches.
 
 These directories are created privately on first use. Baselines store identities,
 digests, and decisions — never plugin file contents.
@@ -306,7 +318,7 @@ v0.2.5 delivers installed inventory, marketplace correlation, source identity,
 trust baselines, diffs, explicit payload coverage, exact opaque executable review
 bindings, bounded capability/findings reports, scoped suppressions, reviewed
 candidate updates, advisory/hardened lifecycle gates, exact expiring overrides,
-and report-only scheduled scans.
+report-only scheduled scans, and the v0.3 host posture foundation.
 
 Analysis is deliberately conservative: QML/JavaScript uses bounded
 intra-file dataflow when the parser feature is enabled; shell and Python use

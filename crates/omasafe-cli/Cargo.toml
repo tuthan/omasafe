@@ -22,6 +22,7 @@ omasafe-core = { path = "../omasafe-core" }
 omasafe-marketplace = { path = "../omasafe-marketplace" }
 omasafe-plugin-trust = { path = "../omasafe-plugin-trust" }
 omasafe-report = { path = "../omasafe-report" }
+omasafe-posture = { path = "../omasafe-posture" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

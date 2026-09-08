@@ -3,6 +3,10 @@
 paths	print XDG configuration, state, and cache paths
 provenance	[--format text|json]
 scan	[--format text|json] [--notify] [--only-new] [--include-analysis]
+posture scan	[--format text|json|markdown] [--notify]
+posture export	[--format text|json|markdown]
+posture digest	[--format text|json|markdown]
+posture hook install|uninstall|self-test|status
 scan-cache show	[--profile installed-basic|installed-analysis] [--validate] [--format text|json]
 plugins inventory	[--format text|json]
 plugins trust PLUGIN_ID	[--yes] [--expected-head VALUE] [--expected-tree VALUE] [--expected-digest VALUE] [--note TEXT]

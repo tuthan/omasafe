@@ -6,6 +6,7 @@ members = [
     "crates/omasafe-marketplace",
     "crates/omasafe-plugin-trust",
     "crates/omasafe-report",
+    "crates/omasafe-posture",
 ]
 resolver = "2"
 
