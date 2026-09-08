@@ -467,11 +467,15 @@ fn join_line_literals(line: &str) -> String {
 
 /// Quoted string literals that look like paths become reference candidates.
 fn collect_quoted_references(line: &str, number: u32, references: &mut Vec<ReferenceCandidate>) {
-    let resolved_url_values = resolved_url_argument_values(line);
+    let computed_resolved_url_values = resolved_url_computed_argument_values(line);
     for literal in line_literals(line) {
         // Decode escapes so context candidates match runtime spelling.
         let decoded = decode_js_escapes(literal);
-        if is_path_shaped(&decoded) && !resolved_url_values.iter().any(|value| value == &decoded) {
+        if is_path_shaped(&decoded)
+            && !computed_resolved_url_values
+                .iter()
+                .any(|value| value == &decoded)
+        {
             references.push(ReferenceCandidate {
                 line: number,
                 value: decoded,
@@ -653,12 +657,18 @@ fn is_resolved_url_expression(span: &str) -> bool {
     find_qt_global_calls(&code, "resolvedUrl").len() == 1 && code.trim_start().starts_with("Qt")
 }
 
-fn resolved_url_argument_values(line: &str) -> Vec<String> {
+fn resolved_url_computed_argument_values(line: &str) -> Vec<String> {
     let code = unquoted_text(line);
     find_qt_global_calls(&code, "resolvedUrl")
         .into_iter()
         .filter_map(|open| first_argument_span(line, open))
-        .flat_map(|(start, end)| span_sink_literals(&line[start..end]))
+        .filter_map(|(start, end)| {
+            let argument = &line[start..end];
+            let is_static = unquoted_text(argument).trim().is_empty()
+                && span_sink_literals(argument).len() == 1;
+            (!is_static).then(|| span_sink_literals(argument))
+        })
+        .flatten()
         .collect()
 }
 

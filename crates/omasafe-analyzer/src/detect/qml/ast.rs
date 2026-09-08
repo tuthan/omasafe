@@ -833,17 +833,25 @@ fn resolved_url_literal(source: &str, node: tree_sitter::Node) -> Option<String>
     Some(text)
 }
 
-fn is_resolved_url_argument_node(source: &str, node: tree_sitter::Node) -> bool {
-    let Some(arguments) = node.parent() else {
-        return false;
-    };
-    if arguments.kind() != "arguments" || arguments.named_child(0) != Some(node) {
-        return false;
+fn is_resolved_url_computed_argument_node(source: &str, node: tree_sitter::Node) -> bool {
+    let mut child = node;
+    let mut parent = child.parent();
+    while let Some(ancestor) = parent {
+        if ancestor.kind() == "arguments" && ancestor.named_child(0) == Some(child) {
+            let Some(call) = ancestor.parent() else {
+                return false;
+            };
+            // A literal is already a complete constant argument. Preserve it
+            // as a context reference even when the surrounding QML shape is
+            // too unusual for the stricter sink compensator to recognize.
+            // Non-literal expressions (including a literal nested in a
+            // concatenation) are the computed case that must be suppressed.
+            return is_resolved_url_call(source, call) && child.kind() != "string";
+        }
+        child = ancestor;
+        parent = child.parent();
     }
-    let Some(call) = arguments.parent() else {
-        return false;
-    };
-    is_resolved_url_call(source, call)
+    false
 }
 
 fn is_resolved_url_call(source: &str, call: tree_sitter::Node) -> bool {
@@ -892,7 +900,12 @@ fn collect_ast_references(
             "template_string" => template_plain_content(source, node),
             _ => String::new(),
         };
-        if is_path_shaped(&text) && !is_resolved_url_argument_node(source, node) {
+        // Keep a constant resolvedUrl literal as a context reference unless a
+        // recognized sink adds its stronger edge. Suppress only literals
+        // nested inside a computed resolvedUrl argument; otherwise a helper
+        // call such as `helper.load(Qt.resolvedUrl("./Helper.qml"))` would
+        // lose its invocation edge entirely.
+        if is_path_shaped(&text) && !is_resolved_url_computed_argument_node(source, node) {
             references.push(ReferenceCandidate {
                 line: number_of(node),
                 value: text,

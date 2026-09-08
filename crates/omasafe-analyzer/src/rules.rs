@@ -287,7 +287,10 @@ pub fn rule_semantic_identity(id: &str) -> Option<RuleSemanticIdentity> {
             | "oma.qml.sensitive-data-egress"
             | "oma.script.sensitive-data-egress" => 2,
             "oma.python.download-execute" => 3,
-            "oma.qml.dynamic-reference" => 2,
+            // v0.2.5 follow-up narrows resolvedUrl suppression to computed
+            // arguments and preserves constant context edges outside the
+            // modeled Loader/FileView sinks.
+            "oma.qml.dynamic-reference" => 3,
             _ => 1,
         },
         severity: definition.default_severity,

@@ -2168,12 +2168,12 @@ fn coverage_review_status(
     source_tree: Option<&str>,
     source_content_digest: Option<&str>,
 ) -> &'static str {
-    let Some(digest) = coverage.exact_sha256.as_deref() else {
-        return "digest-unavailable";
-    };
     if !coverage.opaque_review_required {
         return "not-applicable";
     }
+    let Some(digest) = coverage.exact_sha256.as_deref() else {
+        return "digest-unavailable";
+    };
     let native_format = coverage
         .native_format
         .as_deref()
@@ -5460,7 +5460,7 @@ fn executable_review_add(id: &str, args: &[String]) -> Result<(), Box<dyn std::e
         audit_event_id: format!(
             "executable-review:add:{id}:{}:{}",
             item.relative_path,
-            unix_now()
+            now_nanos()
         ),
     };
     binding
@@ -5570,7 +5570,7 @@ fn executable_review_revoke(id: &str, args: &[String]) -> Result<(), Box<dyn std
         &paths,
         &EnforcementAuditEvent {
             schema: omasafe_report::enforcement::ENFORCEMENT_AUDIT_SCHEMA_VERSION.to_owned(),
-            audit_event_id: format!("executable-review:revoke:{}:{}", id, unix_now()),
+            audit_event_id: format!("executable-review:revoke:{}:{}", id, now_nanos()),
             plugin_id: id.to_owned(),
             operation: "executable-review-revoke".to_owned(),
             attempted_at: revocation.revoked_at.clone(),
@@ -8018,6 +8018,9 @@ fn apply_review_profile(
     let payload_total = result["payload_inventory"]["entries"]
         .as_array()
         .map_or(0, Vec::len);
+    let coverage_total = result["payload_inventory"]["coverage"]
+        .as_array()
+        .map_or(0, Vec::len);
     result["payload_inventory"]["entries"] = serde_json::json!([]);
     result["payload_inventory"]["coverage"] = serde_json::json!([]);
     result["payload_inventory"]["entries_omitted"] = serde_json::json!(payload_total);
@@ -8037,6 +8040,14 @@ fn apply_review_profile(
             "total": payload_total,
             "emitted": 0,
             "omitted": payload_total,
+        }),
+    );
+    omissions.insert(
+        "coverage".into(),
+        serde_json::json!({
+            "total": coverage_total,
+            "emitted": 0,
+            "omitted": coverage_total,
         }),
     );
     omissions.insert(

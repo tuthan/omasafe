@@ -250,7 +250,6 @@ impl ExecutableReviewBinding {
             && self.source_commit.as_deref() == source_commit
             && self.source_tree.as_deref() == source_tree
             && self.source_content_digest.as_deref() == source_content_digest
-            && self.expires_at.as_str() > now
     }
 }
 

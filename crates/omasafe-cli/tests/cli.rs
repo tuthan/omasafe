@@ -5175,6 +5175,10 @@ fn candidate_scan_is_unsuppressed_and_review_profile_is_bounded() {
         result["report_profile"]["omissions"]["payload_entries"]["omitted"],
         result["payload_inventory"]["totals"]["entries"]
     );
+    assert_eq!(
+        result["report_profile"]["omissions"]["coverage"]["omitted"],
+        result["payload_inventory"]["totals"]["entries"]
+    );
     fixture
         .command()
         .args([

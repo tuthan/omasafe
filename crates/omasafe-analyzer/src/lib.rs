@@ -28,7 +28,10 @@ pub use ingest::{
     ingest_pinned_tree_at_root,
 };
 pub use omasafe_core::bounds::TimeBudget;
-pub use payload::{CoverageState, PayloadCoverage, PayloadEntry, PayloadInventory, PayloadKind};
+pub use payload::{
+    ContentClass, CoverageState, PayloadCoverage, PayloadEntry, PayloadInventory, PayloadKind,
+    content_class,
+};
 pub use policy::{policy_identity, suppression_semantic_compatible};
 pub use rules::{
     Capability, EQUIVALENCE_MAP_VERSION, Language, RULE_CATALOG_VERSION, RuleDefinition,

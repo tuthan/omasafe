@@ -177,6 +177,52 @@ fn resolved_url_constant_resolves_only_to_an_inventoried_regular_file() {
 }
 
 #[test]
+fn resolved_url_constant_in_an_unmodeled_call_keeps_context_edge() {
+    let source = r#"Item {
+    Component.onCompleted: helper.load(Qt.resolvedUrl("./Helper.qml"))
+}
+"#;
+    let (artifacts, inventory) = run(
+        vec![
+            entry("Main.qml", PayloadKind::Qml, source.len()),
+            entry("Helper.qml", PayloadKind::Qml, 1),
+        ],
+        &[("Main.qml", source.as_bytes()), ("Helper.qml", b"\n")],
+    );
+    assert!(
+        artifacts
+            .edges
+            .iter()
+            .any(|edge| edge.from_path == "Main.qml" && edge.target_path == "Helper.qml"),
+        "{artifacts:?}"
+    );
+    assert!(inventory.entries[1].invocation_target);
+}
+
+#[test]
+fn computed_resolved_url_does_not_promote_nested_literal_to_an_edge() {
+    let source = r#"Item {
+    Component.onCompleted: helper.load(Qt.resolvedUrl(root.path + "./Helper.qml"))
+}
+"#;
+    let (artifacts, inventory) = run(
+        vec![
+            entry("Main.qml", PayloadKind::Qml, source.len()),
+            entry("Helper.qml", PayloadKind::Qml, 1),
+        ],
+        &[("Main.qml", source.as_bytes()), ("Helper.qml", b"\n")],
+    );
+    assert!(
+        !artifacts
+            .edges
+            .iter()
+            .any(|edge| edge.target_path == "Helper.qml"),
+        "{artifacts:?}"
+    );
+    assert!(!inventory.entries[1].invocation_target);
+}
+
+#[test]
 fn resolved_url_missing_constant_stays_a_dynamic_reference_finding() {
     let source = r#"Item { Loader { source: Qt.resolvedUrl("./Missing.qml") } }
 "#;

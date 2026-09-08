@@ -215,6 +215,11 @@ pub struct PayloadInventory {
     /// entry shape so older Rust producers can still construct entries.
     #[serde(default)]
     pub native_architectures: BTreeMap<String, String>,
+    /// Bounded content-class facts derived from the classification prefix.
+    /// This keeps archives/WASM/bytecode typed even when their legacy
+    /// `PayloadKind` remains `DataBinary` for consumer compatibility.
+    #[serde(default)]
+    pub content_classes: BTreeMap<String, ContentClass>,
     /// Open language hints retained from the bounded classification prefix.
     /// These preserve Node/Ruby/etc. recognition without adding closed
     /// `PayloadKind` variants or claiming behavior support.
@@ -252,6 +257,7 @@ impl PayloadInventory {
                         .get(&entry.relative_path)
                         .map(String::as_str),
                     self.language_hints.get(&entry.relative_path),
+                    self.content_classes.get(&entry.relative_path),
                 )
             })
             .collect();
@@ -400,13 +406,14 @@ pub fn language_hint(path: &str, content_prefix: &[u8]) -> Option<LanguageHint> 
 
 /// Derive the additive v0.2.5 coverage row for one legacy inventory entry.
 pub fn payload_coverage(entry: &PayloadEntry) -> PayloadCoverage {
-    payload_coverage_with_metadata(entry, None, None)
+    payload_coverage_with_metadata(entry, None, None, None)
 }
 
 fn payload_coverage_with_metadata(
     entry: &PayloadEntry,
     architecture: Option<&str>,
     language_hint_override: Option<&LanguageHint>,
+    content_class_override: Option<&ContentClass>,
 ) -> PayloadCoverage {
     let native = native_format_for_kind(&entry.kind);
     let interpreted = matches!(
@@ -440,15 +447,9 @@ fn payload_coverage_with_metadata(
     } else {
         None
     };
-    let content_class = if native.is_some() {
-        ContentClass::NativeCode
-    } else if interpreted || matches!(entry.kind, PayloadKind::ExtensionlessExecutable) {
-        ContentClass::InterpretedCode
-    } else if matches!(entry.kind, PayloadKind::DataBinary) {
-        ContentClass::OrdinaryData
-    } else {
-        ContentClass::Unknown
-    };
+    let content_class = content_class_override
+        .copied()
+        .unwrap_or_else(|| content_class_for_entry(entry, native, interpreted));
     let (syntax_coverage, behavior_coverage) = match entry.kind {
         PayloadKind::Qml | PayloadKind::JavaScript => (
             if cfg!(feature = "qml-parser") {
@@ -504,6 +505,9 @@ fn payload_coverage_with_metadata(
     if entry.sampled_digest {
         classification_evidence.push("bounded-sample".to_owned());
     }
+    let unsupported_text_script_reachable = matches!(entry.kind, PayloadKind::TextFile)
+        && entry.invocation_target
+        && hint.as_ref().is_some_and(|hint| hint.language != "unknown");
     PayloadCoverage {
         relative_path: entry.relative_path.clone(),
         inventory_state: if entry.coverage_state == CoverageState::Truncated
@@ -533,9 +537,124 @@ fn payload_coverage_with_metadata(
         architecture: architecture.map(str::to_owned),
         classification_evidence,
         opaque_review_required: native.is_some()
+            || matches!(
+                content_class,
+                ContentClass::ArchiveOrContainer | ContentClass::BytecodeOrWasm
+            )
             || (matches!(entry.kind, PayloadKind::ExtensionlessExecutable)
-                && (entry.executable || entry.invocation_target)),
+                && (entry.executable || entry.invocation_target))
+            || unsupported_text_script_reachable,
     }
+}
+
+fn content_class_for_entry(
+    entry: &PayloadEntry,
+    native: Option<&str>,
+    interpreted: bool,
+) -> ContentClass {
+    let lower = entry.relative_path.to_ascii_lowercase();
+    if is_archive_or_container_path(&lower) {
+        return ContentClass::ArchiveOrContainer;
+    }
+    if is_bytecode_or_wasm_path(&lower) {
+        return ContentClass::BytecodeOrWasm;
+    }
+    if native.is_some() {
+        ContentClass::NativeCode
+    } else if interpreted || matches!(entry.kind, PayloadKind::ExtensionlessExecutable) {
+        ContentClass::InterpretedCode
+    } else if matches!(entry.kind, PayloadKind::DataBinary) {
+        ContentClass::OrdinaryData
+    } else {
+        ContentClass::Unknown
+    }
+}
+
+/// Derive a typed content class from the bounded sniff prefix and path. The
+/// legacy [`PayloadKind`] remains intentionally small; this orthogonal fact
+/// keeps containers and bytecode from being mislabeled ordinary data.
+pub fn content_class(path: &str, kind: &PayloadKind, prefix: &[u8]) -> ContentClass {
+    let lower = path.to_ascii_lowercase();
+    if is_archive_or_container_path(&lower) || archive_magic(prefix) {
+        return ContentClass::ArchiveOrContainer;
+    }
+    if is_bytecode_or_wasm_path(&lower) || bytecode_magic(prefix) {
+        return ContentClass::BytecodeOrWasm;
+    }
+    let native = native_format_for_kind(kind);
+    let interpreted = matches!(
+        kind,
+        PayloadKind::Qml | PayloadKind::JavaScript | PayloadKind::Shell | PayloadKind::Python
+    );
+    content_class_for_entry(
+        &PayloadEntry {
+            relative_path: path.to_owned(),
+            kind: kind.clone(),
+            mode: 0,
+            size: 0,
+            sha256_sampled: None,
+            sampled_digest: false,
+            executable: false,
+            coverage_state: CoverageState::Unsupported,
+            link_target: None,
+            invocation_target: false,
+            object_id: None,
+        },
+        native,
+        interpreted,
+    )
+}
+
+fn archive_magic(prefix: &[u8]) -> bool {
+    prefix.starts_with(b"PK\x03\x04")
+        || prefix.starts_with(b"7z\xbc\xaf\x27\x1c")
+        || prefix.starts_with(b"Rar!\x1a\x07")
+        || prefix.starts_with(b"\x1f\x8b")
+        || prefix.starts_with(b"BZh")
+        || prefix.starts_with(b"\xfd7zXZ\x00")
+        || prefix.starts_with(b"!<arch>\n")
+        || prefix.get(257..262) == Some(b"ustar")
+}
+
+fn bytecode_magic(prefix: &[u8]) -> bool {
+    prefix.starts_with(b"\0asm")
+        || prefix.starts_with(b"\xca\xfe\xba\xbe")
+        || prefix.starts_with(b"dex\n")
+        || prefix.starts_with(b"BC\xc0\xde")
+}
+
+fn is_archive_or_container_path(path: &str) -> bool {
+    [
+        ".appimage",
+        ".zip",
+        ".tar",
+        ".tgz",
+        ".tar.gz",
+        ".tbz",
+        ".tbz2",
+        ".tar.bz2",
+        ".txz",
+        ".tar.xz",
+        ".7z",
+        ".rar",
+        ".jar",
+        ".apk",
+        ".deb",
+        ".rpm",
+        ".iso",
+        ".cpio",
+        ".cab",
+    ]
+    .iter()
+    .any(|suffix| path.ends_with(suffix))
+}
+
+fn is_bytecode_or_wasm_path(path: &str) -> bool {
+    [
+        ".wasm", ".class", ".pyc", ".pyo", ".luac", ".beam", ".dex", ".bc",
+    ]
+    .iter()
+    .any(|suffix| path.ends_with(suffix))
 }
 
 /// Bounded native-format architecture parsing. It reads only headers already
@@ -586,8 +705,18 @@ pub fn native_architecture(kind: &PayloadKind, prefix: &[u8]) -> Option<String> 
             )
         }
         PayloadKind::PeBinary => {
-            let offset = u32::from_le_bytes(prefix.get(0x3c..0x40)?.try_into().ok()?) as usize;
-            let machine = u16::from_le_bytes(prefix.get(offset + 4..offset + 6)?.try_into().ok()?);
+            let offset = u32::from_le_bytes(
+                prefix
+                    .get(0x3c..0x40)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .unwrap_or([0, 0, 0, 0]),
+            ) as usize;
+            let machine = u16::from_le_bytes(
+                prefix
+                    .get(offset + 4..offset + 6)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .unwrap_or([0, 0]),
+            );
             Some(
                 match machine {
                     0x014c => "x86",
@@ -820,6 +949,10 @@ mod tests {
             Some("unknown".to_owned())
         );
         assert_eq!(native_architecture(&PayloadKind::TextFile, b""), None);
+        assert_eq!(
+            native_architecture(&PayloadKind::PeBinary, b"MZ"),
+            Some("unknown".to_owned())
+        );
     }
 
     #[test]
@@ -869,5 +1002,66 @@ mod tests {
         assert_eq!(hint.language, "python|ruby");
         assert_eq!(hint.confidence, "conflict");
         assert_eq!(hint.source, "extension-and-shebang");
+    }
+
+    #[test]
+    fn opaque_content_classes_do_not_fall_through_to_ordinary_data() {
+        assert_eq!(
+            content_class("module.wasm", &PayloadKind::DataBinary, b""),
+            ContentClass::BytecodeOrWasm
+        );
+        assert_eq!(
+            content_class("bundle.bin", &PayloadKind::DataBinary, b"PK\x03\x04"),
+            ContentClass::ArchiveOrContainer
+        );
+        let wasm = PayloadEntry {
+            relative_path: "module.wasm".into(),
+            kind: PayloadKind::DataBinary,
+            mode: NON_EXEC,
+            size: 4,
+            sha256_sampled: Some("a".repeat(64)),
+            sampled_digest: false,
+            executable: false,
+            coverage_state: CoverageState::Unsupported,
+            link_target: None,
+            invocation_target: false,
+            object_id: None,
+        };
+        let coverage = payload_coverage(&wasm);
+        assert_eq!(coverage.content_class, ContentClass::BytecodeOrWasm);
+        assert!(coverage.opaque_review_required);
+    }
+
+    #[test]
+    fn known_unsupported_text_script_requires_review_only_when_reachable() {
+        let mut inventory = PayloadInventory {
+            entries: vec![PayloadEntry {
+                relative_path: "helper.fish".into(),
+                kind: PayloadKind::TextFile,
+                mode: NON_EXEC,
+                size: 1,
+                sha256_sampled: Some("a".repeat(64)),
+                sampled_digest: false,
+                executable: false,
+                coverage_state: CoverageState::Unsupported,
+                link_target: None,
+                invocation_target: true,
+                object_id: None,
+            }],
+            language_hints: BTreeMap::from([(
+                "helper.fish".into(),
+                LanguageHint {
+                    language: "fish".into(),
+                    confidence: "exact".into(),
+                    source: "extension".into(),
+                },
+            )]),
+            ..Default::default()
+        };
+        inventory.refresh_coverage();
+        assert!(inventory.coverage[0].opaque_review_required);
+        inventory.entries[0].invocation_target = false;
+        inventory.refresh_coverage();
+        assert!(!inventory.coverage[0].opaque_review_required);
     }
 }

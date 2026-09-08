@@ -30,8 +30,8 @@ use omasafe_core::bounds::{
 use omasafe_core::git;
 
 use crate::payload::{
-    ContentDigester, CoverageState, LanguageHint, PayloadEntry, PayloadInventory, PayloadKind,
-    classify_regular_file, language_hint, native_architecture,
+    ContentClass, ContentDigester, CoverageState, LanguageHint, PayloadEntry, PayloadInventory,
+    PayloadKind, classify_regular_file, content_class, language_hint, native_architecture,
 };
 
 const SNIFF_WINDOW: usize = 64 * 1024;
@@ -114,6 +114,7 @@ struct Walker {
     total_bytes: u64,
     limitations: Vec<String>,
     native_architectures: std::collections::BTreeMap<String, String>,
+    content_classes: std::collections::BTreeMap<String, ContentClass>,
     language_hints: std::collections::BTreeMap<String, LanguageHint>,
 }
 
@@ -127,6 +128,7 @@ impl Walker {
             total_bytes: 0,
             limitations: Vec::new(),
             native_architectures: std::collections::BTreeMap::new(),
+            content_classes: std::collections::BTreeMap::new(),
             language_hints: std::collections::BTreeMap::new(),
         }
     }
@@ -157,6 +159,7 @@ impl Walker {
             limitations: self.limitations,
             coverage: Vec::new(),
             native_architectures: self.native_architectures,
+            content_classes: self.content_classes,
             language_hints: self.language_hints,
         };
         inventory.sort_entries();
@@ -332,6 +335,7 @@ impl Walker {
         let (digest_hex, _) = digester.finish_hex();
         let kind = classify_regular_file(relative, mode, &window);
         self.remember_native_architecture(relative, &kind, &window);
+        self.remember_content_class(relative, &kind, &window);
         self.remember_language_hint(relative, &window);
         PayloadEntry {
             kind,
@@ -391,6 +395,7 @@ impl Walker {
         let (digest_hex, _) = digester.finish_hex();
         let kind = classify_regular_file(relative, mode, &head);
         self.remember_native_architecture(relative, &kind, &head);
+        self.remember_content_class(relative, &kind, &head);
         self.remember_language_hint(relative, &head);
         PayloadEntry {
             kind,
@@ -412,6 +417,11 @@ impl Walker {
         if let Some(hint) = language_hint(relative, prefix) {
             self.language_hints.insert(relative.to_owned(), hint);
         }
+    }
+
+    fn remember_content_class(&mut self, relative: &str, kind: &PayloadKind, prefix: &[u8]) {
+        self.content_classes
+            .insert(relative.to_owned(), content_class(relative, kind, prefix));
     }
 }
 
@@ -862,6 +872,7 @@ pub fn ingest_pinned_tree_at_root(
                     let window_end = content.len().min(SNIFF_WINDOW);
                     let kind = classify_regular_file(&relative, mode, &content[..window_end]);
                     walker.remember_native_architecture(&relative, &kind, &content[..window_end]);
+                    walker.remember_content_class(&relative, &kind, &content[..window_end]);
                     walker.remember_language_hint(&relative, &content[..window_end]);
                     PayloadEntry {
                         kind,
@@ -898,6 +909,7 @@ pub fn ingest_pinned_tree_at_root(
                     let window_end = content.len().min(SNIFF_WINDOW);
                     let kind = classify_regular_file(&relative, mode, &content[..window_end]);
                     walker.remember_native_architecture(&relative, &kind, &content[..window_end]);
+                    walker.remember_content_class(&relative, &kind, &content[..window_end]);
                     walker.remember_language_hint(&relative, &content[..window_end]);
                     PayloadEntry {
                         kind,

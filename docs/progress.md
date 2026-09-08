@@ -2938,9 +2938,18 @@ Implemented:
   operator decision, and revocation audit events. Hardened enable and review-update
   paths block every missing, stale, rejected, inconclusive, or mismatched opaque
   item; legacy plugin-wide overrides cannot authorize opaque executable code.
+- Follow-up review fixes keep typed opaque blockers independent from legacy
+  unsupported-executable compatibility inputs, classify archives/AppImages and
+  WASM/bytecode as bounded opaque content, and require review for a reachable
+  unsupported text script even when its mode is 0644.
+- Constant `Qt.resolvedUrl` references outside modeled Loader/FileView sinks keep
+  their context edge while computed arguments remain suppressed; Python coverage
+  gaps now attribute parser/flow and line-oriented reverse-shell limits to their
+  distinct rule families.
 - Added `plugins executable-review list|add|revoke`, bounded full/review/summary
   report projections, report arithmetic/omission disclosure, cache invalidation
-  for review-history changes, and regenerated man/completion assets.
+  for review-history changes, coverage omission arithmetic for the cleared review
+  profile, unique nanosecond audit IDs, and regenerated man/completion assets.
 - Rolled the workspace and CLI version to 0.2.5, amended ADR-0003, updated the
   release plan/site/signing instructions, and reconfirmed the four parser-projection
   compatibility identities.
@@ -2966,7 +2975,8 @@ Release disposition: v0.2.4 was rolled forward into this 0.2.5 implementation;
 it was not released as a separate tag. Clean-VM lifecycle, package-manager,
 network-pinned corpus, native-validator parity, external scanner execution or
 upload, and GitHub/Sigstore signing gates remain environment-dependent and are
-not claimed by this local implementation record.
+not claimed by this local implementation record. Candidate review records for
+uninstalled remote revisions are explicitly deferred from this release.
 
 ## v0.2.3 — CLI-owned installed-scan caching
 

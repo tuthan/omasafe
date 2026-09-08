@@ -416,16 +416,16 @@ pub fn analyze_inventory(
         if !matches!(entry.coverage_state, CoverageState::Unsupported)
             || entry.size > MAX_FILE_BYTES
         {
+            let reason = match entry.coverage_state {
+                CoverageState::Skipped => "payload-skipped",
+                CoverageState::Truncated => "payload-truncated",
+                _ if entry.size > MAX_FILE_BYTES => "file-size-limit",
+                _ => "payload-unavailable",
+            };
             artifacts.coverage_gaps.push(CoverageGap {
-                reason: match entry.coverage_state {
-                    CoverageState::Skipped => "payload-skipped",
-                    CoverageState::Truncated => "payload-truncated",
-                    _ if entry.size > MAX_FILE_BYTES => "file-size-limit",
-                    _ => "payload-unavailable",
-                }
-                .to_owned(),
+                reason: reason.to_owned(),
                 language: payload_language(&entry.kind).to_owned(),
-                rule_ids: coverage_rule_ids(&entry.kind),
+                rule_ids: coverage_rule_ids(&entry.kind, reason),
                 relative_path: Some(entry.relative_path.clone()),
                 line: None,
                 impact: if matches!(entry.kind, PayloadKind::Python) {
@@ -445,7 +445,7 @@ pub fn analyze_inventory(
             artifacts.coverage_gaps.push(CoverageGap {
                 reason: "content-unavailable".to_owned(),
                 language: payload_language(&entry.kind).to_owned(),
-                rule_ids: coverage_rule_ids(&entry.kind),
+                rule_ids: coverage_rule_ids(&entry.kind, "content-unavailable"),
                 relative_path: Some(entry.relative_path.clone()),
                 line: None,
                 impact: "executable-or-load".to_owned(),
@@ -498,7 +498,7 @@ pub fn analyze_inventory(
             artifacts.coverage_gaps.push(CoverageGap {
                 reason: limitation.clone(),
                 language: payload_language(&entry_kind).to_owned(),
-                rule_ids: coverage_rule_ids(&entry_kind),
+                rule_ids: coverage_rule_ids(&entry_kind, limitation),
                 relative_path: Some(entry.relative_path.clone()),
                 line: None,
                 impact: if limitation.contains("parser") || limitation.contains("flow") {
@@ -718,11 +718,18 @@ fn payload_language(kind: &PayloadKind) -> &'static str {
     }
 }
 
-fn coverage_rule_ids(kind: &PayloadKind) -> Vec<String> {
+fn coverage_rule_ids(kind: &PayloadKind, reason: &str) -> Vec<String> {
     match kind {
-        // A Python coverage gap applies to every Python behavior family in
-        // the current catalog; assigning it only to download-execute would
-        // falsely suggest that the other families were fully covered.
+        // Keep the two known Python limits attributed to the family they
+        // actually weaken. A line-oriented reverse-shell limit must not be
+        // presented as a download/execute limitation (C1). A generic source
+        // or inventory loss remains broad because no family had usable input.
+        PayloadKind::Python if reason.contains("reverse-shell") => {
+            vec!["oma.python.reverse-shell".to_owned()]
+        }
+        PayloadKind::Python if reason.contains("parser") || reason.contains("flow") => {
+            vec!["oma.python.download-execute".to_owned()]
+        }
         PayloadKind::Python => vec![
             "oma.python.download-execute".to_owned(),
             "oma.python.privilege-escalation".to_owned(),

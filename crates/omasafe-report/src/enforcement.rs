@@ -8,7 +8,7 @@
 //! persistence remain CLI responsibilities.
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -306,6 +306,11 @@ impl EnforcementPolicy {
             {
                 reason_codes.push("installed-tree-postcondition-failed".to_owned());
             }
+            let opaque_paths: BTreeSet<&str> = input
+                .opaque_code_items
+                .iter()
+                .map(|item| item.relative_path.as_str())
+                .collect();
             if !input.opaque_code_items.is_empty() {
                 for item in input
                     .opaque_code_items
@@ -340,14 +345,21 @@ impl EnforcementPolicy {
                         });
                     }
                 }
-                if !blockers.is_empty() {
-                    reason_codes.push("opaque-code-review-required".to_owned());
-                }
-            } else if !input.unsupported_executable_paths.is_empty()
-                && !input.executable_digest_approved
-            {
+            }
+            if !blockers.is_empty() {
+                reason_codes.push("opaque-code-review-required".to_owned());
+            }
+            let legacy_unsupported_executables: Vec<&String> = input
+                .unsupported_executable_paths
+                .iter()
+                .filter(|path| !opaque_paths.contains(path.as_str()))
+                .collect();
+            if !legacy_unsupported_executables.is_empty() && !input.executable_digest_approved {
                 // Compatibility path for v0.2 callers that have not yet
-                // materialized typed coverage rows.
+                // materialized typed coverage rows. Paths represented by a
+                // typed opaque item are evaluated above, independently from
+                // this legacy set; one accepted review cannot clear another
+                // unsupported executable.
                 reason_codes.push("unsupported-executable".to_owned());
             }
             if !blocking_rule_ids.is_empty() {
@@ -357,18 +369,18 @@ impl EnforcementPolicy {
 
         reason_codes.sort();
         reason_codes.dedup();
-        let has_blockers = !reason_codes.is_empty();
         // Plugin-wide overrides remain a separate legacy authority. They may
         // not turn an opaque executable review requirement into a blanket
         // approval; only the exact per-file binding above can clear it.
-        let opaque_code_blocked = !blockers.is_empty();
-        let override_usable =
-            input.override_present && input.override_valid && has_blockers && !opaque_code_blocked;
         if input.override_present && !input.override_valid {
             reason_codes.push("override-expired-or-mismatched".to_owned());
             reason_codes.sort();
             reason_codes.dedup();
         }
+        let has_blockers = !reason_codes.is_empty();
+        let opaque_code_blocked = !blockers.is_empty();
+        let override_usable =
+            input.override_present && input.override_valid && has_blockers && !opaque_code_blocked;
 
         let outcome = if has_blockers && !override_usable {
             EnforcementOutcome::Block
@@ -807,6 +819,57 @@ mod tests {
             blocked
                 .reason_codes
                 .contains(&"opaque-code-review-required".to_owned())
+        );
+    }
+
+    #[test]
+    fn accepted_opaque_review_does_not_clear_unrelated_legacy_executable() {
+        let mut input = evaluation();
+        input.opaque_code_items = vec![OpaqueCodeItem {
+            plugin_id: input.plugin_id.clone(),
+            relative_path: "helper".into(),
+            native_format: "elf".into(),
+            exact_sha256: Some("a".repeat(64)),
+            digest_state: "exact".into(),
+            exposure: "known-execute-or-load".into(),
+            content_class: "native-code".into(),
+            review_required: true,
+            source_commit: None,
+            source_tree: None,
+            source_content_digest: None,
+        }];
+        input.executable_reviews = vec![ExecutableReviewBinding {
+            schema: EXECUTABLE_REVIEW_SCHEMA_VERSION.into(),
+            plugin_id: input.plugin_id.clone(),
+            relative_path: "helper".into(),
+            native_format: "elf".into(),
+            exact_sha256: "a".repeat(64),
+            source_commit: None,
+            source_tree: None,
+            source_content_digest: None,
+            review_policy_version: EXECUTABLE_REVIEW_POLICY_VERSION.into(),
+            assessment_method: AssessmentMethod::ManualBinaryReview,
+            provider: "maintainer".into(),
+            provider_version: None,
+            assessment_outcome: AssessmentOutcome::NoKnownIssue,
+            performed_at: "2026-09-01T00:00:00Z".into(),
+            report_ref: Some("ticket-1".into()),
+            report_digest: None,
+            limitations: Vec::new(),
+            operator_decision: OperatorDecision::Accepted,
+            reason: "reviewed exact bytes".into(),
+            decision_at: "2026-09-01T00:00:00Z".into(),
+            expires_at: "2099-01-01T00:00:00Z".into(),
+            audit_event_id: "review-1".into(),
+        }];
+        input.unsupported_executable_paths = vec!["helper".into(), "module.wasm".into()];
+        let decision = EnforcementPolicy::new(EnforcementMode::Hardened).evaluate(input);
+        assert_eq!(decision.outcome, EnforcementOutcome::Block);
+        assert!(decision.blockers.is_empty());
+        assert!(
+            decision
+                .reason_codes
+                .contains(&"unsupported-executable".into())
         );
     }
 
