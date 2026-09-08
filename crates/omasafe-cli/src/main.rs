@@ -9131,9 +9131,9 @@ fn posture(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn posture_age_seconds(report: &PostureReport) -> u64 {
-    let observed = report.generated_at.parse::<u64>().unwrap_or(0);
-    let current = omasafe_posture::now().parse::<u64>().unwrap_or(observed);
-    current.saturating_sub(observed)
+    let observed = omasafe_posture::timestamp_seconds(&report.generated_at).unwrap_or(0);
+    let current = omasafe_posture::timestamp_seconds(&omasafe_posture::now()).unwrap_or(observed);
+    current.saturating_sub(observed) as u64
 }
 
 fn write_posture_json(

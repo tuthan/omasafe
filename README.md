@@ -49,14 +49,16 @@ CLI commands.
 
 ## Status
 
-**v0.2.5 is the current development release** — the CLI now combines the v0.1 local
+**v0.3.0 is the current development release** — the CLI now combines the v0.1 local
 trust layer with explicit payload coverage, opaque executable review bindings,
 bounded capability and finding reports, reviewed updates, opt-in enforcement
 controls, scan-only review of exact GitHub/marketplace candidates, and CLI-owned
 cached installed-scan hydration.
-The v0.3 posture foundation is implemented in this development tree: host-scoped
-reports, explicit coverage states, update awareness, bounded support export, and
-daily/weekly visibility are available through `omasafe-cli posture`.
+The v0.3 posture foundation is partially implemented in this development tree:
+host-scoped reports, explicit coverage states, update awareness, bounded support
+export, and daily/weekly visibility are available through `omasafe-cli posture`;
+persistence baselines, time-windowed digests, provenance-rich export, benchmark
+evidence, and a posture bar indicator remain on the roadmap.
 
 The [v0.2.5 implementation plan](docs/plans/v0.2.5-coverage-and-binary-review.md)
 defines the coverage, identity, opaque-code review, and hardened-policy updates.

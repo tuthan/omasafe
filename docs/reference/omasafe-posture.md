@@ -12,6 +12,10 @@ dependencies, coverage limitations, and a read-only next step. `incomplete` and
 the state transition record. A missing optional dependency is visible in the
 report; it does not become a pass.
 
+`generated_at` and each check's `observed_at` are UTC RFC3339 seconds (`2026-09-08T00:00:00Z`).
+JSON exports add `result_age_seconds`; consumers should surface a stale report
+when that age exceeds their product freshness window.
+
 The initial catalog is version 1:
 
 | ID | Scope |
@@ -35,11 +39,25 @@ The initial catalog is version 1:
 | `packages.integrity` | Weekly integrity profile marker |
 | `updates.post_update_hook` | Last observed Omarchy post-update hook |
 
-Tools are resolved from fixed absolute directories (`/usr/bin`, `/usr/sbin`,
-`/bin`, `/sbin`) or an explicit absolute fixture directory. The inherited
-`PATH` is never used for posture tools. Child environments are cleared and
-stderr is discarded. A command that is missing, denied, timed out, truncated,
+Tools are resolved only from fixed, root-owned, non-group-writable absolute
+directories (`/usr/bin`, `/usr/sbin`, `/bin`, `/sbin`). The inherited `PATH`
+and `OMASAFE_POSTURE_TOOL_DIR` are never used for production posture tools;
+fixture adapters are test-only. Child environments are cleared and stderr is
+discarded from the report. A command that is missing, denied, timed out, truncated,
 or malformed yields `incomplete` with a bounded explanation.
+
+Repository updates run `checkupdates --nocolor` with `TMPDIR` pointing at a
+private, mode-0700 OmaSafe temporary directory. Exit-0 output is retained as a
+complete inventory. No-update exit 1/2 branches require a readable `sync/core.db`
+and a clean `pacman -Qu --dbpath <private-db>` query; empty stdout with stderr,
+missing sync metadata, or any other query failure is incomplete. Stale
+`omasafe-checkupdates-*` directories older than one hour are swept before a new
+database is created.
+
+Secure Boot is read from `bootctl status --no-pager` when `/sys/firmware/efi`
+exists. Legacy-BIOS hosts report `not_applicable`. Firewall configuration reads
+`/etc/nftables.conf` or `/etc/ufw/*`; effective nftables policy is passing only
+when a runtime base chain has both a hook and a default policy.
 
 The collected host fields are limited to OS, architecture, Omarchy path and
 version when available, running kernel, tool names/paths/versions, check
@@ -55,10 +73,12 @@ history did not move. A verified stamp is never described as completion of the
 entire Omarchy update.
 
 `posture hook uninstall` removes the hook only when its bytes still match the
-OmaSafe-owned script.
+OmaSafe-owned script. Installing the current hook also removes an exact copy
+left at the pre-v0.3 `$XDG_CONFIG_HOME/omarchy/hooks/post-update.d` path.
 
-`posture digest` renders the last completed report as a compact weekly support
-digest; it never runs host commands or changes the monitored system.
+`posture digest` renders the last completed report as a bounded support summary;
+it has no time-window or episode aggregation yet, never runs host commands, and
+does not change the monitored system.
 
 The state file `posture-state.json` retains the last check state and one active
 coverage episode per stable check ID. The first missing dependency is visible

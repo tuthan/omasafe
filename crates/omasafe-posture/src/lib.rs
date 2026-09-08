@@ -344,6 +344,30 @@ impl CommandAdapter for FixtureCommandAdapter {
                 .any(|key| key == tool || key.starts_with(&format!("{tool} "))),
         })
     }
+
+    fn execute_with_env(
+        &self,
+        tool: &str,
+        args: &[&str],
+        budget: Duration,
+        env: &[(&str, &str)],
+    ) -> Result<CommandOutput, RunnerError> {
+        let output = self.execute(tool, args, budget)?;
+        if tool == "checkupdates"
+            && matches!(output.status, Some(0..=2))
+            && !output.truncated
+            && let Some((_, tmpdir)) = env.iter().find(|(key, _)| *key == "TMPDIR")
+        {
+            let uid = unsafe { libc::geteuid() };
+            let sync = Path::new(tmpdir)
+                .join(format!("checkup-db-{uid}"))
+                .join("sync");
+            fs::create_dir_all(&sync).map_err(|error| RunnerError::Io(error.to_string()))?;
+            fs::write(sync.join("core.db"), b"fixture sync database")
+                .map_err(|error| RunnerError::Io(error.to_string()))?;
+        }
+        Ok(output)
+    }
 }
 
 fn command_key(tool: &str, args: &[&str]) -> String {
@@ -368,10 +392,81 @@ pub enum PostureError {
 }
 
 pub fn now() -> String {
-    SystemTime::now()
+    let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs().to_string())
-        .unwrap_or_else(|_| "0".to_owned())
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    format_timestamp(seconds)
+}
+
+fn format_timestamp(seconds: i64) -> String {
+    let days = seconds.div_euclid(86_400);
+    let day_seconds = seconds.rem_euclid(86_400);
+    let hour = day_seconds / 3_600;
+    let minute = (day_seconds % 3_600) / 60;
+    let second = day_seconds % 60;
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = if z >= 0 {
+        z / 146_097
+    } else {
+        (z - 146_096) / 146_097
+    };
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let month_part = (5 * doy + 2) / 153;
+    let day = doy - (153 * month_part + 2) / 5 + 1;
+    let month = month_part + if month_part < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    (year, month, day)
+}
+
+pub fn timestamp_seconds(value: &str) -> Option<i64> {
+    let value = value.strip_suffix('Z')?;
+    let (date, time) = value.split_once('T')?;
+    let mut date_parts = date.split('-');
+    let year = date_parts.next()?.parse::<i64>().ok()?;
+    let month = date_parts.next()?.parse::<i64>().ok()?;
+    let day = date_parts.next()?.parse::<i64>().ok()?;
+    if date_parts.next().is_some() {
+        return None;
+    }
+    let mut time_parts = time.split(':');
+    let hour = time_parts.next()?.parse::<i64>().ok()?;
+    let minute = time_parts.next()?.parse::<i64>().ok()?;
+    let second = time_parts.next()?.parse::<i64>().ok()?;
+    if time_parts.next().is_some()
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    Some(days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let adjusted_year = year - i64::from(month <= 2);
+    let era = if adjusted_year >= 0 {
+        adjusted_year / 400
+    } else {
+        (adjusted_year - 399) / 400
+    };
+    let year_of_era = adjusted_year - era * 400;
+    let month_from_march = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month_from_march + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 pub fn check_catalog() -> Vec<(&'static str, &'static str)> {
@@ -818,13 +913,28 @@ fn checkupdates_with_inventory<A: CommandAdapter>(
             // across pacman-contrib releases. Validate the same private DB that
             // checkupdates populated; never query the user's live system DB.
             let dbpath_text = dbpath.to_string_lossy().to_string();
+            if !private_database_is_synced(&dbpath) {
+                let _ = fs::remove_dir_all(&tmpdir);
+                return (
+                    incomplete(
+                        id,
+                        title,
+                        tool,
+                        "checkupdates did not leave a readable private sync database",
+                        "Retry after the private package database has synchronized successfully.",
+                    ),
+                    Vec::new(),
+                );
+            }
             let query = adapter.execute(
                 "pacman",
                 &["-Qu", "--dbpath", dbpath_text.as_str()],
                 Duration::from_secs(10),
             );
             let check = match query {
-                Ok(query) if !query.truncated && query.status == Some(0) => {
+                Ok(query)
+                    if !query.truncated && !query.stderr_nonempty && query.status == Some(0) =>
+                {
                     let lines = parse_lines(&query.stdout);
                     if lines.is_empty() {
                         result(
@@ -857,8 +967,11 @@ fn checkupdates_with_inventory<A: CommandAdapter>(
                         )
                     }
                 }
-                Ok(query) if !query.truncated && query.status == Some(1) && query.stdout.is_empty() =>
-                    result(
+                Ok(query)
+                    if !query.truncated
+                        && !query.stderr_nonempty
+                        && query.status == Some(1)
+                        && query.stdout.is_empty() => result(
                         id,
                         title,
                         CheckState::Pass,
@@ -1820,7 +1933,22 @@ fn path_integrity() -> CheckResult {
 }
 
 fn secure_boot<A: CommandAdapter>(adapter: &A) -> CheckResult {
+    secure_boot_with_efi(adapter, Path::new("/sys/firmware/efi").is_dir())
+}
+
+fn secure_boot_with_efi<A: CommandAdapter>(adapter: &A, efi_present: bool) -> CheckResult {
     let tool = adapter.describe("bootctl");
+    if !efi_present {
+        return result(
+            "boot.secure_boot",
+            "Secure Boot state",
+            CheckState::NotApplicable,
+            vec!["EFI firmware interface is not present on this host".to_owned()],
+            vec!["Secure Boot state is not observable on a legacy-BIOS host".to_owned()],
+            Some("Use firmware settings when diagnosing boot policy.".to_owned()),
+            Some(tool),
+        );
+    }
     match adapter.execute("bootctl", &["status", "--no-pager"], Duration::from_secs(2)) {
         Ok(output) if output.status == Some(0) => {
             let status = String::from_utf8_lossy(&output.stdout)
@@ -2024,6 +2152,32 @@ pub fn hook_install_path() -> PathBuf {
         .join(POST_UPDATE_HOOK_NAME)
 }
 
+fn legacy_hook_install_path() -> Option<PathBuf> {
+    let config = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())?;
+    let path = config
+        .join("omarchy/hooks/post-update.d")
+        .join(POST_UPDATE_HOOK_NAME);
+    (path != hook_install_path()).then_some(path)
+}
+
+fn remove_owned_legacy_hook(stamp: &Path) -> io::Result<bool> {
+    let Some(path) = legacy_hook_install_path() else {
+        return Ok(false);
+    };
+    let script = match fs::read_to_string(&path) {
+        Ok(script) => script,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if script != hook_script(stamp) {
+        return Ok(false);
+    }
+    fs::remove_file(path)?;
+    Ok(true)
+}
+
 fn require_omarchy_hook_tree() -> io::Result<()> {
     let home = env::var_os("HOME")
         .map(PathBuf::from)
@@ -2051,6 +2205,7 @@ pub fn install_post_update_hook() -> Result<PathBuf, PostureError> {
     fs::create_dir_all(parent)?;
     let script = hook_script(&stamp);
     atomic_replace(&path, script.as_bytes(), 0o755)?;
+    let _ = remove_owned_legacy_hook(&stamp)?;
     Ok(path)
 }
 
@@ -2114,19 +2269,26 @@ pub fn self_test_post_update_hook() -> Result<String, PostureError> {
 
 pub fn uninstall_post_update_hook() -> Result<bool, PostureError> {
     let path = hook_install_path();
-    let script = match fs::read_to_string(&path) {
-        Ok(script) => script,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+    let stamp = production_stamp_path();
+    let mut removed = false;
+    match fs::read_to_string(&path) {
+        Ok(script) if script == hook_script(&stamp) => {
+            fs::remove_file(path)?;
+            removed = true;
+        }
+        Ok(_) => {
+            return Err(PostureError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "refusing to remove a hook that is not the OmaSafe-owned script",
+            )));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
-    };
-    if script != hook_script(&production_stamp_path()) {
-        return Err(PostureError::Io(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "refusing to remove a hook that is not the OmaSafe-owned script",
-        )));
     }
-    fs::remove_file(path)?;
-    Ok(true)
+    if remove_owned_legacy_hook(&stamp)? {
+        removed = true;
+    }
+    Ok(removed)
 }
 
 fn production_stamp_path() -> PathBuf {
@@ -2254,7 +2416,9 @@ fn parse_lines(bytes: &[u8]) -> Vec<String> {
 }
 
 fn private_checkupdates_database() -> io::Result<(PathBuf, PathBuf)> {
-    let root = env::temp_dir().join(format!(
+    let temp_root = env::temp_dir();
+    sweep_stale_checkupdates_databases(&temp_root);
+    let root = temp_root.join(format!(
         "omasafe-checkupdates-{}-{}",
         std::process::id(),
         SystemTime::now()
@@ -2270,6 +2434,39 @@ fn private_checkupdates_database() -> io::Result<(PathBuf, PathBuf)> {
     }
     let uid = unsafe { libc::geteuid() };
     Ok((root.clone(), root.join(format!("checkup-db-{uid}"))))
+}
+
+fn private_database_is_synced(dbpath: &Path) -> bool {
+    dbpath.join("sync/core.db").is_file()
+}
+
+fn sweep_stale_checkupdates_databases(temp_root: &Path) {
+    let Ok(entries) = fs::read_dir(temp_root) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("omasafe-checkupdates-")
+        {
+            continue;
+        }
+        let Ok(metadata) = fs::metadata(&path) else {
+            continue;
+        };
+        let stale = metadata.is_dir()
+            && metadata
+                .modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_some_and(|age| age >= Duration::from_secs(60 * 60));
+        if stale {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
 }
 
 fn read_text_capped(path: &Path, max_bytes: usize) -> io::Result<String> {
@@ -2547,6 +2744,20 @@ mod tests {
     }
 
     #[test]
+    fn private_query_stderr_is_not_treated_as_current() {
+        let adapter = FixtureCommandAdapter::default()
+            .response("checkupdates", output(1, ""))
+            .response("pacman", output_with_stderr(1, ""));
+        let report = scan_with_adapter(&adapter);
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.id == "updates.repository")
+            .unwrap();
+        assert_eq!(check.state, CheckState::Incomplete);
+    }
+
+    #[test]
     fn listeners_retain_local_address_and_wildcard_port() {
         let adapter = FixtureCommandAdapter::default().response(
             "ss",
@@ -2571,8 +2782,26 @@ mod tests {
             "bootctl",
             output(0, "Systemd Boot Loader:\nSecure Boot: enabled\n"),
         );
-        let check = secure_boot(&adapter);
+        let check = secure_boot_with_efi(&adapter, true);
         assert!(check.evidence.iter().any(|line| line.contains("enabled")));
+    }
+
+    #[test]
+    fn secure_boot_is_not_applicable_without_efi() {
+        let adapter = FixtureCommandAdapter::default();
+        let check = secure_boot_with_efi(&adapter, false);
+        assert_eq!(check.state, CheckState::NotApplicable);
+    }
+
+    #[test]
+    fn report_timestamps_use_rfc3339_utc_shape() {
+        assert_eq!(format_timestamp(0), "1970-01-01T00:00:00Z");
+        assert_eq!(timestamp_seconds("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            timestamp_seconds("2026-09-08T00:00:00Z").map(format_timestamp),
+            Some("2026-09-08T00:00:00Z".to_owned())
+        );
+        assert!(now().ends_with('Z'));
     }
 
     #[test]

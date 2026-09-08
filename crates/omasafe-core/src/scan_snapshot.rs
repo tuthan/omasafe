@@ -546,7 +546,7 @@ pub fn validate_timestamp(value: &str, reject_future: bool) -> Result<(), CacheE
 
 fn producer_compatible(value: &str) -> bool {
     let mut parts = value.split('.');
-    matches!((parts.next(), parts.next(), parts.next(), parts.next()), (Some("0"), Some("2"), Some(patch), None) if !patch.is_empty() && patch.bytes().all(|byte| byte.is_ascii_digit()))
+    matches!((parts.next(), parts.next(), parts.next(), parts.next()), (Some("0"), Some("2" | "3"), Some(patch), None) if !patch.is_empty() && patch.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 fn valid_digest(value: &str) -> bool {

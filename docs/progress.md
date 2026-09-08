@@ -2952,7 +2952,9 @@ posture digest timer.
 The current M5 slice is limited to stable check IDs, coverage episodes, and
 managed daily/weekly scheduling. Persistence baselines and acknowledge/exclude
 reuse, whole-scan failure notifications, a time-windowed digest, provenance
-context in support export, and benchmark evidence remain outstanding. The
+context in support export, benchmark evidence, and a posture alert count/state
+on the bar remain outstanding. The weekly `packages.integrity` entry is an
+explicit not-applicable marker until the integrity profile is implemented. The
 plugin repository now has a Posture tab and the portable skill consumes the
 `omasafe.posture.v1` contract, but that sibling coordination is recorded as
 integration work rather than proof that M5–M7 acceptance is complete.
