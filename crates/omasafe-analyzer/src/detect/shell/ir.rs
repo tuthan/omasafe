@@ -1,6 +1,6 @@
 //! Bounded typed structure for one shell logical unit.
 //!
-//! This is the first Stage B layer from `../omasafe-docs/Cli/detect-rs-maintenance-plan.md`.
+//! This is the first Stage B layer from `docs/detect-rs-maintenance-plan.md`.
 //! Detector families consume this typed structure first; only opaque or
 //! depth-capped children retain a bounded token fallback. Compound groups
 //! remain nodes of their own instead of being mistaken for ordinary argv.

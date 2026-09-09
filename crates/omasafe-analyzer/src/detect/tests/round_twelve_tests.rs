@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// Round-12 reopen (../omasafe-docs/Cli/h3-review-round-12.md): seven P1 behavioral gaps and
+// Round-12 reopen (docs/h3-review-round-12.md): seven P1 behavioral gaps and
 // the P2 line-attribution defect, pinned at the artifact layer plus the
 // lowest responsible source-layer case.
 // ---------------------------------------------------------------------------

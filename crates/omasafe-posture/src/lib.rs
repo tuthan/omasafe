@@ -430,10 +430,11 @@ pub enum PostureError {
 /// correct; this migrates the ones that are not, so every reader sees one shape and the
 /// state file self-heals on its next write.
 fn normalize_timestamp(value: &str) -> String {
-    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
-        if let Ok(seconds) = value.parse::<i64>() {
-            return format_timestamp(seconds);
-        }
+    if !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && let Ok(seconds) = value.parse::<i64>()
+    {
+        return format_timestamp(seconds);
     }
     value.to_owned()
 }

@@ -5,7 +5,7 @@
 //! strength, and against exactly which external version and commit. The map
 //! never redefines OmaSafe severity or meaning: upstream vocabulary moving is
 //! a staleness event requiring review, not a silent semantic change
-//! (`../omasafe-docs/Cli/plans/v0.2.md` M5).
+//! (`docs/plans/v0.2.md` M5).
 
 use serde::{Deserialize, Serialize};
 
