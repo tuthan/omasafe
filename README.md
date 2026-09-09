@@ -60,7 +60,7 @@ export, and daily/weekly visibility are available through `omasafe-cli posture`;
 persistence baselines, time-windowed digests, provenance-rich export, benchmark
 evidence, and a posture bar indicator remain on the roadmap.
 
-The [v0.2.5 implementation plan](docs/plans/v0.2.5-coverage-and-binary-review.md)
+The [v0.2.5 implementation plan](../omasafe-docs/Cli/plans/v0.2.5-coverage-and-binary-review.md)
 defines the coverage, identity, opaque-code review, and hardened-policy updates.
 The shipped CLI enables bounded Python syntax-flow analysis by default; constrained
 fallback builds explicitly report `python-parser-disabled` coverage and no longer
@@ -68,8 +68,8 @@ emit the unsound same-line Python download-to-execution heuristic. See the
 [rule architecture review](docs/reviews/2026-09-06-rule-detection-clarity-review.md)
 for verified examples and residual limitations.
 
-See [`docs/brainstorm.md`](docs/brainstorm.md) for the product thesis and
-[`docs/plans/`](docs/plans/) for the release plans.
+See [`omasafe-docs/Cli/brainstorm.md`](../omasafe-docs/Cli/brainstorm.md) for the product thesis and
+[`omasafe-docs/Cli/plans/`](../omasafe-docs/Cli/plans/) for the release plans.
 
 ## CLI usage
 
@@ -247,7 +247,7 @@ and removal lifecycles.
   `./scripts/install-cli.sh --version v0.2.5`.
 
   Release signatures and detached verification instructions are in
-  [`docs/release-signing.md`](docs/release-signing.md).
+  [`omasafe-docs/Cli/release-signing.md`](../omasafe-docs/Cli/release-signing.md).
 - **UI plugin** — the standalone bar-widget lives in the
   [`omasafe-plugin`](https://github.com/tuthan/omasafe-plugin) repository, which
   carries a repository-root `manifest.json` for direct Omarchy publishing. It is
@@ -331,9 +331,9 @@ malware verdict, and the current hardened blocking-family set is empty until
 complete precision evidence exists.
 
 The v0.2 and v0.2.1 implementation records are available in
-[`docs/plans/v0.2.md`](docs/plans/v0.2.md),
-[`docs/plans/v0.2.1-hardening-implementation.md`](docs/plans/v0.2.1-hardening-implementation.md),
-and [`docs/progress.md`](docs/progress.md).
+[`omasafe-docs/Cli/plans/v0.2.md`](../omasafe-docs/Cli/plans/v0.2.md),
+[`omasafe-docs/Cli/plans/v0.2.1-hardening-implementation.md`](../omasafe-docs/Cli/plans/v0.2.1-hardening-implementation.md),
+and [`omasafe-docs/Cli/progress.md`](../omasafe-docs/Cli/progress.md).
 
 Explicit non-goals: antivirus, runtime sandboxing, EDR, a universal security
 score, a hosted reputation service, and automatic privileged remediation.

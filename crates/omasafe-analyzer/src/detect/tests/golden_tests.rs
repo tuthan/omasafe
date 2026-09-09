@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// Characterization golden (Stage A1 of docs/detect-rs-maintenance-plan.md):
+// Characterization golden (Stage A1 of ../omasafe-docs/Cli/detect-rs-maintenance-plan.md):
 // the script-fixture corpus's normalized artifacts are frozen so the Stage A
 // extraction can prove itself behavior-preserving in both feature
 // configurations.

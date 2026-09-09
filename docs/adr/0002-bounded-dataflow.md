@@ -92,6 +92,6 @@ usable for compatibility and are not silently rewritten.
 
 ## References
 
-- `docs/plans/v0.2.1-hardening-implementation.md` (H4)
+- `../../../omasafe-docs/Cli/plans/v0.2.1-hardening-implementation.md` (H4)
 - `crates/omasafe-analyzer/src/detect/qml/dataflow.rs`
 - `crates/omasafe-analyzer/src/detect/script/mod.rs`

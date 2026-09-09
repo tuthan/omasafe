@@ -110,7 +110,7 @@ QQmlSA linkage stays a future option, not a dependency.
 
 ## References
 
-- Plan: `docs/plans/v0.2-implementation.md` (S2, M3)
+- Plan: `../../../omasafe-docs/Cli/plans/v0.2-implementation.md` (S2, M3)
 - Manifest: `corpus/entry-points.json`; raw results:
   `corpus/coverage-report.json`
 - Measurement API: `omasafe-analyzer::qml`; harness:

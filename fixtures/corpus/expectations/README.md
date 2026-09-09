@@ -48,7 +48,7 @@ The independent fixture suite is described by
 
 ```text
 python3 scripts/measure-ground-truth.py \
-  --output docs/reports/h7-ground-truth.json
+  --output ../omasafe-docs/Cli/reports/h7-ground-truth.json
 ```
 
 Its detection-rate report is separate from corpus precision: fixture labels

@@ -454,7 +454,7 @@
       "detector_logic_fingerprint": "1c661f0a0adc06075f3504000275380051070225a6915842d7cb935b8382a38c",
       "feature_projection": "qml-python",
       "id": "98c0c72da42525af38bc9959edc07cb3e4acf2dda2ded169f4fd4da344ed8d24",
-      "rationale": "Codex AI-assisted re-review of the Luna xhigh fixes, grounded in docs/reviews/2026-09-07-v024-implementation-rereview.md and the passing analyzer and semantic self-tests.",
+      "rationale": "Codex AI-assisted re-review of the Luna xhigh fixes, grounded in ../omasafe-docs/Cli/reviews/2026-09-07-v024-implementation-rereview.md and the passing analyzer and semantic self-tests.",
       "reviewer": "Codex AI-assisted re-review (Luna xhigh fixes)",
       "rule_review_revisions": {
         "oma.context.omasafe-state-tamper": 1,
@@ -562,7 +562,7 @@
       "detector_logic_fingerprint": "1c661f0a0adc06075f3504000275380051070225a6915842d7cb935b8382a38c",
       "feature_projection": "qml-only",
       "id": "cc45aea64828d4f74dcfc303da1562a3778d2c04f19b4b5bc5daa54f0d94472f",
-      "rationale": "Codex AI-assisted re-review of the Luna xhigh fixes, grounded in docs/reviews/2026-09-07-v024-implementation-rereview.md and the passing analyzer and semantic self-tests.",
+      "rationale": "Codex AI-assisted re-review of the Luna xhigh fixes, grounded in ../omasafe-docs/Cli/reviews/2026-09-07-v024-implementation-rereview.md and the passing analyzer and semantic self-tests.",
       "reviewer": "Codex AI-assisted re-review (Luna xhigh fixes)",
       "rule_review_revisions": {
         "oma.context.omasafe-state-tamper": 1,
@@ -670,7 +670,7 @@
       "detector_logic_fingerprint": "1c661f0a0adc06075f3504000275380051070225a6915842d7cb935b8382a38c",
       "feature_projection": "python-only",
       "id": "bee7196300b804a06f769afe4f21dc69a43e3e970639c1123436bb4fef3c1c3f",
-      "rationale": "Codex AI-assisted re-review of the Luna xhigh fixes, grounded in docs/reviews/2026-09-07-v024-implementation-rereview.md and the passing analyzer and semantic self-tests.",
+      "rationale": "Codex AI-assisted re-review of the Luna xhigh fixes, grounded in ../omasafe-docs/Cli/reviews/2026-09-07-v024-implementation-rereview.md and the passing analyzer and semantic self-tests.",
       "reviewer": "Codex AI-assisted re-review (Luna xhigh fixes)",
       "rule_review_revisions": {
         "oma.context.omasafe-state-tamper": 1,
@@ -778,7 +778,7 @@
       "detector_logic_fingerprint": "1c661f0a0adc06075f3504000275380051070225a6915842d7cb935b8382a38c",
       "feature_projection": "lexical-only",
       "id": "0a5f71d6376efba6bec568c3380b25fbf98a801451eb7c02ce3c5afffe197c1b",
-      "rationale": "Codex AI-assisted re-review of the Luna xhigh fixes, grounded in docs/reviews/2026-09-07-v024-implementation-rereview.md and the passing analyzer and semantic self-tests.",
+      "rationale": "Codex AI-assisted re-review of the Luna xhigh fixes, grounded in ../omasafe-docs/Cli/reviews/2026-09-07-v024-implementation-rereview.md and the passing analyzer and semantic self-tests.",
       "reviewer": "Codex AI-assisted re-review (Luna xhigh fixes)",
       "rule_review_revisions": {
         "oma.context.omasafe-state-tamper": 1,

@@ -58,6 +58,6 @@ transport and dependency boundary.
 
 ## References
 
-- `docs/plans/v0.2.2-candidate-source-scan.md`
+- `../../../omasafe-docs/Cli/plans/v0.2.2-candidate-source-scan.md`
 - `crates/omasafe-core/src/source.rs`
 - `crates/omasafe-report/src/acquisition.rs`

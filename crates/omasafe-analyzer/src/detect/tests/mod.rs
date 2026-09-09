@@ -1,5 +1,5 @@
 //! Test modules for the `detect` facade, split by behavior (plan A5 of
-//! docs/detect-rs-maintenance-plan.md). The whole tree is compiled only in
+//! ../omasafe-docs/Cli/detect-rs-maintenance-plan.md). The whole tree is compiled only in
 //! test builds via the `#[cfg(test)] mod tests;` gate in `detect.rs`.
 
 mod golden_tests;
