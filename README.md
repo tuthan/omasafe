@@ -4,19 +4,26 @@
 
 # OmaSafe
 
-OmaSafe is a local trust and drift-review tool for [Omarchy](https://omarchy.org)
-community plugins. After a plugin is installed, it answers four questions on your
-own machine:
+> Know what your system can do. Catch what quietly changed.
 
-1. What exact plugin revision is installed here?
-2. Is that revision listed, verified, or the commit the marketplace actually validated?
-3. What changed since you trusted or last reviewed it?
-4. What is out of coverage and should not be read as clean?
+OmaSafe is a bounded, evidence-first review tool for [Omarchy](https://omarchy.org).
+The `omasafe-cli` is the engine: it produces versioned reports with identity,
+evidence, and coverage attached. The optional bar widget and agent skill are thin
+clients over the same commands.
 
-OmaSafe helps surface unusual patterns, risky capabilities, and source changes
-for review. It never labels a plugin safe or malicious, never executes plugin
-code, and never emits a single security score. Quiet means "no new actionable
-change," not "proven secure."
+It covers three review surfaces:
+
+- **Plugins** — exact revisions, shipped payloads, capabilities, and drift from a
+  trust baseline.
+- **Host** — encryption, firewall, updates, listeners, kernel and package state,
+  and persistence, reported as state rather than a score.
+- **Candidates** — public GitHub URLs, Git revisions, and pasted install commands
+  scanned before anything touches your shell.
+
+OmaSafe surfaces unusual patterns, risky capabilities, posture regressions, and
+source changes for review. It never labels a plugin safe or malicious, never
+executes plugin code, and runs unprivileged. A quiet report means "no new
+actionable change," not "proven secure."
 
 Why this matters: Omarchy plugins are QML + JavaScript loaded **unsandboxed, with
 full user permissions, inside the shared shell process**, installed as mutable Git
@@ -49,16 +56,17 @@ CLI commands.
 
 ## Status
 
-**v0.3.0 is the current development release** — the CLI now combines the v0.1 local
-trust layer with explicit payload coverage, opaque executable review bindings,
-bounded capability and finding reports, reviewed updates, opt-in enforcement
-controls, scan-only review of exact GitHub/marketplace candidates, and CLI-owned
-cached installed-scan hydration.
-The v0.3 posture foundation is partially implemented in this development tree:
-host-scoped reports, explicit coverage states, update awareness, bounded support
-export, and daily/weekly visibility are available through `omasafe-cli posture`;
-persistence baselines, time-windowed digests, provenance-rich export, benchmark
-evidence, and a posture bar indicator remain on the roadmap.
+**v0.3.1 is the current signed release** (2026-09-09) — the CLI combines the v0.1
+local trust layer with explicit payload coverage, opaque executable review
+bindings, bounded capability and finding reports, reviewed updates, opt-in
+enforcement controls, scan-only review of exact GitHub/marketplace candidates,
+CLI-owned cached installed-scan hydration, and the v0.3 host posture foundation.
+Posture ships host-scoped reports, explicit coverage states, update awareness,
+per-check delta fields, bounded support export, and daily/weekly visibility
+through `omasafe-cli posture`; persistence baselines, time-windowed digests,
+provenance-rich export, benchmark evidence, and a posture bar indicator remain on
+the roadmap. The paired bar widget is `io.github.tuthan.omasafe` 0.5.0 and the
+agent skill is [`omasafe-plugin-review` 1.4.0](https://github.com/tuthan/omasafe-agent-skill/releases/tag/v1.4.0).
 
 The [v0.2.5 implementation plan](../omasafe-docs/Cli/plans/v0.2.5-coverage-and-binary-review.md)
 defines the coverage, identity, opaque-code review, and hardened-policy updates.
@@ -225,34 +233,40 @@ and removal lifecycles.
   ```sh
   # Download the pinned installer, review it, then run it locally
   curl --fail --proto '=https' --tlsv1.2 --location \
-    https://raw.githubusercontent.com/tuthan/omasafe/v0.2.5/scripts/install-cli.sh \
+    https://raw.githubusercontent.com/tuthan/omasafe/v0.3.1/scripts/install-cli.sh \
     --output install-cli.sh
   less install-cli.sh
   bash install-cli.sh --version latest
 
   # Or review and run it for an exact release
   curl --fail --proto '=https' --tlsv1.2 --location \
-    https://raw.githubusercontent.com/tuthan/omasafe/v0.2.5/scripts/install-cli.sh \
+    https://raw.githubusercontent.com/tuthan/omasafe/v0.3.1/scripts/install-cli.sh \
     --output install-cli.sh
   less install-cli.sh
-  bash install-cli.sh --version v0.2.5
+  bash install-cli.sh --version v0.3.1
   ```
 
   The URL is pinned to the release tag, so the installer you review is the exact
   one that produced that release's signed assets; reviewing it locally avoids
   piping a network response directly to the shell. `latest` selects the current
-  signed release, while `v0.2.5` selects an exact signed archive. When installing
+  signed release, while `v0.3.1` selects an exact signed archive. When installing
   an exact release, pin the URL to the same tag you pass to `--version`. From a
   repository checkout, run `./scripts/install-cli.sh --version latest` or
-  `./scripts/install-cli.sh --version v0.2.5`.
+  `./scripts/install-cli.sh --version v0.3.1`.
 
   Release signatures and detached verification instructions are in
   [`omasafe-docs/Cli/release-signing.md`](../omasafe-docs/Cli/release-signing.md).
 - **UI plugin** — the standalone bar-widget lives in the
   [`omasafe-plugin`](https://github.com/tuthan/omasafe-plugin) repository, which
   carries a repository-root `manifest.json` for direct Omarchy publishing. It is
-  listed in the [Omarchy plugin marketplace](https://plugins.omarchy.org/index.html),
+  listed in the [Omarchy plugin marketplace](https://plugins.omarchy.org/plugin.html?id=io.github.tuthan.omasafe),
   whose catalog is maintained in the [marketplace repository](https://github.com/omacom/omarchy-plugin-marketplace).
+
+- **Agent skill** — the [`omasafe-agent-skill`](https://github.com/tuthan/omasafe-agent-skill)
+  repository packages `omasafe-plugin-review` for Claude Code, Codex, Cursor, and
+  OpenCode ([v1.4.0](https://github.com/tuthan/omasafe-agent-skill/releases/tag/v1.4.0)). Its offline installer copies or symlinks one canonical
+  skill directory into the host's skills path; it never installs `omasafe-cli`,
+  and the skill requires a local CLI at 0.3.0 or newer.
 
 Installing an Omarchy plugin only clones and validates the plugin checkout; it does
 **not** install native binaries or run dependency installers. If the plugin is
@@ -316,7 +330,7 @@ against a fresh VM snapshot per release.
 
 ## Scope
 
-v0.2.5 delivers installed inventory, marketplace correlation, source identity,
+v0.3.1 delivers installed inventory, marketplace correlation, source identity,
 trust baselines, diffs, explicit payload coverage, exact opaque executable review
 bindings, bounded capability/findings reports, scoped suppressions, reviewed
 candidate updates, advisory/hardened lifecycle gates, exact expiring overrides,
