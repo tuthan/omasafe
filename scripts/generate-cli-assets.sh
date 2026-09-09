@@ -19,7 +19,18 @@ package_version=$(awk -F '"' '/^version =/ {print $2; exit}' "$root_dir/Cargo.to
 if [[ -n ${SOURCE_DATE_EPOCH:-} ]]; then
   generated_date=$(date -u -d "@${SOURCE_DATE_EPOCH}" +%Y-%m-%d)
 else
-  generated_date=$(date -u +%Y-%m-%d)
+  # Generated assets are checked into the repository. Using the wall clock
+  # here makes the check fail every day even when no source changed. Preserve
+  # the existing man-page date by default; SOURCE_DATE_EPOCH remains
+  # available to callers that need an explicit reproducible build timestamp.
+  existing_date=$(sed -n \
+    's/^\.TH OMASAFE-CLI 1 "\([0-9][0-9-]*\)".*/\1/p' \
+    "$root_dir/docs/man/omasafe-cli.1" | head -n 1)
+  if [[ $existing_date =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+    generated_date=$existing_date
+  else
+    generated_date=$(date -u +%Y-%m-%d)
+  fi
 fi
 
 tmp_dir=$(mktemp -d)
