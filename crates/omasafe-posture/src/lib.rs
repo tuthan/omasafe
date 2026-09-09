@@ -7,7 +7,7 @@
 use omasafe_core::bounds::{MAX_METADATA_BYTES, run_bounded};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -67,6 +67,22 @@ pub struct CheckResult {
     pub limitations: Vec<String>,
     pub next_step: Option<String>,
     pub tool: Option<ToolObservation>,
+    /// Stable position in `check_catalog()`. The catalog order is deliberate and not
+    /// alphabetical, so without this a consumer can only sort by id and the reading
+    /// order the catalog encodes is lost at the boundary (v0.3.1 C3).
+    #[serde(default)]
+    pub catalog_index: Option<u64>,
+    /// The state this check held in the immediately preceding completed report.
+    ///
+    /// `None` on the FIRST observation of a check — not the current state, and never
+    /// omitted-as-equal. It is annotated from `PostureState::prior_states` after
+    /// `update_state()` has run; see the warning on that map (v0.3.1 C1).
+    #[serde(default)]
+    pub previous_state: Option<CheckState>,
+    /// When this check's current coverage-loss episode began, RFC-3339. `None` when the
+    /// check is not in a gap (v0.3.1 C2).
+    #[serde(default)]
+    pub gap_open_since: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -121,8 +137,22 @@ pub struct PostureState {
     pub schema_version: u64,
     pub last_report_at: Option<String>,
     pub last_report_path: Option<String>,
+    /// The states of the report that produced this file — i.e. the CURRENT states, not
+    /// the previous ones, despite the name. It exists to suppress duplicate coverage
+    /// notifications and must never be exported as `previous_state`; doing so would
+    /// make `previous_state == state` for every check and silently render zero change
+    /// marks forever. Use `prior_states` for that.
     #[serde(default)]
     pub previous_states: BTreeMap<String, CheckState>,
+    /// The state each check held in the immediately PRECEDING completed report — the
+    /// value `update_state()` displaces out of `previous_states` and used to throw
+    /// away. A check absent from this map has never been observed twice, and exports
+    /// `previous_state: null` rather than a value equal to its current state.
+    ///
+    /// `serde(default)` is the whole migration: an older state file loads with an empty
+    /// map and the first scan after the upgrade populates it.
+    #[serde(default)]
+    pub prior_states: BTreeMap<String, CheckState>,
     #[serde(default)]
     pub coverage_episodes: BTreeMap<String, CoverageEpisode>,
     #[serde(default)]
@@ -138,6 +168,7 @@ impl Default for PostureState {
             last_report_at: None,
             last_report_path: None,
             previous_states: BTreeMap::new(),
+            prior_states: BTreeMap::new(),
             coverage_episodes: BTreeMap::new(),
             last_notified_states: BTreeMap::new(),
             whole_scan_failures: 0,
@@ -391,6 +422,43 @@ pub enum PostureError {
     },
 }
 
+/// Coerce a stored timestamp to RFC-3339.
+///
+/// `CoverageEpisode::started_at` is a `String`, so the type system never caught that
+/// some episodes were written as bare unix seconds (`"1788872597"`) while `last_seen_at`
+/// beside them was RFC-3339. New episodes take `report.generated_at` and are already
+/// correct; this migrates the ones that are not, so every reader sees one shape and the
+/// state file self-heals on its next write.
+fn normalize_timestamp(value: &str) -> String {
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        if let Ok(seconds) = value.parse::<i64>() {
+            return format_timestamp(seconds);
+        }
+    }
+    value.to_owned()
+}
+
+/// Attach the fields that can only be known once `update_state` has run: the state each
+/// check held in the PRECEDING report, and when an open coverage gap began.
+///
+/// Call this after `update_state` and before the report is persisted, so `posture
+/// export` can return the stored report without consulting the state file at all.
+pub fn annotate_report(report: &mut PostureReport, state: &PostureState) {
+    for check in &mut report.checks {
+        // Absent from `prior_states` means never observed twice, which is `null` — a
+        // different claim from "unchanged".
+        check.previous_state = state.prior_states.get(&check.id).copied();
+        check.gap_open_since = if check.state.is_coverage_loss() {
+            state
+                .coverage_episodes
+                .get(&check.id)
+                .map(|episode| normalize_timestamp(&episode.started_at))
+        } else {
+            None
+        };
+    }
+}
+
 pub fn now() -> String {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -502,7 +570,14 @@ pub fn scan() -> PostureReport {
 pub fn scan_with_adapter<A: CommandAdapter>(adapter: &A) -> PostureReport {
     let generated_at = now();
     let (host, raw_omarchy_path) = discover_host(adapter);
-    let names: BTreeSet<&str> = check_catalog().iter().map(|(id, _)| *id).collect();
+    // The catalog order is deliberate and not alphabetical. The emitted array stays
+    // sorted by id — that ordering is a published shape — so the position travels as a
+    // field instead, and a consumer that wants the catalog's reading order has it.
+    let catalog_index: BTreeMap<&str, u64> = check_catalog()
+        .iter()
+        .enumerate()
+        .map(|(index, (id, _))| (*id, index as u64))
+        .collect();
     let mut checks = Vec::new();
     checks.push(check_context(&host));
     let (repository_check, repository_inventory) =
@@ -529,8 +604,11 @@ pub fn scan_with_adapter<A: CommandAdapter>(adapter: &A) -> PostureReport {
     checks.push(ssh_configuration(adapter));
     checks.push(package_integrity(adapter));
     checks.push(post_update_hook());
-    checks.retain(|check| names.contains(check.id.as_str()));
+    checks.retain(|check| catalog_index.contains_key(check.id.as_str()));
     checks.sort_by(|a, b| a.id.cmp(&b.id));
+    for check in &mut checks {
+        check.catalog_index = catalog_index.get(check.id.as_str()).copied();
+    }
     let tools = [
         "checkupdates",
         "pacman",
@@ -577,6 +655,19 @@ pub fn update_state(state: &mut PostureState, report: &PostureReport) -> Vec<Pos
     let now = report.generated_at.clone();
     for check in &report.checks {
         let prior = state.previous_states.insert(check.id.clone(), check.state);
+        // Keep the value the insert displaced. It is the state from the immediately
+        // preceding report, it is the only place that value exists, and until v0.3.1 it
+        // was used for notification suppression and then dropped on the floor.
+        match prior {
+            Some(prior) => {
+                state.prior_states.insert(check.id.clone(), prior);
+            }
+            // First observation: `previous_state` must be null, which is a different
+            // claim from "unchanged".
+            None => {
+                state.prior_states.remove(&check.id);
+            }
+        }
         if check.state.is_coverage_loss() {
             state.last_notified_states.remove(&check.id);
             let episode = state
@@ -645,6 +736,11 @@ pub fn load_state(path: &Path) -> Result<PostureState, PostureError> {
             path: path.display().to_string(),
             source,
         })?;
+    let mut state = state;
+    for episode in state.coverage_episodes.values_mut() {
+        episode.started_at = normalize_timestamp(&episode.started_at);
+        episode.last_seen_at = normalize_timestamp(&episode.last_seen_at);
+    }
     if state.schema_version != POSTURE_STATE_SCHEMA_VERSION {
         return Err(PostureError::State {
             path: path.display().to_string(),
@@ -898,7 +994,11 @@ fn checkupdates_with_inventory<A: CommandAdapter>(
                 result(
                     id,
                     title,
-                    CheckState::Regression,
+                    // Pending updates are maintenance, not a regression: nothing about
+                    // this host got worse, it is behind. `Regression` is reserved for
+                    // a defect, and now that `previous_state` carries the comparison
+                    // the word has to mean what it says (v0.3.1 D1).
+                    CheckState::Attention,
                     lines.clone(),
                     Vec::new(),
                     Some("Run `omarchy update` after reviewing the pending packages.".to_owned()),
@@ -956,7 +1056,7 @@ fn checkupdates_with_inventory<A: CommandAdapter>(
                         result(
                             id,
                             title,
-                            CheckState::Regression,
+                            CheckState::Attention,
                             lines,
                             vec![
                                 "checkupdates returned its no-update status, but the independent package query reported updates"
@@ -1040,7 +1140,10 @@ fn check_omarchy_updates<A: CommandAdapter>(
     repository_inventory: &[String],
 ) -> CheckResult {
     if raw_omarchy_path == Some(Path::new("/usr/share/omarchy")) {
-        if repository.state == CheckState::Regression {
+        // Follows `updates.repository`'s state: when that check moved from `Regression`
+        // to `Attention` (v0.3.1 D1) this gate had to move with it, or the branch that
+        // reads the validated inventory would never run again.
+        if repository.state == CheckState::Attention {
             let updates = repository_inventory
                 .iter()
                 .filter(|line| {
@@ -1063,7 +1166,7 @@ fn check_omarchy_updates<A: CommandAdapter>(
                 result(
                     "updates.omarchy",
                     "Omarchy update availability",
-                    CheckState::Regression,
+                    CheckState::Attention,
                     updates,
                     Vec::new(),
                     Some(
@@ -1251,7 +1354,8 @@ fn development_checkout<A: CommandAdapter>(adapter: &A, checkout: &Path) -> Chec
     let state = if head == upstream {
         CheckState::Pass
     } else {
-        CheckState::Regression
+        // A development checkout behind its upstream is behind, not broken (D1).
+        CheckState::Attention
     };
     result(
         "updates.omarchy",
@@ -2358,6 +2462,11 @@ fn result(
         limitations: bound_strings(limitations),
         next_step,
         tool,
+        // Annotated after the fact: `catalog_index` in `scan_with_adapter`, the other
+        // two in `annotate_report` once `update_state` has computed them.
+        catalog_index: None,
+        previous_state: None,
+        gap_open_since: None,
     }
 }
 
@@ -2685,7 +2794,8 @@ mod tests {
             .iter()
             .find(|check| check.id == "updates.repository")
             .expect("repository check");
-        assert_eq!(check.state, CheckState::Regression);
+        // Pending updates are `Attention`, not `Regression` (v0.3.1 D1).
+        assert_eq!(check.state, CheckState::Attention);
         assert!(
             check
                 .evidence
@@ -2712,7 +2822,10 @@ mod tests {
             &repository,
             &inventory,
         );
-        assert_eq!(omarchy.state, CheckState::Regression);
+        // Also asserts the gate in `check_omarchy_updates` followed the repository
+        // check's new state: if it still tested for `Regression` this branch would never
+        // run and the evidence below would be empty.
+        assert_eq!(omarchy.state, CheckState::Attention);
         assert!(omarchy.evidence.iter().any(|line| line.contains("omarchy")));
     }
 
@@ -2979,5 +3092,180 @@ mod tests {
         report.generated_at = "5".into();
         report.checks[0].state = CheckState::Regression;
         assert_eq!(update_state(&mut state, &report).len(), 1);
+    }
+
+    // ---- v0.3.1 C1/C2/C3 ------------------------------------------------------
+
+    fn one_check_report(state: CheckState, generated_at: &str) -> PostureReport {
+        PostureReport {
+            schema: POSTURE_SCHEMA_VERSION.to_owned(),
+            check_catalog_version: CHECK_CATALOG_VERSION,
+            generated_at: generated_at.to_owned(),
+            host: HostProfile::default(),
+            tools: vec![],
+            checks: vec![result(
+                "updates.repository",
+                "Repository updates",
+                state,
+                vec!["evidence".into()],
+                vec![],
+                None,
+                None,
+            )],
+            coverage: CoverageSummary::default(),
+            last_observed_post_update_hook: None,
+        }
+    }
+
+    #[test]
+    fn previous_state_is_the_preceding_report_not_the_current_one() {
+        let mut state = PostureState::default();
+        let mut report = one_check_report(CheckState::Pass, "2026-09-08T00:00:00Z");
+
+        // First observation: nothing precedes it, and `null` is the honest answer.
+        update_state(&mut state, &report);
+        annotate_report(&mut report, &state);
+        assert_eq!(report.checks[0].previous_state, None);
+
+        // Second run, changed. THIS is the assertion the whole field exists for: if
+        // `previous_states` were exported instead of `prior_states`, previous_state
+        // would come back as `Attention` — equal to the current state — and every
+        // change mark downstream would silently disappear.
+        let mut next = one_check_report(CheckState::Attention, "2026-09-09T00:00:00Z");
+        update_state(&mut state, &next);
+        annotate_report(&mut next, &state);
+        assert_eq!(next.checks[0].previous_state, Some(CheckState::Pass));
+        assert_ne!(next.checks[0].previous_state, Some(next.checks[0].state));
+    }
+
+    #[test]
+    fn an_unchanged_check_reports_a_previous_state_equal_to_its_state() {
+        // The degenerate case, reachable deliberately. It is also exactly what the
+        // `previous_states` bug would produce for EVERY check, which is why it must
+        // never be the only case covered.
+        let mut state = PostureState::default();
+        let mut first = one_check_report(CheckState::Pass, "2026-09-08T00:00:00Z");
+        update_state(&mut state, &first);
+        annotate_report(&mut first, &state);
+        let mut second = one_check_report(CheckState::Pass, "2026-09-09T00:00:00Z");
+        update_state(&mut state, &second);
+        annotate_report(&mut second, &state);
+        assert_eq!(second.checks[0].previous_state, Some(CheckState::Pass));
+        assert_eq!(second.checks[0].previous_state, Some(second.checks[0].state));
+    }
+
+    #[test]
+    fn gap_open_since_is_set_only_while_a_coverage_gap_is_open() {
+        let mut state = PostureState::default();
+        let mut open = one_check_report(CheckState::Incomplete, "2026-09-08T00:00:00Z");
+        update_state(&mut state, &open);
+        annotate_report(&mut open, &state);
+        assert_eq!(
+            open.checks[0].gap_open_since.as_deref(),
+            Some("2026-09-08T00:00:00Z")
+        );
+
+        // The episode keeps its ORIGINAL start across later reports, which is the whole
+        // point of "open N days".
+        let mut still_open = one_check_report(CheckState::Incomplete, "2026-09-14T00:00:00Z");
+        update_state(&mut state, &still_open);
+        annotate_report(&mut still_open, &state);
+        assert_eq!(
+            still_open.checks[0].gap_open_since.as_deref(),
+            Some("2026-09-08T00:00:00Z")
+        );
+
+        let mut recovered = one_check_report(CheckState::Pass, "2026-09-15T00:00:00Z");
+        update_state(&mut state, &recovered);
+        annotate_report(&mut recovered, &state);
+        assert_eq!(recovered.checks[0].gap_open_since, None);
+    }
+
+    #[test]
+    fn stored_unix_second_timestamps_are_normalized_on_load() {
+        // `started_at` was written as bare unix seconds by an earlier version while
+        // `last_seen_at` beside it was RFC-3339 — same String type, so nothing caught
+        // it. Loading migrates the value so every reader sees one shape.
+        let dir = std::env::temp_dir().join(format!("omasafe-posture-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("posture-state.json");
+        let mut state = PostureState::default();
+        state.coverage_episodes.insert(
+            "firewall.effective".to_owned(),
+            CoverageEpisode {
+                check_id: "firewall.effective".to_owned(),
+                started_at: "1788872597".to_owned(),
+                last_seen_at: "2026-09-09T05:00:15Z".to_owned(),
+                notified: false,
+                reason: "denied".to_owned(),
+            },
+        );
+        store_state(&path, &state).expect("store");
+        let loaded = load_state(&path).expect("load");
+        let episode = &loaded.coverage_episodes["firewall.effective"];
+        assert_eq!(episode.started_at, format_timestamp(1_788_872_597));
+        assert!(episode.started_at.ends_with('Z'));
+        // An already-correct value is left exactly as it was.
+        assert_eq!(episode.last_seen_at, "2026-09-09T05:00:15Z");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_check_carries_its_catalog_position() {
+        let report = scan_with_adapter(&FixtureCommandAdapter::default());
+        let catalog = check_catalog();
+        let mut seen: Vec<u64> = report
+            .checks
+            .iter()
+            .map(|check| check.catalog_index.expect("every check carries an index"))
+            .collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), report.checks.len(), "indices are unique");
+        assert!(
+            seen.iter().all(|index| (*index as usize) < catalog.len()),
+            "every index addresses a catalog entry"
+        );
+        // The index must reconstruct the catalog's own order, which is deliberate and
+        // NOT the id order the array is emitted in.
+        let by_index = {
+            let mut checks: Vec<&CheckResult> = report.checks.iter().collect();
+            checks.sort_by_key(|check| check.catalog_index);
+            checks
+                .iter()
+                .map(|check| check.id.as_str())
+                .collect::<Vec<_>>()
+        };
+        let expected: Vec<&str> = catalog
+            .iter()
+            .map(|(id, _)| *id)
+            .filter(|id| report.checks.iter().any(|check| check.id == *id))
+            .collect();
+        assert_eq!(by_index, expected);
+        assert_ne!(
+            by_index,
+            report
+                .checks
+                .iter()
+                .map(|check| check.id.as_str())
+                .collect::<Vec<_>>(),
+            "catalog order differs from the emitted id order, which is why C3 exists"
+        );
+    }
+
+    #[test]
+    fn pending_updates_are_attention_and_real_defects_stay_regression() {
+        // D1: no disk encryption was `Attention` while a pending package update was
+        // `Regression`. Maintenance and defects now sit on the right side of that line.
+        let report = scan_with_adapter(&FixtureCommandAdapter::default());
+        for id in ["updates.repository", "updates.omarchy"] {
+            if let Some(check) = report.checks.iter().find(|check| check.id == id) {
+                assert_ne!(
+                    check.state,
+                    CheckState::Regression,
+                    "{id} must not report a regression for pending maintenance"
+                );
+            }
+        }
     }
 }

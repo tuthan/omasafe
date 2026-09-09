@@ -230,7 +230,7 @@ dependencies = [
 
 [[package]]
 name = "omasafe-analyzer"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "libc",
  "omasafe-core",
@@ -247,7 +247,7 @@ dependencies = [
 
 [[package]]
 name = "omasafe-cli"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "assert_cmd",
  "libc",
@@ -266,7 +266,7 @@ dependencies = [
 
 [[package]]
 name = "omasafe-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "libc",
  "serde",
@@ -278,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "omasafe-marketplace"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "omasafe-core",
  "serde",
@@ -289,7 +289,7 @@ dependencies = [
 
 [[package]]
 name = "omasafe-plugin-trust"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "libc",
  "omasafe-core",
@@ -302,7 +302,7 @@ dependencies = [
 
 [[package]]
 name = "omasafe-posture"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "libc",
  "omasafe-core",
@@ -314,7 +314,7 @@ dependencies = [
 
 [[package]]
 name = "omasafe-report"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "serde",
  "serde_json",

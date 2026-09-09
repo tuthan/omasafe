@@ -8666,10 +8666,27 @@ fn enrich_review_summary(
     } else {
         "unknown"
     });
+    // Per-class aggregate, mirroring `findings.by_rule` (v0.3.1 C5). `total` is taken
+    // from the full pre-selection set, so it stays EXACT however much of
+    // `analysis.capabilities[]` the report profile later drops. Without it a consumer
+    // cannot tell "this class was not observed" from "this class's instances were
+    // selected away", and has to mark every unobserved class as unknown.
+    let mut by_class = serde_json::Map::new();
+    for occurrence in capabilities {
+        let row = by_class
+            .entry(occurrence.capability.clone())
+            .or_insert_with(|| serde_json::json!({"total": 0, "emitted": 0, "omitted": 0}));
+        let total = row["total"].as_u64().unwrap_or(0) + 1;
+        row["total"] = serde_json::json!(total);
+        // Nothing has been dropped at this point; `update_review_summary` recomputes
+        // these two against the emitted array when the profile trims.
+        row["emitted"] = serde_json::json!(total);
+    }
     summary["capabilities"] = serde_json::json!({
         "total": capabilities.len(),
         "emitted": capabilities.len(),
         "omitted": 0,
+        "by_class": by_class,
     });
     let mut by_reason = serde_json::Map::new();
     let mut executable_or_load_gaps = 0usize;
@@ -8713,6 +8730,10 @@ fn update_review_summary(result: &mut serde_json::Value) {
         .as_array()
         .map_or(0, Vec::len);
     let findings = result["analysis"]["findings"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let emitted_capabilities = result["analysis"]["capabilities"]
         .as_array()
         .cloned()
         .unwrap_or_default();
@@ -8818,7 +8839,26 @@ fn update_review_summary(result: &mut serde_json::Value) {
         coverage["gap_omitted"] = row["omitted"].clone();
     }
     if let Some(row) = collection_losses.get("capabilities") {
-        summary.insert("capabilities".to_owned(), row.clone());
+        // The losses row replaces the scalar counts, but `by_class` must survive it:
+        // its per-class `total` is the pre-selection figure and is the only exact
+        // per-class number in the report. Recompute emitted/omitted against what was
+        // actually emitted, the same way by_severity and by_rule are handled above.
+        let mut by_class = summary["capabilities"]["by_class"]
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        for (class, class_row) in &mut by_class {
+            let count = emitted_capabilities
+                .iter()
+                .filter(|occurrence| occurrence["capability"].as_str() == Some(class.as_str()))
+                .count() as u64;
+            let class_total = class_row["total"].as_u64().unwrap_or(count);
+            class_row["emitted"] = serde_json::json!(count);
+            class_row["omitted"] = serde_json::json!(class_total.saturating_sub(count));
+        }
+        let mut merged = row.clone();
+        merged["by_class"] = serde_json::Value::Object(by_class);
+        summary.insert("capabilities".to_owned(), merged);
     }
     summary.insert(
         "presentation_collections".to_owned(),
@@ -9055,10 +9095,14 @@ fn posture(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let report = if action == "scan" {
-        let report = omasafe_posture::scan();
+        let mut report = omasafe_posture::scan();
         let state_path = omasafe_posture::state_path(&paths);
         let mut state = omasafe_posture::load_state(&state_path)?;
         let notifications = omasafe_posture::update_state(&mut state, &report);
+        // After update_state, before the write: `prior_states` now holds the state each
+        // check had in the PRECEDING report, and the coverage episodes are current. The
+        // report carries both from here on, so `posture export` never touches state.
+        omasafe_posture::annotate_report(&mut report, &state);
         state.last_report_path = Some(report_path.display().to_string());
         write_posture_json(&report_path, &report)?;
         omasafe_posture::store_state(&state_path, &state)?;
