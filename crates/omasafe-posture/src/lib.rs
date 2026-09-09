@@ -689,20 +689,34 @@ pub fn update_state(state: &mut PostureState, report: &PostureReport) -> Vec<Pos
                     message: format!("{} coverage was lost: {}", check.title, first_reason(check)),
                 });
             }
-        } else if matches!(check.state, CheckState::Regression | CheckState::Attention) {
-            if prior.is_some() && state.last_notified_states.get(&check.id) != Some(&check.state) {
-                state
-                    .last_notified_states
-                    .insert(check.id.clone(), check.state);
-                notifications.push(PostureNotification {
-                    key: format!("state:{}:{:?}", check.id, check.state),
-                    check_id: check.id.clone(),
-                    message: format!("{} requires review", check.title),
-                });
-            }
-        } else if check.state != CheckState::Error {
+        } else {
+            // Observation RECOVERED, and the episode is over whatever state it
+            // recovered into. `Attention` and `Regression` are observations that
+            // succeeded and reported something — they are not coverage gaps.
+            //
+            // This used to clear the episode only on the third branch (pass,
+            // informational, not applicable), so `Incomplete → Attention → Incomplete`
+            // left the first episode in place and `or_insert_with` above then kept its
+            // original `started_at`. That was invisible while episodes were internal;
+            // exporting `gap_open_since` made it a wrong date on screen. It also
+            // carried `notified: true` across the recovery, so the REOPENED gap was
+            // silently not notified.
             state.coverage_episodes.remove(&check.id);
-            state.last_notified_states.remove(&check.id);
+            if matches!(check.state, CheckState::Regression | CheckState::Attention) {
+                if prior.is_some() && state.last_notified_states.get(&check.id) != Some(&check.state)
+                {
+                    state
+                        .last_notified_states
+                        .insert(check.id.clone(), check.state);
+                    notifications.push(PostureNotification {
+                        key: format!("state:{}:{:?}", check.id, check.state),
+                        check_id: check.id.clone(),
+                        message: format!("{} requires review", check.title),
+                    });
+                }
+            } else {
+                state.last_notified_states.remove(&check.id);
+            }
         }
     }
     state.last_report_at = Some(now);
@@ -3179,6 +3193,78 @@ mod tests {
         update_state(&mut state, &recovered);
         annotate_report(&mut recovered, &state);
         assert_eq!(recovered.checks[0].gap_open_since, None);
+    }
+
+    #[test]
+    fn a_reopened_coverage_gap_starts_when_it_reopened() {
+        // Incomplete -> Attention -> Incomplete. The middle report is a SUCCESSFUL
+        // observation that happened to report something, so the first gap ended there
+        // and the third report opens a new one. Inheriting the first episode's date
+        // would report a gap as nine days old when it is one day old.
+        let mut state = PostureState::default();
+
+        let mut first = one_check_report(CheckState::Incomplete, "2026-09-01T00:00:00Z");
+        update_state(&mut state, &first);
+        annotate_report(&mut first, &state);
+        assert_eq!(
+            first.checks[0].gap_open_since.as_deref(),
+            Some("2026-09-01T00:00:00Z")
+        );
+
+        let mut recovered = one_check_report(CheckState::Attention, "2026-09-02T00:00:00Z");
+        update_state(&mut state, &recovered);
+        annotate_report(&mut recovered, &state);
+        assert_eq!(recovered.checks[0].gap_open_since, None);
+        assert!(
+            !state.coverage_episodes.contains_key("updates.repository"),
+            "recovering into Attention must end the episode, not park it"
+        );
+
+        let mut reopened = one_check_report(CheckState::Incomplete, "2026-09-09T00:00:00Z");
+        let notifications = update_state(&mut state, &reopened);
+        annotate_report(&mut reopened, &state);
+        assert_eq!(
+            reopened.checks[0].gap_open_since.as_deref(),
+            Some("2026-09-09T00:00:00Z"),
+            "the reopened gap starts when it reopened, not when the first one did"
+        );
+        // The same stale episode also carried `notified: true`, which silently
+        // suppressed the notification for the reopened gap.
+        assert_eq!(notifications.len(), 1, "a reopened gap notifies again");
+    }
+
+    #[test]
+    fn recovering_into_a_passing_state_also_ends_the_episode() {
+        let mut state = PostureState::default();
+        let first = one_check_report(CheckState::Incomplete, "2026-09-01T00:00:00Z");
+        update_state(&mut state, &first);
+        let pass = one_check_report(CheckState::Pass, "2026-09-02T00:00:00Z");
+        update_state(&mut state, &pass);
+        assert!(state.coverage_episodes.is_empty());
+        let mut reopened = one_check_report(CheckState::Incomplete, "2026-09-09T00:00:00Z");
+        update_state(&mut state, &reopened);
+        annotate_report(&mut reopened, &state);
+        assert_eq!(
+            reopened.checks[0].gap_open_since.as_deref(),
+            Some("2026-09-09T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn a_continuing_gap_keeps_its_original_start() {
+        // The other half of the contract: while the gap stays open the date must NOT
+        // move, or "open N days" resets on every scan.
+        let mut state = PostureState::default();
+        let first = one_check_report(CheckState::Incomplete, "2026-09-01T00:00:00Z");
+        update_state(&mut state, &first);
+        let mut later = one_check_report(CheckState::Error, "2026-09-09T00:00:00Z");
+        update_state(&mut state, &later);
+        annotate_report(&mut later, &state);
+        assert_eq!(
+            later.checks[0].gap_open_since.as_deref(),
+            Some("2026-09-01T00:00:00Z"),
+            "Incomplete and Error are both coverage loss; the episode continues"
+        );
     }
 
     #[test]
