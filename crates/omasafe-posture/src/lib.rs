@@ -703,7 +703,8 @@ pub fn update_state(state: &mut PostureState, report: &PostureReport) -> Vec<Pos
             // silently not notified.
             state.coverage_episodes.remove(&check.id);
             if matches!(check.state, CheckState::Regression | CheckState::Attention) {
-                if prior.is_some() && state.last_notified_states.get(&check.id) != Some(&check.state)
+                if prior.is_some()
+                    && state.last_notified_states.get(&check.id) != Some(&check.state)
                 {
                     state
                         .last_notified_states
@@ -3165,7 +3166,10 @@ mod tests {
         update_state(&mut state, &second);
         annotate_report(&mut second, &state);
         assert_eq!(second.checks[0].previous_state, Some(CheckState::Pass));
-        assert_eq!(second.checks[0].previous_state, Some(second.checks[0].state));
+        assert_eq!(
+            second.checks[0].previous_state,
+            Some(second.checks[0].state)
+        );
     }
 
     #[test]
