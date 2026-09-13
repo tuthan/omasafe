@@ -56,7 +56,7 @@ CLI commands.
 
 ## Status
 
-**v0.3.1 is the current signed release** (2026-09-09) — the CLI combines the v0.1
+**v0.3.2 is the current signed release** (2026-09-13) — the CLI combines the v0.1
 local trust layer with explicit payload coverage, opaque executable review
 bindings, bounded capability and finding reports, reviewed updates, opt-in
 enforcement controls, scan-only review of exact GitHub/marketplace candidates,
@@ -65,8 +65,8 @@ Posture ships host-scoped reports, explicit coverage states, update awareness,
 per-check delta fields, bounded support export, and daily/weekly visibility
 through `omasafe-cli posture`; persistence baselines, time-windowed digests,
 provenance-rich export, benchmark evidence, and a posture bar indicator remain on
-the roadmap. The paired bar widget is `io.github.tuthan.omasafe` 0.5.0 and the
-agent skill is [`omasafe-plugin-review` 1.4.0](https://github.com/tuthan/omasafe-agent-skill/releases/tag/v1.4.0).
+the roadmap. The paired bar widget is `io.github.tuthan.omasafe` 0.5.1 and the
+agent skill is [`omasafe-plugin-review` 1.4.1](https://github.com/tuthan/omasafe-agent-skill/releases/tag/v1.4.1).
 
 The v0.3.2 implementation adds the review-only runner gate, clean Git transport
 builders, exclusive private review workspaces, and a minimal untrusted agent
@@ -240,26 +240,26 @@ and removal lifecycles.
   ```sh
   # Download the pinned installer, review it, then run it locally
   curl --fail --proto '=https' --tlsv1.2 --location \
-    https://raw.githubusercontent.com/tuthan/omasafe/v0.3.1/scripts/install-cli.sh \
+    https://raw.githubusercontent.com/tuthan/omasafe/v0.3.2/scripts/install-cli.sh \
     --output install-cli.sh
   less install-cli.sh
   bash install-cli.sh --version latest
 
   # Or review and run it for an exact release
   curl --fail --proto '=https' --tlsv1.2 --location \
-    https://raw.githubusercontent.com/tuthan/omasafe/v0.3.1/scripts/install-cli.sh \
+    https://raw.githubusercontent.com/tuthan/omasafe/v0.3.2/scripts/install-cli.sh \
     --output install-cli.sh
   less install-cli.sh
-  bash install-cli.sh --version v0.3.1
+  bash install-cli.sh --version v0.3.2
   ```
 
   The URL is pinned to the release tag, so the installer you review is the exact
   one that produced that release's signed assets; reviewing it locally avoids
   piping a network response directly to the shell. `latest` selects the current
-  signed release, while `v0.3.1` selects an exact signed archive. When installing
+  signed release, while `v0.3.2` selects an exact signed archive. When installing
   an exact release, pin the URL to the same tag you pass to `--version`. From a
   repository checkout, run `./scripts/install-cli.sh --version latest` or
-  `./scripts/install-cli.sh --version v0.3.1`.
+  `./scripts/install-cli.sh --version v0.3.2`.
 
   Release signatures and detached verification instructions are in
   [`omasafe-docs/Cli/release-signing.md`](../omasafe-docs/Cli/release-signing.md).
@@ -271,7 +271,7 @@ and removal lifecycles.
 
 - **Agent skill** — the [`omasafe-agent-skill`](https://github.com/tuthan/omasafe-agent-skill)
   repository packages `omasafe-plugin-review` for Claude Code, Codex, Cursor, and
-  OpenCode ([v1.4.0](https://github.com/tuthan/omasafe-agent-skill/releases/tag/v1.4.0)). Its offline installer copies or symlinks one canonical
+  OpenCode ([v1.4.1](https://github.com/tuthan/omasafe-agent-skill/releases/tag/v1.4.1)). Its offline installer copies or symlinks one canonical
   skill directory into the host's skills path; it never installs `omasafe-cli`,
   and the skill requires a local CLI at 0.3.2 or newer. The pinned OpenCode
   integration bundle lives under `integrations/opencode/` and is not installed
@@ -339,7 +339,7 @@ against a fresh VM snapshot per release.
 
 ## Scope
 
-v0.3.1 delivers installed inventory, marketplace correlation, source identity,
+v0.3.2 delivers installed inventory, marketplace correlation, source identity,
 trust baselines, diffs, explicit payload coverage, exact opaque executable review
 bindings, bounded capability/findings reports, scoped suppressions, reviewed
 candidate updates, advisory/hardened lifecycle gates, exact expiring overrides,
