@@ -86,50 +86,325 @@ fn interruption_checkpoint(context: &str) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-/// Removes candidate checkouts orphaned by hard deaths (SIGKILL, power loss)
-/// whose owning pid no longer exists. Live concurrent runs are never touched.
+#[derive(Debug, Clone, Copy)]
+enum ReviewWorkspaceKind {
+    Runtime,
+    CacheFallback,
+}
+
+impl ReviewWorkspaceKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Runtime => "runtime-directory",
+            Self::CacheFallback => "cache-fallback",
+        }
+    }
+}
+
 #[cfg(unix)]
-fn sweep_orphaned_review_checkouts() {
-    let prefix = "omasafe-review-update-";
-    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
-        return;
+fn current_uid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(unix)]
+fn private_directory_metadata(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<(), std::io::Error> {
+    use std::os::unix::fs::MetadataExt;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} is not a directory", path.display()),
+        ));
+    }
+    if metadata.uid() != current_uid() || metadata.permissions().mode() & 0o077 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is not owned by the current user with private permissions",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn private_directory_metadata(
+    _path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<(), std::io::Error> {
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "not a directory",
+        ))
+    }
+}
+
+/// Validate a pre-existing parent used for the cache fallback. The parent
+/// does not need mode 0700 (`~/.cache` is commonly 0755), but group/other write
+/// access would let another account pre-place the OmaSafe namespace or race a
+/// job name. Newly-created components are made private by
+/// [`ensure_workspace_components`].
+#[cfg(unix)]
+fn workspace_parent_metadata(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<(), std::io::Error> {
+    use std::os::unix::fs::MetadataExt;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} is not a directory", path.display()),
+        ));
+    }
+    if metadata.uid() != current_uid() || metadata.permissions().mode() & 0o022 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is not owned by the current user without group/other write access",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn workspace_parent_metadata(
+    _path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<(), std::io::Error> {
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "not a directory",
+        ))
+    }
+}
+
+/// Walk and create only named directory components. `create_dir` is used for
+/// each component so a symlink inserted between the check and create cannot
+/// redirect the workspace into a plugin-controlled location.
+fn ensure_workspace_components(path: &Path, leaf_private: bool) -> Result<(), std::io::Error> {
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not absolute", path.display()),
+        ));
+    }
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component);
+        let metadata = match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current)?;
+                #[cfg(unix)]
+                std::fs::set_permissions(&current, std::fs::Permissions::from_mode(0o700))?;
+                std::fs::symlink_metadata(&current)?
+            }
+            Err(error) => return Err(error),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("{} contains a symlink or non-directory", current.display()),
+            ));
+        }
+    }
+    if leaf_private {
+        let metadata = std::fs::symlink_metadata(path)?;
+        private_directory_metadata(path, &metadata)?;
+    }
+    Ok(())
+}
+
+fn review_workspace_base() -> Result<(PathBuf, ReviewWorkspaceKind), std::io::Error> {
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+        let runtime = PathBuf::from(runtime);
+        if !runtime.is_absolute() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "XDG_RUNTIME_DIR must be an absolute private directory",
+            ));
+        }
+        // A configured runtime directory must already exist and be private;
+        // silently falling back would hide an unsafe host configuration.
+        let metadata = std::fs::symlink_metadata(&runtime)?;
+        private_directory_metadata(&runtime, &metadata)?;
+        let base = runtime.join("omasafe");
+        ensure_workspace_components(&base, true)?;
+        return Ok((base, ReviewWorkspaceKind::Runtime));
+    }
+
+    let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "HOME is required for the cache fallback",
+        )
+    })?;
+    if !home.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "HOME must be absolute for the cache fallback",
+        ));
+    }
+    let cache = match std::env::var_os("XDG_CACHE_HOME") {
+        Some(cache) => {
+            let cache = PathBuf::from(cache);
+            if !cache.is_absolute() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "XDG_CACHE_HOME must be absolute for the cache fallback",
+                ));
+            }
+            cache
+        }
+        None => home.join(".cache"),
     };
-    for entry in entries.flatten() {
+    ensure_workspace_components(&cache, false)?;
+    let metadata = std::fs::symlink_metadata(&cache)?;
+    workspace_parent_metadata(&cache, &metadata)?;
+    let base = cache.join("omasafe").join("tmp");
+    ensure_workspace_components(&base, true)?;
+    Ok((base, ReviewWorkspaceKind::CacheFallback))
+}
+
+#[cfg(unix)]
+fn open_owner_lock(path: &Path) -> Result<std::fs::File, std::io::Error> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_owner_lock(path: &Path) -> Result<std::fs::File, std::io::Error> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
+fn fresh_review_job(base: &Path) -> Result<PathBuf, std::io::Error> {
+    use std::io::Read as _;
+    for _ in 0..16 {
+        let mut random = [0_u8; 16];
+        let mut source = std::fs::File::open("/dev/urandom")?;
+        source.read_exact(&mut random)?;
+        let suffix: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let path = base.join(format!("job-{suffix}"));
+        match std::fs::create_dir(&path) {
+            Ok(()) => {
+                #[cfg(unix)]
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a fresh review workspace",
+    ))
+}
+
+/// Removes only positively identified stale jobs under OmaSafe's owned base.
+/// A live owner holds LOCK_EX for its entire run; legacy/unverifiable paths are
+/// reported and left for manual cleanup.
+fn sweep_orphaned_review_checkouts(base: &Path) -> Result<(), std::io::Error> {
+    let entries = std::fs::read_dir(base)?;
+    for entry in entries {
+        let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.starts_with(prefix) {
+        if !name.starts_with("job-") {
             continue;
         }
         let dir = entry.path();
-        // A live owner holds LOCK_EX on .owner.lock for its entire run; the
-        // kernel drops that lock exactly when the owner dies. Acquiring it
-        // here therefore proves the checkout is orphaned regardless of pid
-        // reuse. Directories predating the lock scheme have no lock file and
-        // are treated as orphans.
+        let metadata = match std::fs::symlink_metadata(&dir) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if private_directory_metadata(&dir, &metadata).is_err() {
+            eprintln!(
+                "omasafe: leaving unverifiable review workspace {} for manual cleanup",
+                dir.display()
+            );
+            continue;
+        }
         let lock_path = dir.join(".owner.lock");
-        if lock_path.exists() {
-            let Ok(lock) = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&lock_path)
-            else {
-                continue;
-            };
-            #[cfg(unix)]
-            {
-                use std::os::fd::AsRawFd;
-                let result =
-                    unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-                if result != 0 {
-                    continue; // live owner
+        let lock = match std::fs::symlink_metadata(&lock_path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                match open_lock_for_sweep(&lock_path) {
+                    Ok(lock) => lock,
+                    Err(_) => continue,
                 }
             }
+            _ => {
+                eprintln!(
+                    "omasafe: leaving legacy review workspace {} for manual cleanup",
+                    dir.display()
+                );
+                continue;
+            }
+        };
+        if !try_exclusive_lock(&lock)? {
+            continue;
         }
-        let _ = std::fs::remove_dir_all(dir);
+        eprintln!("omasafe: removing stale review workspace {}", dir.display());
+        std::fs::remove_dir_all(&dir)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_lock_for_sweep(path: &Path) -> Result<std::fs::File, std::io::Error> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_lock_for_sweep(path: &Path) -> Result<std::fs::File, std::io::Error> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+}
+
+#[cfg(unix)]
+fn try_exclusive_lock(file: &std::fs::File) -> Result<bool, std::io::Error> {
+    use std::os::fd::AsRawFd;
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        Ok(true)
+    } else if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
+        Ok(false)
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 
 #[cfg(not(unix))]
-fn sweep_orphaned_review_checkouts() {}
+fn try_exclusive_lock(_file: &std::fs::File) -> Result<bool, std::io::Error> {
+    Ok(true)
+}
 
 fn run(args: Vec<String>) -> Result<i32, Box<dyn std::error::Error>> {
     let exit_code = match args.as_slice() {
@@ -450,35 +725,70 @@ fn expected_component(current: Option<&str>, expected: Option<&str>) -> bool {
 /// can distinguish a live run from an orphaned one without pid heuristics —
 /// the kernel releases the lock when (and only when) the owning process dies,
 /// which closes the pid-reuse race.
-struct TempCandidate(PathBuf, Option<std::fs::File>);
+struct TempCandidate(PathBuf, Option<std::fs::File>, Option<std::fs::File>);
 
 impl TempCandidate {
-    fn create(path: PathBuf) -> Result<Self, std::io::Error> {
-        std::fs::create_dir_all(&path)?;
-        let lock = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .create(true)
-            .open(path.join(".owner.lock"))?;
+    fn create(base: &Path) -> Result<Self, std::io::Error> {
+        let path = fresh_review_job(base)?;
+        let lock = match open_owner_lock(&path.join(".owner.lock")) {
+            Ok(lock) => lock,
+            Err(error) => {
+                let _ = std::fs::remove_dir(&path);
+                return Err(error);
+            }
+        };
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
             let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
             if result != 0 {
+                let _ = std::fs::remove_file(path.join(".owner.lock"));
+                let _ = std::fs::remove_dir(&path);
                 return Err(std::io::Error::last_os_error());
             }
         }
-        Ok(Self(path, Some(lock)))
+        #[cfg(unix)]
+        let directory = {
+            use std::os::unix::fs::OpenOptionsExt;
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&path)
+            {
+                Ok(directory) => directory,
+                Err(error) => {
+                    let _ = std::fs::remove_file(path.join(".owner.lock"));
+                    let _ = std::fs::remove_dir(&path);
+                    return Err(error);
+                }
+            }
+        };
+        #[cfg(not(unix))]
+        let directory = match std::fs::File::open(&path) {
+            Ok(directory) => directory,
+            Err(error) => {
+                let _ = std::fs::remove_file(path.join(".owner.lock"));
+                let _ = std::fs::remove_dir(&path);
+                return Err(error);
+            }
+        };
+        Ok(Self(path, Some(lock), Some(directory)))
     }
 }
 
 impl Drop for TempCandidate {
     fn drop(&mut self) {
-        // Release the ownership lock first so removal never races a sweeper
-        // that observed us as orphans mid-teardown.
+        // Close the retained directory and ownership lock before cleanup so a
+        // sweeper can never observe a half-released live job.
+        self.2.take();
         self.1.take();
-        let _ = std::fs::remove_dir_all(&self.0);
+        let removable = std::fs::symlink_metadata(&self.0)
+            .ok()
+            .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+            .unwrap_or(false);
+        if removable {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 }
 
@@ -1077,7 +1387,14 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
         );
     }
 
-    sweep_orphaned_review_checkouts();
+    let (workspace_base, workspace_kind) = review_workspace_base()
+        .map_err(|error| format!("review workspace is unavailable: {error}"))?;
+    sweep_orphaned_review_checkouts(&workspace_base)
+        .map_err(|error| format!("review workspace sweep failed: {error}"))?;
+    eprintln!(
+        "omasafe: using {} private review workspace",
+        workspace_kind.as_str()
+    );
     interruption_checkpoint("before evaluation started")?;
 
     let paths = XdgPaths::discover()?;
@@ -1264,18 +1581,18 @@ fn review_update(id: &str, args: &[String]) -> Result<(), Box<dyn std::error::Er
         .unwrap_or(false);
 
     // Materialize a working tree for validation + filesystem analysis.
-    let checkout_path = std::env::temp_dir().join(format!(
-        "omasafe-review-update-{}-{}",
-        id.replace(['/', ':', ' '], "_"),
-        std::process::id()
-    ));
-    let checkout = TempCandidate::create(checkout_path)
+    let checkout = TempCandidate::create(&workspace_base)
         .map_err(|error| format!("candidate checkout failed: {error}"))?;
     bounded_git(
         None,
         &["init", "--quiet", checkout.0.to_string_lossy().as_ref()],
     )
     .map_err(|error| format!("candidate checkout failed: {error}"))?;
+    // The offline Git builder intentionally disables template installation;
+    // keep an explicit empty hooks directory so identity collection can audit
+    // it rather than treating a missing directory as unknown coverage.
+    fs::create_dir(checkout.0.join(".git/hooks"))
+        .map_err(|error| format!("candidate checkout hooks directory failed: {error}"))?;
     bounded_git(
         Some(&checkout.0),
         &[
@@ -2743,7 +3060,14 @@ fn override_audit_event(
 /// Bounded argv-only local git invocation with scrubbed config, returning
 /// trimmed stdout on success.
 fn bounded_git(dir: Option<&Path>, args: &[&str]) -> Result<String, String> {
-    let mut command = omasafe_core::git::command();
+    // The CLI's bounded helper is used for local state and supervisor-owned
+    // cache transfers. Remote acquisition goes through the analyzer's
+    // HTTPS-specific builder; a local fetch never gains network protocols.
+    let mut command = if args.first().copied() == Some("fetch") {
+        omasafe_core::git::private_local()
+    } else {
+        omasafe_core::git::offline()
+    };
     command.args(args.to_vec());
     if let Some(dir) = dir {
         command.current_dir(dir);
@@ -6946,6 +7270,7 @@ fn scan_plugin(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     }
 
     let paths = XdgPaths::discover()?;
+    paths.ensure_cache()?;
     let cache_root = paths.cache.join("analysis");
     let (url, resolved_revision, mut acquisition, selected_plugin_id) = if let Some(request) =
         request
@@ -7593,11 +7918,9 @@ fn pinned_git_reader(
             return None;
         }
         let oid = entry.object_id.as_deref()?;
-        let mut command = std::process::Command::new("git");
+        let mut command = omasafe_core::git::offline();
         command.current_dir(&repository_dir);
         command.args(["cat-file", "blob", oid]);
-        command.env("GIT_CONFIG_GLOBAL", "/dev/null");
-        command.env("GIT_CONFIG_SYSTEM", "/dev/null");
         let captured = omasafe_core::bounds::run_bounded_capped(
             &mut command,
             omasafe_core::bounds::GIT_PROCESS_BUDGET,

@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "suite": "h8b-blocking-admission",
+  "precisionThreshold": 1.0,
+  "fixtureDetectionThreshold": 1.0,
+  "dispositionLedger": "fixtures/corpus/expectations/dispositions.jsonl",
+  "triagedDispositionCount": 8,
+  "groundTruth": {
+    "report": "docs/reports/h7-ground-truth.json",
+    "fixtures": 11,
+    "passed": true
+  },
+  "blockingEligible": [],
+  "blockingRuleFamilies": []
+}

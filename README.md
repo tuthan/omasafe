@@ -68,6 +68,13 @@ provenance-rich export, benchmark evidence, and a posture bar indicator remain o
 the roadmap. The paired bar widget is `io.github.tuthan.omasafe` 0.5.0 and the
 agent skill is [`omasafe-plugin-review` 1.4.0](https://github.com/tuthan/omasafe-agent-skill/releases/tag/v1.4.0).
 
+The v0.3.2 implementation adds the review-only runner gate, clean Git transport
+builders, exclusive private review workspaces, and a minimal untrusted agent
+projection. It is not an OS sandbox, does not ship a prompt-injection detector,
+does not provide a hard aggregate fetch-storage quota, and does not extend host
+permission enforcement beyond the pinned OpenCode integration that is verified
+separately.
+
 The [v0.2.5 implementation plan](../omasafe-docs/Cli/plans/v0.2.5-coverage-and-binary-review.md)
 defines the coverage, identity, opaque-code review, and hardened-policy updates.
 The shipped CLI enables bounded Python syntax-flow analysis by default; constrained
@@ -266,7 +273,9 @@ and removal lifecycles.
   repository packages `omasafe-plugin-review` for Claude Code, Codex, Cursor, and
   OpenCode ([v1.4.0](https://github.com/tuthan/omasafe-agent-skill/releases/tag/v1.4.0)). Its offline installer copies or symlinks one canonical
   skill directory into the host's skills path; it never installs `omasafe-cli`,
-  and the skill requires a local CLI at 0.3.0 or newer.
+  and the skill requires a local CLI at 0.3.2 or newer. The pinned OpenCode
+  integration bundle lives under `integrations/opencode/` and is not installed
+  into a user's host configuration automatically.
 
 Installing an Omarchy plugin only clones and validates the plugin checkout; it does
 **not** install native binaries or run dependency installers. If the plugin is
@@ -349,13 +358,20 @@ The v0.2 and v0.2.1 implementation records are available in
 [`omasafe-docs/Cli/plans/v0.2.1-hardening-implementation.md`](../omasafe-docs/Cli/plans/v0.2.1-hardening-implementation.md),
 and [`omasafe-docs/Cli/progress.md`](../omasafe-docs/Cli/progress.md).
 
-Explicit non-goals: antivirus, runtime sandboxing, EDR, a universal security
-score, a hosted reputation service, and automatic privileged remediation.
+Explicit non-goals: antivirus, sandboxing the runtime of installed Omarchy
+plugins, EDR, a universal security score, a hosted reputation service, and
+automatic privileged remediation. Containment of OmaSafe's own scanner processes
+is separate, planned work; the current CLI does not provide that OS boundary.
 
 The v0.2.2 candidate route resolves one exact Git commit, reads raw Git
 objects, and never installs, enables, trusts, or suppresses a candidate. The
 review report is bounded and records any omissions; it is analysis evidence,
 not an approval or a safety verdict.
+
+The v0.3.2 review-only runner refuses lifecycle mutations before invoking the
+CLI. Its OpenCode adapter runs from a trusted owner-private directory and
+passes only typed, immutable review selectors; source text and scanner inputs
+remain untrusted, and no OS containment is provided.
 
 ## License
 

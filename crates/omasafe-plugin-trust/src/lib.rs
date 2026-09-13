@@ -1020,6 +1020,64 @@ const NATIVE_OUTPUT_CAP: usize = 64 * 1024;
 fn run_omarchy(args: &[&str]) -> NativeCommand {
     let mut command = Command::new("omarchy");
     command.args(args.to_vec());
+    // The native updater needs the user's normal desktop environment, so it
+    // cannot use the fully scrubbed environment used by direct OmaSafe Git
+    // builders. Remove the Git variables that can redirect repositories,
+    // object stores, helpers, config, or startup programs before setting the
+    // small fixed Git policy below. This keeps a poisoned parent environment
+    // from changing which repository or executable Git consumes during the
+    // delegated lifecycle operation.
+    for key in [
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_KEY_1",
+        "GIT_CONFIG_KEY_2",
+        "GIT_CONFIG_KEY_3",
+        "GIT_CONFIG_KEY_4",
+        "GIT_CONFIG_KEY_5",
+        "GIT_CONFIG_KEY_6",
+        "GIT_CONFIG_KEY_7",
+        "GIT_CONFIG_KEY_8",
+        "GIT_CONFIG_KEY_9",
+        "GIT_CONFIG_VALUE_0",
+        "GIT_CONFIG_VALUE_1",
+        "GIT_CONFIG_VALUE_2",
+        "GIT_CONFIG_VALUE_3",
+        "GIT_CONFIG_VALUE_4",
+        "GIT_CONFIG_VALUE_5",
+        "GIT_CONFIG_VALUE_6",
+        "GIT_CONFIG_VALUE_7",
+        "GIT_CONFIG_VALUE_8",
+        "GIT_CONFIG_VALUE_9",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_SSH_COMMAND",
+        "GIT_SSH",
+        "GIT_PROXY_COMMAND",
+        "GIT_EXEC_PATH",
+        "GIT_TEMPLATE_DIR",
+        "GIT_ASKPASS",
+        "SSH_ASKPASS",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "NODE_OPTIONS",
+        "RUBYOPT",
+        "PERL5OPT",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+    ] {
+        command.env_remove(key);
+    }
     // Inherited Git hardening for the native updater's own git children
     // (fetch/merge run hooks and honor .git/config directives):
     // - system/global/user config neutralized, so nothing outside the
@@ -1038,6 +1096,7 @@ fn run_omarchy(args: &[&str]) -> NativeCommand {
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_EXEC_PATH", "/usr/lib/git-core")
         .env("GIT_ALLOW_PROTOCOL", "file:git:http:https:ssh")
         // Mirror every command-level hardening setting from
         // omasafe_core::git::command(), plus an empty credential.helper that

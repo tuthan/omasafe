@@ -56,8 +56,17 @@ database is created.
 
 Secure Boot is read from `bootctl status --no-pager` when `/sys/firmware/efi`
 exists. Legacy-BIOS hosts report `not_applicable`. Firewall configuration reads
-`/etc/nftables.conf` or `/etc/ufw/*`; effective nftables policy is passing only
-when a runtime base chain has both a hook and a default policy.
+`/etc/nftables.conf` or `/etc/ufw/*`. Effective nftables policy passes when a
+runtime base chain has both a hook and a default policy. When direct nftables
+inspection is unavailable, an active UFW policy is also accepted when `ufw
+status` reports `Status: active`, or when UFW is enabled, `ufw.service` is
+active, and a generated UFW policy file is readable. The latter result carries
+a limitation stating that effectiveness was inferred from UFW activation and
+policy files rather than a live netfilter dump. The firewall service check names
+the active owner and flags a host where both `nftables.service` and
+`ufw.service` are active at the same time; a readable inactive
+`/etc/nftables.conf` is reported as reference configuration rather than the
+active firewall policy.
 
 The collected host fields are limited to OS, architecture, Omarchy path and
 version when available, running kernel, tool names/paths/versions, check

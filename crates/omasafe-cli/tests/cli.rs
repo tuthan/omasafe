@@ -47,6 +47,7 @@ impl Fixture {
             .env("XDG_CONFIG_HOME", self.config.path())
             .env("XDG_STATE_HOME", self.state.path())
             .env("XDG_CACHE_HOME", self.cache.path())
+            .env_remove("XDG_RUNTIME_DIR")
             .env("PATH", self.bin.path());
         command
     }
@@ -3501,15 +3502,19 @@ impl UpdateFixture {
         fs::create_dir_all(&analysis_cache).unwrap();
         let cache_repo = analysis_cache.join(format!("{slug}.git"));
         fs::create_dir_all(&cache_repo).unwrap();
-        init_repo(&cache_repo, true);
+        run_git(&cache_repo, &["init", "--quiet", "--bare"]);
         run_git(
             &cache_repo,
             &[
-                "remote",
-                "add",
-                "origin",
+                "fetch",
+                "--quiet",
                 origin.path().to_string_lossy().as_ref(),
+                &candidate,
             ],
+        );
+        run_git(
+            &cache_repo,
+            &["remote", "add", "origin", "https://plugins.test/cli.git"],
         );
 
         let fake = FakeOmarchy::install(fixture.bin.path(), fixture.state.path());
@@ -3530,6 +3535,40 @@ impl UpdateFixture {
     }
 
     fn review_update(&self, extra_args: &[&str]) -> (Vec<u8>, Vec<u8>, Option<i32>) {
+        // The production cache is supervisor-owned and may already contain
+        // objects fetched from the validated HTTPS origin. Keep this fixture
+        // deterministic without weakening that origin check: refresh only
+        // the disposable test cache from its local bare origin, then leave
+        // the cache's configured origin HTTPS-shaped.
+        let digest = Sha256::digest("https://plugins.test/cli.git".as_bytes());
+        let slug: String = digest
+            .iter()
+            .take(8)
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let cache_repo = self
+            .fixture
+            .cache
+            .path()
+            .join(format!("omasafe/analysis/{slug}.git"));
+        let _ = run_git(
+            &cache_repo,
+            &[
+                "fetch",
+                "--quiet",
+                self.origin.path().to_string_lossy().as_ref(),
+                "refs/heads/main",
+            ],
+        );
+        let _ = run_git(
+            &cache_repo,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://plugins.test/cli.git",
+            ],
+        );
         let output = self
             .fixture
             .command()
@@ -3555,6 +3594,25 @@ impl UpdateFixture {
                 "OMASAFE_FAKE_FS_MONITOR_MARKER",
                 self.fixture.state.path().join("raced-fsmonitor-ran"),
             )
+            // Poison the parent environment in every native-update fixture.
+            // The updater must remove these Git selectors before delegating;
+            // otherwise even a literal `git -C` in the fake would be
+            // redirected to an attacker-chosen repository or helper.
+            .env("GIT_CONFIG_PARAMETERS", "'core.hooksPath=/tmp/evil'")
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+            .env("GIT_CONFIG_VALUE_0", "/tmp/evil")
+            .env("GIT_DIR", "/tmp/evil-git")
+            .env("GIT_WORK_TREE", "/tmp/evil-tree")
+            .env("GIT_COMMON_DIR", "/tmp/evil-common")
+            .env("GIT_INDEX_FILE", "/tmp/evil-index")
+            .env("GIT_OBJECT_DIRECTORY", "/tmp/evil-objects")
+            .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", "/tmp/evil-alternates")
+            .env("GIT_SSH_COMMAND", "/tmp/evil-ssh")
+            .env("GIT_PROXY_COMMAND", "/tmp/evil-proxy")
+            .env("GIT_EXEC_PATH", "/tmp/evil-git-core")
+            .env("LD_PRELOAD", "/tmp/evil.so")
+            .env("NODE_OPTIONS", "--require=/tmp/evil.js")
             .env("OMASAFE_DEBUG_REVIEW", "1")
             .args(["plugins", "review-update", "io.example.cli"])
             .args(extra_args)
@@ -4843,6 +4901,7 @@ fn review_update_sigint_during_native_update_fails_closed_with_exit_130() {
         .env("XDG_CONFIG_HOME", fixture.config.path())
         .env("XDG_STATE_HOME", fixture.state.path())
         .env("XDG_CACHE_HOME", fixture.cache.path())
+        .env_remove("XDG_RUNTIME_DIR")
         .env("PATH", fixture.bin.path())
         .env("OMASAFE_FAKE_STATE", &update.fake.state_path)
         .env("OMASAFE_FAKE_LOG", &update.fake.log_path)
@@ -5053,25 +5112,99 @@ fn panel_data_contract_pins_the_json_sections_the_ui_consumes() {
 #[test]
 #[cfg(unix)]
 fn review_update_sweeps_orphaned_checkouts_from_dead_pids() {
-    // Simulate a SIGKILLed earlier run by creating its temp checkout naming
-    // pattern with a pid that cannot exist; the next run must remove it.
+    use std::os::unix::fs::PermissionsExt;
+
+    // Simulate a SIGKILLed earlier run by creating a private job with an
+    // unlocked owner file; the next run must remove only that identified job.
     let update = UpdateFixture::new();
-    // Unique middle segment keeps concurrent test runs from colliding; the
-    // parser only reads the pid after the last '-'.
-    let dead_dir = std::env::temp_dir().join(format!(
-        "omasafe-review-update-x{}-4000000",
+    let workspace = update.fixture.cache.path().join("omasafe/tmp");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::set_permissions(&workspace, fs::Permissions::from_mode(0o700)).unwrap();
+    let dead_dir = workspace.join(format!(
+        "job-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .subsec_nanos()
+            .as_nanos()
     ));
     let _ = fs::remove_dir_all(&dead_dir);
-    fs::create_dir_all(dead_dir.join("leftover")).unwrap();
+    fs::create_dir_all(&dead_dir).unwrap();
+    fs::set_permissions(&dead_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(dead_dir.join(".owner.lock"), b"").unwrap();
 
     // Any invocation sweeps before its own outcome; this one still fails on
     // the missing trusted baseline afterwards.
     update.review_update(&[]);
     assert!(!dead_dir.exists(), "orphaned checkout was not swept");
+}
+
+#[test]
+#[cfg(unix)]
+fn review_update_rejects_a_nonabsolute_runtime_directory() {
+    let update = UpdateFixture::new();
+    let output = update
+        .fixture
+        .command()
+        .env("XDG_RUNTIME_DIR", "relative-runtime")
+        .args(["plugins", "review-update", "io.example.cli"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        text.contains("XDG_RUNTIME_DIR must be an absolute private directory"),
+        "{text}"
+    );
+    assert!(!update.fake.log_contains("plugin update"));
+}
+
+#[test]
+#[cfg(unix)]
+fn review_update_rejects_a_symlinked_runtime_workspace_base() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let update = UpdateFixture::new();
+    let runtime = tempfile::tempdir().unwrap();
+    fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), runtime.path().join("omasafe")).unwrap();
+    let output = update
+        .fixture
+        .command()
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .args(["plugins", "review-update", "io.example.cli"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        text.contains("contains a symlink or non-directory"),
+        "{text}"
+    );
+    assert!(!update.fake.log_contains("plugin update"));
+}
+
+#[test]
+#[cfg(unix)]
+fn review_update_rejects_a_group_or_other_writable_cache_fallback() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let update = UpdateFixture::new();
+    fs::set_permissions(
+        update.fixture.cache.path(),
+        fs::Permissions::from_mode(0o777),
+    )
+    .unwrap();
+    let output = update
+        .fixture
+        .command()
+        .args(["plugins", "review-update", "io.example.cli"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert!(text.contains("without group/other write access"), "{text}");
+    assert!(!update.fake.log_contains("plugin update"));
 }
 
 #[test]
@@ -5310,6 +5443,10 @@ fn marketplace_candidate_scan_uses_verified_listing_and_exact_cached_commit() {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     clone(&candidate_work, &analysis_cache.join(format!("{slug}.git")));
+    git(
+        &["remote", "set-url", "origin", effective_url],
+        &analysis_cache.join(format!("{slug}.git")),
+    );
 
     let output = fixture
         .command()

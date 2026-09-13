@@ -488,6 +488,20 @@ fn oversize_repo_blobs_become_skipped_entries_instead_of_aborting() {
         ],
         guard_temp.path(),
     );
+    // Force a highly-compressible blob into a pack so this fixture exercises
+    // the high-ratio pack-expansion boundary rather than only loose-object
+    // reads. The analyzer must sample the declared size without expanding the
+    // full payload into its bounded buffers.
+    git(&["repack", "-ad", "--quiet"], &bare);
+    let packed_bytes: u64 = fs::read_dir(bare.join("objects/pack"))
+        .unwrap()
+        .map(|entry| entry.unwrap().metadata().unwrap().len())
+        .sum();
+    assert!(
+        packed_bytes < big.len() as u64 / 100,
+        "fixture should have a high pack expansion ratio: {packed_bytes} packed bytes for {} source bytes",
+        big.len()
+    );
 
     let limits = Limits {
         max_file_bytes: 1024 * 1024,

@@ -604,7 +604,11 @@ fn run_git(directory: &Path, args: &[&str]) -> Result<(), Error> {
 }
 
 fn run_git_output(directory: &Path, args: &[&str]) -> Result<Vec<u8>, Error> {
-    let mut command = git_command();
+    let mut command = if args.first().copied() == Some("fetch") {
+        omasafe_core::git::remote_https()
+    } else {
+        omasafe_core::git::offline()
+    };
     command.args(args).current_dir(directory);
     let output = run_bounded_capped(
         &mut command,

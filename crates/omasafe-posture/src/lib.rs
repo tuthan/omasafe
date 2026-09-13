@@ -1656,6 +1656,8 @@ fn root_luks<A: CommandAdapter>(adapter: &A) -> CheckResult {
 fn firewall_configuration<A: CommandAdapter>(adapter: &A) -> CheckResult {
     let nft = adapter.describe("nft");
     let ufw = adapter.describe("ufw");
+    let nft_service = firewall_unit_state(adapter, "nftables.service");
+    let ufw_service = firewall_unit_state(adapter, "ufw.service");
     let nft_config = read_text_capped(Path::new("/etc/nftables.conf"), MAX_METADATA_BYTES).ok();
     let ufw_config = [
         "/etc/ufw/ufw.conf",
@@ -1675,10 +1677,24 @@ fn firewall_configuration<A: CommandAdapter>(adapter: &A) -> CheckResult {
     }
     let mut evidence = Vec::new();
     if nft_config.is_some() {
-        evidence.push("/etc/nftables.conf is readable".to_owned());
+        evidence.push(
+            match nft_service {
+                Some(true) => "nftables configuration is readable and nftables.service is active",
+                Some(false) => "/etc/nftables.conf is readable, but nftables.service is not active",
+                None => "/etc/nftables.conf is readable; nftables.service state is unavailable",
+            }
+            .to_owned(),
+        );
     }
     if ufw_config.is_some() {
-        evidence.push("an /etc/ufw configuration file is readable".to_owned());
+        evidence.push(
+            match ufw_service {
+                Some(true) => "UFW configuration is readable and ufw.service is active",
+                Some(false) => "/etc/ufw configuration is readable, but ufw.service is not active",
+                None => "/etc/ufw configuration is readable; ufw.service state is unavailable",
+            }
+            .to_owned(),
+        );
     }
     result(
         "firewall.configuration",
@@ -1687,25 +1703,20 @@ fn firewall_configuration<A: CommandAdapter>(adapter: &A) -> CheckResult {
         evidence,
         Vec::new(),
         Some("Review the active firewall configuration if listeners change.".to_owned()),
-        Some(if nft_config.is_some() { nft } else { ufw }),
+        Some(match (nft_service, ufw_service) {
+            (_, Some(true)) => ufw,
+            (Some(true), _) => nft,
+            _ if nft_config.is_some() => nft,
+            _ => ufw,
+        }),
     )
 }
 
 fn firewall_service<A: CommandAdapter>(adapter: &A) -> CheckResult {
     let tool = adapter.describe("systemctl");
-    let nft = adapter.execute(
-        "systemctl",
-        &["is-active", "nftables.service"],
-        Duration::from_secs(2),
-    );
-    let ufw = adapter.execute(
-        "systemctl",
-        &["is-active", "ufw.service"],
-        Duration::from_secs(2),
-    );
-    let active = nft.as_ref().is_ok_and(|output| output.status == Some(0))
-        || ufw.as_ref().is_ok_and(|output| output.status == Some(0));
-    if nft.is_err() && ufw.is_err() {
+    let nft = firewall_unit_state(adapter, "nftables.service");
+    let ufw = firewall_unit_state(adapter, "ufw.service");
+    if nft.is_none() && ufw.is_none() {
         return incomplete(
             "firewall.service",
             "Firewall service state",
@@ -1714,24 +1725,69 @@ fn firewall_service<A: CommandAdapter>(adapter: &A) -> CheckResult {
             "Retry with systemd user-session access.",
         );
     }
+    let both_active = nft == Some(true) && ufw == Some(true);
+    let active = nft == Some(true) || ufw == Some(true);
+    let mut limitations = Vec::new();
+    if nft.is_none() || ufw.is_none() {
+        limitations.push(
+            "The state of one supported firewall service was unavailable to the scan".to_owned(),
+        );
+    }
+    let (evidence, next_step) = if both_active {
+        (
+            "nftables.service and ufw.service are both active; firewall ownership is ambiguous"
+                .to_owned(),
+            "Keep one firewall manager active and rescan the effective policy.".to_owned(),
+        )
+    } else if ufw == Some(true) {
+        (
+            "ufw.service is active; UFW owns the firewall policy".to_owned(),
+            "Recheck the effective UFW policy after firewall changes.".to_owned(),
+        )
+    } else if nft == Some(true) {
+        (
+            "nftables.service is active; nftables owns the firewall policy".to_owned(),
+            "Recheck the effective nftables policy after firewall changes.".to_owned(),
+        )
+    } else {
+        (
+            "no supported firewall service was reported active".to_owned(),
+            "Enable one supported firewall service before relying on host filtering.".to_owned(),
+        )
+    };
     result(
         "firewall.service",
         "Firewall service state",
-        if active {
+        if both_active {
+            CheckState::Attention
+        } else if active {
             CheckState::Informational
         } else {
             CheckState::Attention
         },
-        vec![if active {
-            "a supported firewall service is active; runtime policy is checked separately"
-                .to_owned()
-        } else {
-            "no supported firewall service was reported active".to_owned()
-        }],
-        Vec::new(),
-        Some("Review firewall service state together with the effective-policy check.".to_owned()),
+        vec![evidence],
+        limitations,
+        Some(next_step),
         Some(tool),
     )
+}
+
+/// Return a service state only when systemd produced an interpretable result.
+/// A non-zero result with stderr is treated as unavailable because it commonly
+/// means the scan cannot access the system bus, not that the unit is inactive.
+fn firewall_unit_state<A: CommandAdapter>(adapter: &A, unit: &str) -> Option<bool> {
+    adapter
+        .execute("systemctl", &["is-active", unit], Duration::from_secs(2))
+        .ok()
+        .and_then(|output| {
+            if output.status == Some(0) {
+                Some(true)
+            } else if !output.stderr_nonempty {
+                Some(false)
+            } else {
+                None
+            }
+        })
 }
 
 fn firewall_effective<A: CommandAdapter>(adapter: &A) -> CheckResult {
@@ -1754,6 +1810,9 @@ fn firewall_effective<A: CommandAdapter>(adapter: &A) -> CheckResult {
                     Some(tool),
                 )
             } else {
+                if let Some(check) = ufw_effective_fallback(adapter) {
+                    return check;
+                }
                 result(
                     "firewall.effective",
                     "Effective firewall policy",
@@ -1765,21 +1824,106 @@ fn firewall_effective<A: CommandAdapter>(adapter: &A) -> CheckResult {
                 )
             }
         }
-        Ok(_) => incomplete(
-            "firewall.effective",
-            "Effective firewall policy",
-            tool,
-            "runtime firewall policy was denied or unavailable to the unprivileged scan",
-            "Run the posture scan as the supported user session; OmaSafe does not request elevation.",
-        ),
-        Err(error) => incomplete(
-            "firewall.effective",
-            "Effective firewall policy",
-            tool,
-            format_runner_error(error),
-            "Runtime firewall policy is unobserved without supported permissions.",
-        ),
+        Ok(_) => ufw_effective_fallback(adapter).unwrap_or_else(|| {
+            incomplete(
+                "firewall.effective",
+                "Effective firewall policy",
+                tool,
+                "runtime firewall policy was denied or unavailable to the unprivileged scan",
+                "Run the posture scan as the supported user session; OmaSafe does not request elevation.",
+            )
+        }),
+        Err(error) => ufw_effective_fallback(adapter).unwrap_or_else(|| {
+            incomplete(
+                "firewall.effective",
+                "Effective firewall policy",
+                tool,
+                format_runner_error(error),
+                "Runtime firewall policy is unobserved without supported permissions.",
+            )
+        }),
     }
+}
+
+/// UFW normally refuses `ufw status` for an unprivileged caller even when its
+/// system service is active. When direct nftables inspection is unavailable,
+/// accept two bounded UFW-specific observations instead:
+///
+///   1. `ufw status` explicitly reports an active policy; or
+///   2. UFW is enabled in its root-owned config, the service is active, and a
+///      generated policy file is readable.
+///
+/// The second path is deliberately labelled as an inference. It is enough to
+/// avoid treating a normal Omarchy UFW host as an unexplained coverage gap, but
+/// it does not claim that an unprivileged process independently dumped the live
+/// netfilter ruleset.
+fn ufw_effective_fallback<A: CommandAdapter>(adapter: &A) -> Option<CheckResult> {
+    let tool = adapter.describe("ufw");
+    if let Ok(output) = adapter.execute("ufw", &["status"], Duration::from_secs(3))
+        && output.status == Some(0)
+    {
+        let text = String::from_utf8_lossy(&output.stdout);
+        if ufw_status_is_active(&text) {
+            return Some(result(
+                "firewall.effective",
+                "Effective firewall policy",
+                CheckState::Pass,
+                vec!["UFW reports an active firewall policy".to_owned()],
+                Vec::new(),
+                Some("Recheck after firewall changes.".to_owned()),
+                Some(tool),
+            ));
+        }
+    }
+
+    let enabled = read_text_capped(Path::new("/etc/ufw/ufw.conf"), MAX_METADATA_BYTES)
+        .ok()
+        .is_some_and(|text| ufw_config_is_enabled(&text));
+    let policy_readable = [
+        "/etc/ufw/user.rules",
+        "/etc/ufw/user6.rules",
+        "/etc/ufw/before.rules",
+        "/etc/ufw/before6.rules",
+        "/etc/ufw/after.rules",
+        "/etc/ufw/after6.rules",
+    ]
+    .iter()
+    .any(|path| read_text_capped(Path::new(path), MAX_METADATA_BYTES).is_ok());
+    let service_active = firewall_unit_state(adapter, "ufw.service") == Some(true);
+
+    if !(enabled && policy_readable && service_active) {
+        return None;
+    }
+
+    Some(result(
+        "firewall.effective",
+        "Effective firewall policy",
+        CheckState::Pass,
+        vec![
+            "UFW is enabled and ufw.service is active".to_owned(),
+            "A generated UFW policy file is readable".to_owned(),
+        ],
+        vec![
+            "The live netfilter ruleset was not directly readable; effectiveness is inferred from UFW activation and policy files"
+                .to_owned(),
+        ],
+        Some("Recheck after firewall changes.".to_owned()),
+        Some(tool),
+    ))
+}
+
+fn ufw_status_is_active(text: &str) -> bool {
+    text.lines()
+        .map(str::trim)
+        .any(|line| line.eq_ignore_ascii_case("status: active"))
+}
+
+fn ufw_config_is_enabled(text: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line.trim();
+        line.strip_prefix("ENABLED=")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("yes"))
+    })
 }
 
 fn listeners<A: CommandAdapter>(adapter: &A) -> CheckResult {
@@ -2951,6 +3095,83 @@ mod tests {
         );
         let check = firewall_effective(&adapter);
         assert_eq!(check.state, CheckState::Pass);
+    }
+
+    #[test]
+    fn ufw_status_active_is_an_effective_policy_fallback() {
+        let adapter = FixtureCommandAdapter::default()
+            .failure("nft", RunnerError::Io("permission denied".to_owned()))
+            .response_args("ufw", &["status"], output(0, "Status: active\n"));
+        let check = firewall_effective(&adapter);
+        assert_eq!(check.state, CheckState::Pass);
+        assert!(check.evidence[0].contains("UFW reports"));
+        assert_eq!(
+            check.tool.as_ref().map(|tool| tool.name.as_str()),
+            Some("ufw")
+        );
+    }
+
+    #[test]
+    fn ufw_status_parser_requires_active_status() {
+        assert!(ufw_status_is_active("Status: active\nTo Action From\n"));
+        assert!(ufw_status_is_active("status: ACTIVE\n"));
+        assert!(!ufw_status_is_active("Status: inactive\n"));
+        assert!(!ufw_status_is_active("active\n"));
+    }
+
+    #[test]
+    fn ufw_config_parser_accepts_only_enabled_yes() {
+        assert!(ufw_config_is_enabled("# comment\nENABLED=yes\n"));
+        assert!(ufw_config_is_enabled("ENABLED=YES\n"));
+        assert!(!ufw_config_is_enabled("ENABLED=no\n"));
+        assert!(!ufw_config_is_enabled("# ENABLED=yes\n"));
+    }
+
+    #[test]
+    fn firewall_service_identifies_ufw_as_the_active_manager() {
+        let adapter = FixtureCommandAdapter::default()
+            .response_args(
+                "systemctl",
+                &["is-active", "nftables.service"],
+                output(3, "inactive\n"),
+            )
+            .response_args(
+                "systemctl",
+                &["is-active", "ufw.service"],
+                output(0, "active\n"),
+            );
+        let check = firewall_service(&adapter);
+        assert_eq!(check.state, CheckState::Informational);
+        assert_eq!(
+            check.evidence[0],
+            "ufw.service is active; UFW owns the firewall policy"
+        );
+        assert!(check.limitations.is_empty());
+    }
+
+    #[test]
+    fn firewall_service_flags_competing_active_managers() {
+        let adapter = FixtureCommandAdapter::default()
+            .response_args(
+                "systemctl",
+                &["is-active", "nftables.service"],
+                output(0, "active\n"),
+            )
+            .response_args(
+                "systemctl",
+                &["is-active", "ufw.service"],
+                output(0, "active\n"),
+            );
+        let check = firewall_service(&adapter);
+        assert_eq!(check.state, CheckState::Attention);
+        assert!(check.evidence[0].contains("both active"));
+        assert!(
+            check
+                .next_step
+                .as_deref()
+                .unwrap()
+                .contains("one firewall manager")
+        );
     }
 
     #[test]

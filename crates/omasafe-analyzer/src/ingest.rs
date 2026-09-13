@@ -510,12 +510,7 @@ pub fn ensure_pinned_repository_with_facts(
     url: &str,
     revision: &str,
 ) -> Result<PinnedRepository, IngestError> {
-    if !url.starts_with("https://") || url.starts_with('-') {
-        return Err(IngestError::InvalidUrl);
-    }
-    let authority = url["https://".len()..].split('/').next().unwrap_or("");
-    if authority.contains('@') {
-        // user:token@host URLs would leak secrets into config and reports.
+    if !git::valid_https_url(url) || url.starts_with('-') {
         return Err(IngestError::InvalidUrl);
     }
     if !omasafe_marketplace_valid_revision(revision) {
@@ -560,6 +555,8 @@ pub fn ensure_pinned_repository_with_facts(
             &["init", "--bare", "--object-format", object_format, &display],
         )?;
     }
+    validate_cache_redirects(&repository_dir)?;
+    validate_cache_config(&repository_dir, url, false)?;
     let expected_object_format = if revision.len() == 64 {
         "sha256"
     } else {
@@ -604,10 +601,21 @@ pub fn ensure_pinned_repository_with_facts(
             cache_root,
             &["init", "--bare", "--object-format", object_format, &display],
         )?;
+        validate_cache_redirects(&repository_dir)?;
     }
-    if run_git(&repository_dir, &["remote", "get-url", "origin"]).is_err() {
-        run_git(&repository_dir, &["remote", "add", "origin", url])?;
+    match run_git(&repository_dir, &["remote", "get-url", "origin"]) {
+        Ok(existing) if existing.trim() == url => {}
+        Ok(_) => {
+            return Err(IngestError::Git(
+                "analysis cache origin does not match the requested HTTPS URL".to_owned(),
+            ));
+        }
+        Err(_) => {
+            run_git(&repository_dir, &["remote", "add", "origin", url])?;
+        }
     }
+    validate_cache_redirects(&repository_dir)?;
+    validate_cache_config(&repository_dir, url, true)?;
     if !cache_hit {
         run_git(
             &repository_dir,
@@ -626,6 +634,116 @@ pub fn ensure_pinned_repository_with_facts(
         path: repository_dir,
         cache_hit,
     })
+}
+
+/// Reject filesystem redirects that Git can consume without appearing in the
+/// repository config. A cache repository is disposable, so an existing
+/// alternates file is never needed for a pinned review and is refused before
+/// any object lookup or fetch. Critical top-level entries are also required to
+/// be real repository entries rather than symlinks.
+fn validate_cache_redirects(repository_dir: &Path) -> Result<(), IngestError> {
+    for relative in [
+        "HEAD",
+        "config",
+        "objects",
+        "objects/info",
+        "objects/pack",
+        "refs",
+    ] {
+        let path = repository_dir.join(relative);
+        let metadata = fs::symlink_metadata(&path).map_err(IngestError::Io)?;
+        if metadata.file_type().is_symlink() {
+            return Err(IngestError::Git(format!(
+                "analysis cache repository entry {relative} is a symlink"
+            )));
+        }
+    }
+    for relative in ["objects/info/alternates", "objects/info/http-alternates"] {
+        let path = repository_dir.join(relative);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(IngestError::Git(format!(
+                        "analysis cache redirect {relative} is not a regular file"
+                    )));
+                }
+                return Err(IngestError::Git(format!(
+                    "analysis cache redirect {relative} is unsupported"
+                )));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(IngestError::Io(error)),
+        }
+    }
+    Ok(())
+}
+
+/// Inspect a cached bare repository's config before any Git operation can use
+/// it. A cache is disposable and therefore rejects unknown configuration rather
+/// than attempting to merge or sanitize executable settings in place.
+fn validate_cache_config(
+    repository_dir: &Path,
+    expected_origin: &str,
+    require_origin: bool,
+) -> Result<(), IngestError> {
+    let config_path = repository_dir.join("config");
+    let metadata = fs::symlink_metadata(&config_path).map_err(IngestError::Io)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 64 * 1024 {
+        return Err(IngestError::Git(
+            "analysis cache config is missing, oversized, or a symlink".to_owned(),
+        ));
+    }
+    let bytes = fs::read(&config_path).map_err(IngestError::Io)?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| IngestError::Git("analysis cache config is not UTF-8".to_owned()))?;
+    let mut section = String::new();
+    let mut origin_seen = false;
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line[1..line.len() - 1].trim().to_ascii_lowercase();
+            if section != "core" && section != "extensions" && section != "remote \"origin\"" {
+                return Err(IngestError::Git(
+                    "analysis cache config contains an unsupported section".to_owned(),
+                ));
+            }
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(IngestError::Git(
+                "analysis cache config contains a malformed entry".to_owned(),
+            ));
+        };
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim();
+        match section.as_str() {
+            "core"
+                if matches!(
+                    key.as_str(),
+                    "repositoryformatversion" | "filemode" | "bare" | "logallrefupdates"
+                ) => {}
+            "extensions" if key == "objectformat" && matches!(value, "sha1" | "sha256") => {}
+            "remote \"origin\"" if key == "url" && value == expected_origin => {
+                origin_seen = true;
+            }
+            "remote \"origin\""
+                if key == "fetch" && value == "+refs/heads/*:refs/remotes/origin/*" => {}
+            _ => {
+                return Err(IngestError::Git(
+                    "analysis cache config contains an unsupported or executable entry".to_owned(),
+                ));
+            }
+        }
+    }
+    if require_origin && !origin_seen {
+        return Err(IngestError::Git(
+            "analysis cache config has no exact HTTPS origin".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Advisory whole-cache lock serializing fetch/quota decisions.
@@ -975,7 +1093,7 @@ pub fn discover_manifest_roots(
         return Err(IngestError::InvalidRevision);
     }
     let budget = TimeBudget::default();
-    let mut command = git::command();
+    let mut command = git::offline();
     command.current_dir(repository_dir);
     command.arg("-c").arg("core.quotePath=false");
     command.args(["ls-tree", "-r", "-l", "-z", revision]);
@@ -1028,7 +1146,7 @@ pub fn discover_manifest_roots(
         if size > MANIFEST_BYTES_CAP {
             continue;
         }
-        let mut blob_command = git::command();
+        let mut blob_command = git::offline();
         blob_command.current_dir(repository_dir);
         blob_command.args(["cat-file", "blob", fields[2]]);
         let blob = run_bounded_capped(
@@ -1174,7 +1292,11 @@ fn run_git(dir: &Path, args: &[&str]) -> Result<String, IngestError> {
 /// Returns `(output, hit_cap)`; callers decide whether a cap hit is fatal or a
 /// disclosed degradation.
 fn run_git_capped(dir: &Path, args: &[&str], cap: usize) -> Result<(Vec<u8>, bool), IngestError> {
-    let mut command = git::command();
+    let mut command = if args.first() == Some(&"fetch") {
+        git::remote_https()
+    } else {
+        git::offline()
+    };
     command.current_dir(dir);
     command.arg("-c").arg("core.quotePath=false");
     command.args(args);
@@ -1199,7 +1321,11 @@ fn run_git_capped_within(
         return Err(IngestError::BudgetExhausted);
     }
     let remaining = walker.budget.remaining();
-    let mut command = git::command();
+    let mut command = if args.first() == Some(&"fetch") {
+        git::remote_https()
+    } else {
+        git::offline()
+    };
     command.current_dir(dir);
     command.arg("-c").arg("core.quotePath=false");
     command.args(args);
@@ -1288,5 +1414,31 @@ mod tests {
             ruby_coverage.behavior_coverage,
             crate::payload::BehaviorCoverage::Unsupported
         );
+    }
+
+    #[test]
+    fn cache_redirects_are_rejected_before_git_reads() {
+        let root = tempfile::tempdir().unwrap();
+        for relative in ["objects/info", "objects/pack", "refs"] {
+            fs::create_dir_all(root.path().join(relative)).unwrap();
+        }
+        fs::write(root.path().join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(root.path().join("config"), "[core]\n\tbare = true\n").unwrap();
+        fs::write(root.path().join("objects/info/alternates"), "/outside\n").unwrap();
+        let error = validate_cache_redirects(root.path()).expect_err("alternates must be refused");
+        assert!(error.to_string().contains("alternates"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_critical_symlinks_are_rejected_before_git_reads() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("refs")).unwrap();
+        fs::write(root.path().join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(root.path().join("config"), "[core]\n\tbare = true\n").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("objects")).unwrap();
+        let error = validate_cache_redirects(root.path()).expect_err("objects symlink must fail");
+        assert!(error.to_string().contains("objects"), "{error}");
     }
 }
