@@ -665,7 +665,7 @@
       <a class="opt" href="#scope">Scope</a>
       <a class="opt" href="#roadmap">Roadmap</a>
       <a href="#install">Install</a>
-      <a class="release" href="https://github.com/tuthan/omasafe/releases/tag/v0.3.2">v0.3.2</a>
+      <a class="release" href="https://github.com/tuthan/omasafe/releases/tag/v0.3.3">v0.3.3</a>
     </nav>
   </div>
 </header>
@@ -674,7 +674,7 @@
   <section class="wrap hero">
     <div class="hero-grid">
       <div class="hero-copy">
-        <p class="eyebrow">OmaSafe v0.3.2 &middot; signed release &middot; 2026-09-13</p>
+        <p class="eyebrow">OmaSafe v0.3.3 &middot; current CLI patch &middot; 2026-09-14</p>
         <h1>Know what your system can do.<em>Catch what quietly changed.</em></h1>
         <p class="lede">
           A bounded, evidence-first review tool for Omarchy. <b>Plugins</b>: exact revisions, shipped
@@ -682,6 +682,7 @@
           updates, listeners, and persistence, reported as state rather than a score.
           <b>Candidates</b>: scan a GitHub URL or install command before anything touches your shell.
           The v0.3.2 review runner denies lifecycle mutations before the CLI starts.
+          The v0.3.3 patch keeps a fresh marketplace refresh to the catalog object.
         </p>
         <div class="cta-row">
           <a class="btn btn-primary" href="#install">Install the CLI <span aria-hidden="true">&rarr;</span></a>
@@ -698,7 +699,7 @@
       </div>
 
       <div class="record reveal" aria-label="Sample OmaSafe output">
-        <div class="record-bar"><span class="shield" aria-hidden="true"></span> two subjects, one engine <span class="right">omasafe-cli 0.3.2</span></div>
+        <div class="record-bar"><span class="shield" aria-hidden="true"></span> two subjects, one engine <span class="right">omasafe-cli 0.3.3</span></div>
 
         <div class="record-cmd"><span class="muted">$</span> omasafe-cli <b>posture scan</b></div>
         <dl class="record-body">
@@ -768,19 +769,19 @@
     <div class="surfaces reveal">
       <article class="surface">
         <div class="surface-head">
-          <div class="surface-kicker"><span>01 / engine</span><span class="ver">v0.3.2</span></div>
+          <div class="surface-kicker"><span>01 / engine</span><span class="ver">v0.3.3</span></div>
           <h3>omasafe-cli</h3>
-          <p>A single Rust binary. Inventory, marketplace correlation, trust baselines, drift diff, payload analysis, candidate scans, host posture, reviewed updates, and an opt-in daily timer. Every report is versioned JSON with coverage attached.</p>
+          <p>A single Rust binary. Inventory, marketplace correlation, trust baselines, drift diff, payload analysis, candidate scans, host posture, reviewed updates, and an opt-in daily timer. Every report is versioned JSON with coverage attached. Fresh marketplace caches use filtered Git acquisition and retain only the catalog object they need.</p>
           <ul aria-label="Properties"><li>x86_64 Linux</li><li>Sigstore + SHA-256</li><li>argv-only exec</li><li>exit codes for CI</li></ul>
         </div>
 <pre><span class="c"># pinned to the release you are installing</span>
 curl --fail --proto <span class="p">'=https'</span> --tlsv1.2 --location \
-  https://raw.githubusercontent.com/tuthan/omasafe/v0.3.2/scripts/install-cli.sh \
+  https://raw.githubusercontent.com/tuthan/omasafe/v0.3.3/scripts/install-cli.sh \
   --output install-cli.sh
 less install-cli.sh
-bash install-cli.sh <span class="p">--version</span> v0.3.2</pre>
+bash install-cli.sh <span class="p">--version</span> v0.3.3</pre>
         <div class="surface-links">
-          <a href="https://github.com/tuthan/omasafe/releases/tag/v0.3.2">Release &amp; signatures</a>
+          <a href="https://github.com/tuthan/omasafe/releases/tag/v0.3.3">Release &amp; signatures</a>
           <a href="https://github.com/tuthan/omasafe#cli-usage">Command reference</a>
         </div>
       </article>
@@ -936,7 +937,7 @@ adapters/install.sh <span class="p">--host</span> codex <span class="p">--scope<
   <section class="band band-sunk" id="features">
     <div class="wrap">
     <div class="sec-head">
-      <p class="eyebrow">What ships in v0.3.2</p>
+      <p class="eyebrow">What ships in v0.3.x</p>
       <h2>From “what is installed?” to “what is this machine doing?”</h2>
       <p>The v0.2 series made plugin coverage explicit. v0.3 adds the first data not keyed by plugin: the host itself. The trust layer stays small, and every result carries identity, evidence, and coverage.</p>
     </div>
@@ -1028,7 +1029,7 @@ adapters/install.sh <span class="p">--host</span> codex <span class="p">--scope<
         <b>v0.3</b>
         <h3>Host posture</h3>
         <p>18-check catalog, coverage states, update awareness, post-update hook, support export, daily and weekly timers. Next: posture baselines, windowed digests, bar indicator.</p>
-        <span class="ticks-label">Current &middot; v0.3.2 &middot; 2026-09-13</span>
+        <span class="ticks-label">Current &middot; v0.3.3 &middot; 2026-09-14</span>
       </div>
 
       <div class="stop reveal">
@@ -1074,7 +1075,7 @@ adapters/install.sh <span class="p">--host</span> codex <span class="p">--scope<
     <div class="sec-head">
       <p class="eyebrow">Getting started</p>
       <h2>Install the engine, then review what you trust</h2>
-      <p>Download the signed v0.3.2 CLI, run your first posture scan, pin a baseline for the plugins you already trust, and let the daily timer stay quiet until something changes. The <a href="#surfaces">bar widget and agent skill</a> are separate installs with their own lifecycles.</p>
+      <p>Download the v0.3.3 CLI, run your first posture scan, pin a baseline for the plugins you already trust, and let the daily timer stay quiet until something changes. The <a href="#surfaces">bar widget and agent skill</a> are separate installs with their own lifecycles.</p>
     </div>
     <div class="cta-row" style="margin-bottom: 28px;">
       <a class="btn btn-primary" href="https://github.com/tuthan/omasafe/releases/latest">Download the CLI release</a>
@@ -1086,10 +1087,10 @@ adapters/install.sh <span class="p">--host</span> codex <span class="p">--scope<
         <div class="term-head">verified install <span>x86_64 Linux</span></div>
 <pre><span class="c"># download the pinned installer, review it, then run it</span>
 curl --fail --proto <span class="p">'=https'</span> --tlsv1.2 --location \
-  https://raw.githubusercontent.com/tuthan/omasafe/v0.3.2/scripts/install-cli.sh \
+  https://raw.githubusercontent.com/tuthan/omasafe/v0.3.3/scripts/install-cli.sh \
   --output install-cli.sh
 less install-cli.sh
-bash install-cli.sh <span class="p">--version</span> v0.3.2
+bash install-cli.sh <span class="p">--version</span> v0.3.3
 
 <span class="c"># verifies the Sigstore bundle and SHA-256 before installing to ~/.local/bin</span>
 omasafe-cli --version</pre>
@@ -1119,7 +1120,7 @@ omasafe-cli schedule install <span class="p">--policy</span> advisory</pre>
 <footer>
   <div class="wrap foot">
     <div>
-      omasafe-cli v0.3.2 &middot; io.github.tuthan.omasafe v0.5.1 &middot; omasafe-plugin-review v1.4.1 &middot; MIT<br>
+      omasafe-cli v0.3.3 &middot; io.github.tuthan.omasafe v0.5.1 &middot; omasafe-plugin-review v1.4.1 &middot; MIT<br>
       A trust, drift-review, and posture tool <em>for</em> Omarchy. Not an official Omarchy project.
     </div>
     <div class="foot-links">

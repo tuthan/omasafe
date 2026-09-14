@@ -15,6 +15,11 @@ pub const MAX_CATALOG_BYTES: usize = 32 * 1024 * 1024;
 pub const OFFICIAL_REPOSITORY: &str = "https://github.com/omacom/omarchy-plugin-marketplace";
 pub const DISCLAIMER: &str = "Marketplace fields are claims made by the named registry snapshot, not local security guarantees.";
 
+// Keep the commit graph available for rollback checks while omitting the
+// marketplace's historical trees and blobs. The requested catalog blob is
+// retrieved by one separately bounded promisor read below.
+const CATALOG_FETCH_FILTER: &str = "--filter=tree:0";
+
 pub fn valid_commit(value: &str) -> bool {
     (value.len() == 40 || value.len() == 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -439,10 +444,14 @@ pub fn fetch_pinned_catalog(
             )?;
         }
     }
-    run_git(
-        &repository_dir,
-        &["fetch", "--no-tags", "origin", repository_commit],
-    )?;
+    let fetch_args = [
+        "fetch",
+        "--no-tags",
+        CATALOG_FETCH_FILTER,
+        "origin",
+        repository_commit,
+    ];
+    run_git(&repository_dir, &fetch_args)?;
     let metadata_path = cache_dir.join("catalog.meta.json");
     if let Ok(metadata) = fs::read(&metadata_path)
         && let Ok(previous) = serde_json::from_slice::<CacheMetadata>(&metadata)
@@ -456,10 +465,8 @@ pub fn fetch_pinned_catalog(
     {
         return Err(Error::Rollback);
     }
-    let output = run_git_output(
-        &repository_dir,
-        &["show", &format!("{repository_commit}:site/catalog.json")],
-    )?;
+    let catalog_spec = format!("{repository_commit}:site/catalog.json");
+    let output = run_git_output_with_lazy_fetch(&repository_dir, &["show", &catalog_spec])?;
     let retrieved_at_for_cache = retrieved_at.clone();
     let snapshot = parse_catalog(
         &output,
@@ -604,11 +611,27 @@ fn run_git(directory: &Path, args: &[&str]) -> Result<(), Error> {
 }
 
 fn run_git_output(directory: &Path, args: &[&str]) -> Result<Vec<u8>, Error> {
-    let mut command = if args.first().copied() == Some("fetch") {
+    let command = if args.first().copied() == Some("fetch") {
         omasafe_core::git::remote_https()
     } else {
         omasafe_core::git::offline()
     };
+    run_git_output_with_command(directory, args, command)
+}
+
+/// Allows one exact catalog read to obtain a missing blob from the promisor
+/// remote created by the filtered fetch. All other cache reads stay offline.
+fn run_git_output_with_lazy_fetch(directory: &Path, args: &[&str]) -> Result<Vec<u8>, Error> {
+    let mut command = omasafe_core::git::remote_https();
+    command.env_remove("GIT_NO_LAZY_FETCH");
+    run_git_output_with_command(directory, args, command)
+}
+
+fn run_git_output_with_command(
+    directory: &Path,
+    args: &[&str],
+    mut command: std::process::Command,
+) -> Result<Vec<u8>, Error> {
     command.args(args).current_dir(directory);
     let output = run_bounded_capped(
         &mut command,

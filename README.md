@@ -56,7 +56,7 @@ CLI commands.
 
 ## Status
 
-**v0.3.2 is the current signed release** (2026-09-13) — the CLI combines the v0.1
+**v0.3.3 is the current CLI patch release** (2026-09-14) — the CLI combines the v0.1
 local trust layer with explicit payload coverage, opaque executable review
 bindings, bounded capability and finding reports, reviewed updates, opt-in
 enforcement controls, scan-only review of exact GitHub/marketplace candidates,
@@ -74,6 +74,10 @@ projection. It is not an OS sandbox, does not ship a prompt-injection detector,
 does not provide a hard aggregate fetch-storage quota, and does not extend host
 permission enforcement beyond the pinned OpenCode integration that is verified
 separately.
+
+The v0.3.3 patch fixes first-run marketplace refreshes. It keeps the full commit
+graph needed for rollback checks, but uses a filtered Git fetch and retrieves only
+`site/catalog.json`; fresh caches no longer download the marketplace's full history.
 
 The [v0.2.5 implementation plan](../omasafe-docs/Cli/plans/v0.2.5-coverage-and-binary-review.md)
 defines the coverage, identity, opaque-code review, and hardened-policy updates.
@@ -240,26 +244,26 @@ and removal lifecycles.
   ```sh
   # Download the pinned installer, review it, then run it locally
   curl --fail --proto '=https' --tlsv1.2 --location \
-    https://raw.githubusercontent.com/tuthan/omasafe/v0.3.2/scripts/install-cli.sh \
+    https://raw.githubusercontent.com/tuthan/omasafe/v0.3.3/scripts/install-cli.sh \
     --output install-cli.sh
   less install-cli.sh
   bash install-cli.sh --version latest
 
   # Or review and run it for an exact release
   curl --fail --proto '=https' --tlsv1.2 --location \
-    https://raw.githubusercontent.com/tuthan/omasafe/v0.3.2/scripts/install-cli.sh \
+    https://raw.githubusercontent.com/tuthan/omasafe/v0.3.3/scripts/install-cli.sh \
     --output install-cli.sh
   less install-cli.sh
-  bash install-cli.sh --version v0.3.2
+  bash install-cli.sh --version v0.3.3
   ```
 
   The URL is pinned to the release tag, so the installer you review is the exact
   one that produced that release's signed assets; reviewing it locally avoids
   piping a network response directly to the shell. `latest` selects the current
-  signed release, while `v0.3.2` selects an exact signed archive. When installing
+  signed release, while `v0.3.3` selects an exact signed archive. When installing
   an exact release, pin the URL to the same tag you pass to `--version`. From a
   repository checkout, run `./scripts/install-cli.sh --version latest` or
-  `./scripts/install-cli.sh --version v0.3.2`.
+  `./scripts/install-cli.sh --version v0.3.3`.
 
   Release signatures and detached verification instructions are in
   [`omasafe-docs/Cli/release-signing.md`](../omasafe-docs/Cli/release-signing.md).
